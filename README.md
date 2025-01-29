@@ -1,6 +1,6 @@
 # LiteRegistry
 
-LiteRegistry is a liteweight, flexible service registry and discovery system with built-in telemetry and caching. It supports multiple storage backends and provides async-first APIs for modern Python applications.
+LiteRegistry is a lightweight, flexible service registry and discovery system with built-in telemetry and caching. It supports multiple storage backends and provides async-first APIs for modern Python applications.
 
 ## Features
 
