@@ -107,8 +107,8 @@ class RegistryClient(ServerRegistry):
                 self._cache[value] = m
                 self._cache_timestamps[value] = time.time()
 
-            except KeyError:
-                logging.warning(f"Model {value} not found in registry")
+            except KeyError as e:
+                logging.warning(f"Model {value} not found in registry - {e}")
                 self._cache[value] = []
                 self._cache_timestamps[value] = time.time()
                 m = []

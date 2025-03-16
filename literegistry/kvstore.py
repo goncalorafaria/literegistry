@@ -37,7 +37,7 @@ class KeyValueStore(abc.ABC):
 class FileSystemKVStore(KeyValueStore):
     """Filesystem-based key-value store (keys = files, values = content)"""
 
-    def __init__(self, root: Union[str, Path] = "kv_data"):
+    def __init__(self, root: Union[str, Path] = "/gscratch/ark/graf/registry"):
         self.root = Path(root)
         self.root.mkdir(exist_ok=True)
 

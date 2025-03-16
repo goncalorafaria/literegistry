@@ -4,6 +4,7 @@ from typing import Dict, List, Tuple, Optional
 import logging
 from literegistry.client import RegistryClient
 from literegistry.kvstore import FileSystemKVStore
+from tqdm import tqdm
 
 
 class RegistryHTTPClient:
@@ -82,6 +83,9 @@ class RegistryHTTPClient:
                 server = servers[server_idx].rstrip("/")
                 result = await self._make_http_request(server, endpoint, payload)
 
+                if "status" in result and result["status"] == "failed":
+                    raise RuntimeError(f"Error from server: - {result} - {server}")
+
                 # Report successful request latency
                 latency = asyncio.get_event_loop().time() - start_time
                 self.registry.report_latency(server, latency)
@@ -90,7 +94,7 @@ class RegistryHTTPClient:
 
             except Exception as e:
                 logging.error(
-                    f"Attempt {attempt + 1} failed on server {server}: {str(e)}"
+                    f"Attempt {self.value}:{attempt + 1} failed on server {server}: {str(e)}"
                 )
                 attempt += 1
 
@@ -103,7 +107,7 @@ class RegistryHTTPClient:
                 total_servers = len(servers)
 
                 # Rotate to next server
-                server_idx = (server_idx + 1) % total_servers
+                server_idx = server_idx + 1  # % total_servers
 
                 if attempt >= self.max_retries:
                     raise RuntimeError(
@@ -119,6 +123,7 @@ class RegistryHTTPClient:
         self,
         endpoint: str,
         payloads: List[Dict],
+        track=True,
     ) -> List[Dict]:
         """Make multiple requests in parallel with server rotation."""
         if not self._session:
@@ -144,7 +149,28 @@ class RegistryHTTPClient:
 
         # Gather results with bounded concurrency
         bounded_tasks = [bounded_request(task) for task in tasks]
-        results = await asyncio.gather(*bounded_tasks, return_exceptions=True)
+
+        total_requests = len(bounded_tasks)
+        progress_bar = tqdm(
+            total=total_requests,
+            desc="brrr",
+            unit="req",
+            disable=not track,
+        )
+
+        # Function to update progress bar when a task completes
+        async def tracked_task(task):
+            try:
+                result = await task
+                progress_bar.update(1)
+                return result
+            except Exception as e:
+                progress_bar.update(1)
+                return e
+
+        tracked_tasks = [tracked_task(task) for task in bounded_tasks]
+
+        results = await asyncio.gather(*tracked_tasks, return_exceptions=True)
 
         # Check for exceptions and extract results
         final_results = []
@@ -155,6 +181,29 @@ class RegistryHTTPClient:
             final_results.append(response)
 
         return final_results
+
+    async def get(
+        self,
+        endpoint: str,
+        params: Optional[Dict] = None,
+    ) -> Dict:
+        """Make a single HTTP GET request to a server."""
+        if not self._session:
+            raise RuntimeError("Client not initialized - use async with")
+
+        servers = await self.registry.get_all(self.value)
+        if not servers:
+            raise RuntimeError(f"No servers available for model {self.value}")
+
+        server = servers[0].rstrip("/")  # Use the first server for simplicity
+
+        async with self._session.get(
+            f"{server}/{endpoint}",
+            params=params,
+            timeout=aiohttp.ClientTimeout(total=self.timeout),
+        ) as response:
+            response.raise_for_status()
+            return await response.json()
 
 
 # Example usage
