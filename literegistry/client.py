@@ -7,7 +7,9 @@ from collections import defaultdict
 from literegistry.kvstore import KeyValueStore, FileSystemKVStore
 from literegistry.registry import ServerRegistry
 from literegistry.telemetry import LatencyMetricAggregator
+from literegistry.bandit import Exp3Dynamic
 import asyncio
+import numpy as np
 
 
 class RegistryClient(ServerRegistry):
@@ -22,6 +24,7 @@ class RegistryClient(ServerRegistry):
         max_history: int = 3600,
         cache_ttl: int = 60 * 5,
         service_type="model_path",
+        penalty_latency=200,
     ):
         """
         Initialize ModelRegistry
@@ -37,6 +40,8 @@ class RegistryClient(ServerRegistry):
         self.cache_ttl = cache_ttl
         self.telemetry = LatencyMetricAggregator()
         self.service_type = service_type
+        self.penalty_latency = penalty_latency
+        self.bandit = Exp3Dynamic(gamma=0.2, L_max=penalty_latency)
 
     def _is_cache_valid(self, cache_key: str) -> bool:
         """Check if a cache entry is still valid"""
@@ -113,18 +118,17 @@ class RegistryClient(ServerRegistry):
                 self._cache_timestamps[value] = time.time()
                 m = []
 
-        # If n is specified, select weighted random sample
-        if n and m:
-            scores = [
-                1 / (self.telemetry.get_estimated_latency(mi["uri"]) + 1e-4) for mi in m
-            ]
-            pmf = [s / sum(scores) for s in scores]
-            result = [mi["uri"] for mi in random.choices(m, weights=pmf, k=n)]
-        else:
-            result = [mi["uri"] for mi in m]
+        result = [mi["uri"] for mi in m]
+        # print(result)
 
         self.telemetry.prune_inactive()
 
+        return result
+
+    async def sample_servers(self, value: str, n: int):
+
+        servers = await self.get_all(value)
+        result, _ = self.bandit.get_arm(servers, k=n)  # Get URIs for bandit selection
         return result
 
     async def get(self, value: str, force: bool = False) -> str:
@@ -146,9 +150,14 @@ class RegistryClient(ServerRegistry):
             raise ValueError(f"Model {value} not found in registry")
         return cached_uris[0]
 
-    def report_latency(self, uri: str, response_time: float):
+    def report_latency(self, uri: str, response_time: float, success: bool = True):
         """Report request latency for a URI"""
-        self.telemetry.report(uri, response_time)
+        self.bandit.update(uri, latency=response_time, success=success)
+
+        if success:
+            self.telemetry.report(uri, response_time)
+        else:
+            self.telemetry.report(uri, self.penalty_latency)
 
     def invalidate_cache(self, model_path: Optional[str] = None):
         """

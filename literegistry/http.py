@@ -56,6 +56,7 @@ class RegistryHTTPClient:
             timeout=aiohttp.ClientTimeout(total=self.timeout),
         ) as response:
 
+            # print("sending to: ", f"{server.rstrip('/')}/{endpoint}")
             response.raise_for_status()
             return await response.json()
 
@@ -66,7 +67,9 @@ class RegistryHTTPClient:
         initial_server_idx: int = 0,
     ) -> Tuple[Dict, int]:
         """Make a request with automatic server rotation on failure."""
-        servers = await self.registry.get_all(self.value)
+        servers = await self.registry.sample_servers(
+            self.value, n=self.max_parallel_requests
+        )
         total_servers = len(servers)
 
         if not total_servers:
@@ -96,11 +99,15 @@ class RegistryHTTPClient:
                 logging.error(
                     f"Attempt {self.value}:{attempt + 1} failed on server {server}: {str(e)}"
                 )
+                ## print traceback
+                #import traceback
+                #traceback.print_exc()
+                
                 attempt += 1
 
                 # Report failed request latency
                 latency = asyncio.get_event_loop().time() - start_time
-                self.registry.report_latency(server, latency)
+                self.registry.report_latency(server, latency, success=False)
 
                 # Get fresh server list
                 servers = await self.registry.get_all(self.value, force=True)
