@@ -6,24 +6,28 @@ from literegistry.client import RegistryClient
 from literegistry.kvstore import FileSystemKVStore
 from tqdm import tqdm
 
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 
 class RegistryHTTPClient:
-    """HTTP client with integrated service registry support"""
+    """HTTP client for making requests to model servers via the registry."""
 
     def __init__(
         self,
         registry: RegistryClient,
         value: str,
-        max_parallel_requests: int = 8,
+        max_parallel_requests: int = 512,
         timeout: float = 60,
-        max_retries: int = 50,
+        max_retries: int = 5,
     ):
         """
-        Initialize the HTTP client
-
+        Initialize the HTTP client.
+        
         Args:
             registry: ModelRegistry instance for service discovery
-            model_path: Model path to use for server selection
+            value: Model path to use for server selection
         """
         self.registry = registry
         self.value = value
@@ -31,14 +35,32 @@ class RegistryHTTPClient:
         self.max_parallel_requests = max_parallel_requests
         self.timeout = timeout
         self.max_retries = max_retries
+        # Add connection pooling limits
+        self._connector = None
 
     async def __aenter__(self):
-        self._session = aiohttp.ClientSession()
+        # Create connector with connection pooling limits
+        self._connector = aiohttp.TCPConnector(
+            limit=500,  # Total connection pool size
+            limit_per_host=100,  # Max connections per host
+            ttl_dns_cache=600,  # DNS cache TTL
+            use_dns_cache=True,
+            keepalive_timeout=60,
+            enable_cleanup_closed=True
+        )
+        self._session = aiohttp.ClientSession(connector=self._connector)
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self._session:
-            await self._session.close()
+        try:
+            if self._session:
+                await self._session.close()
+                self._session = None
+            if self._connector:
+                await self._connector.close()
+                self._connector = None
+        except Exception as e:
+            logger.error(f"Error closing HTTP client session: {e}")
 
     async def _make_http_request(
         self,
@@ -50,15 +72,17 @@ class RegistryHTTPClient:
         if not self._session:
             raise RuntimeError("Client not initialized - use async with")
 
-        async with self._session.post(
-            f"{server.rstrip('/')}/{endpoint}",
-            json=payload,
-            timeout=aiohttp.ClientTimeout(total=self.timeout),
-        ) as response:
-
-            # print("sending to: ", f"{server.rstrip('/')}/{endpoint}")
-            response.raise_for_status()
-            return await response.json()
+        try:
+            async with self._session.post(
+                f"{server.rstrip('/')}/{endpoint}",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=self.timeout),
+            ) as response:
+                response.raise_for_status()
+                return await response.json()
+        except Exception as e:
+            logger.error(f"HTTP request failed to {server}/{endpoint}: {e}")
+            raise
 
     async def request_with_rotation(
         self,
@@ -110,7 +134,7 @@ class RegistryHTTPClient:
                 self.registry.report_latency(server, latency, success=False)
 
                 # Get fresh server list
-                servers = await self.registry.get_all(self.value, force=True)
+                servers = await self.registry.get_all(self.value, force=False)
                 total_servers = len(servers)
 
                 # Rotate to next server

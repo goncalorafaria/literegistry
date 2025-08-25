@@ -23,6 +23,11 @@ class Exp3Dynamic:
         return (self.gamma / K) if K > 0 else self.gamma
 
     def _sync_arms(self, active_ids):
+        # Handle empty active_ids
+        if not active_ids:
+            self.weights.clear()
+            return
+            
         # add any new arms
         if not self.weights:
             for arm in active_ids:
@@ -49,7 +54,7 @@ class Exp3Dynamic:
         else:
 
             max_log = max(self.weights.values())
-            # unnormalized “weights” shifted by max to avoid overflow
+            # unnormalized "weights" shifted by max to avoid overflow
             self.weights = {a: (lw - max_log) for a, lw in self.weights.items()}
             exp_weights = {a: math.exp(lw) for a, lw in self.weights.items()}
             total_w = sum(exp_weights.values())
@@ -68,12 +73,24 @@ class Exp3Dynamic:
         - sample one arm
         Returns (chosen_id, p_chosen)
         """
+        # Handle empty active_ids
+        if not active_ids:
+            return [], []
+            
         self._sync_arms(active_ids)
         probs = self._get_probabilities()
 
+        # Handle case when no probabilities are available
+        if not probs:
+            return [], []
+            
         arms, ps = zip(*probs.items())
 
         # print("arms and probs", arms, ps)
+        # Ensure we have valid arms and weights before calling random.choices
+        if not arms or not ps or all(w == 0 for w in ps):
+            return [], []
+            
         chosen = random.choices(arms, weights=ps, k=k)
         return chosen, [probs[chosen_i] for chosen_i in chosen]
 
@@ -103,20 +120,29 @@ class Exp3Dynamic:
         """Return the current probability distribution (after syncing)."""
         return self._get_probabilities()
 
+ 
+    
+class UniformBandit(Exp3Dynamic):
+    def __init__(self):
+        super().__init__(gamma=0.2, L_max=1.0, init_weight=0.0)
+        
+    def update(self, arm_id, success, latency):
+        arm_dist = self._get_probabilities()
 
+        if arm_id in arm_dist:
+            
+            self.weights[arm_id] = 0
+
+            self.t += 1
+        
+        
+        
 if __name__ == "__main__":
-    # Example usage
-    exp3 = Exp3Dynamic(gamma=0.1, L_max=2.0)
+    bandit = UniformBandit(["arm1", "arm2", "arm3"])
     active_arms = ["arm1", "arm2", "arm3"]
 
     for _ in range(10):
-        chosen_arm, prob = exp3.select_arm(active_arms)
+        chosen_arm, prob = bandit.get_arm(active_arms)
         print(f"Chosen arm: {chosen_arm}, Probability: {prob}")
-
-        # Simulate success/failure and latency
-        success = random.choice([True, False])
-        latency = random.uniform(0.1, 1.0)  # Simulated latency in seconds
-
-        exp3.update(chosen_arm, prob, success, latency)
-
-    print("Final probabilities:", exp3.get_probabilities())
+    
+    

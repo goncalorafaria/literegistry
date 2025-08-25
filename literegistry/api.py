@@ -1,4 +1,4 @@
-from literegistry import ServerRegistry, FileSystemKVStore
+from literegistry import ServerRegistry, FileSystemKVStore, RedisKVStore
 import asyncio
 from fastapi import FastAPI, HTTPException
 from typing import List, Optional, Dict, Any
@@ -15,11 +15,11 @@ class ServiceAPI(FastAPI):
     def __init__(
         self,
         *args,
-        registry_path: str = "/gscratch/ark/graf/registry",
+        registry_path: str = "redis://klone-login01.hyak.local:6379",# "/gscratch/ark/graf/registry", # "redis://klone-login01.hyak.local:6379"
         port: int = None,
         hostname: str = None,
         metadata: Dict[str, Any] = None,
-        heartbeat_interval: int = 10,
+        heartbeat_interval: int = 120,
         max_history=3600,
         **kwargs,
     ):
@@ -36,17 +36,23 @@ class ServiceAPI(FastAPI):
         """
         super().__init__(*args, **kwargs)
 
+        if "redis://" in registry_path:
+            store = RedisKVStore(registry_path)
+        else:
+            store = FileSystemKVStore(registry_path)
+            
+            
         self.registry_path = registry_path
         self.port = port
         self.hostname = hostname
         self.metadata = metadata or {}
         self.heartbeat_interval = heartbeat_interval
         self.registry = ServerRegistry(
-            store=FileSystemKVStore(self.registry_path),
+            store=store,#RedisKVStore("redis://klone-login01.hyak.local:6379"),#FileSystemKVStore(self.registry_path),
             max_history=max_history,
         )
         self.heartbeat_thread = None
-        # {socket.gethostname()}.hyak.local
+        self.url = f"http://{hostname}"
 
         # Register startup and shutdown events
         self._register_startup_events()
@@ -60,7 +66,7 @@ class ServiceAPI(FastAPI):
 
             # Register server
             await self.registry.register_server(
-                url=f"http://{self.hostname}",
+                url= self.url,
                 port=self.port,
                 metadata=self.metadata,
             )
@@ -81,7 +87,7 @@ class ServiceAPI(FastAPI):
 
         def heartbeat_loop():
             while True:
-                asyncio.run(self.registry.heartbeat(self.port))
+                asyncio.run(self.registry.heartbeat(self.url, self.port))
                 time.sleep(self.heartbeat_interval)
 
         self.heartbeat_thread = Thread(target=heartbeat_loop, daemon=True)

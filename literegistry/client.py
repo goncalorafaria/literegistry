@@ -7,7 +7,7 @@ from collections import defaultdict
 from literegistry.kvstore import KeyValueStore, FileSystemKVStore
 from literegistry.registry import ServerRegistry
 from literegistry.telemetry import LatencyMetricAggregator
-from literegistry.bandit import Exp3Dynamic
+from literegistry.bandit import Exp3Dynamic, UniformBandit
 import asyncio
 import numpy as np
 
@@ -41,7 +41,7 @@ class RegistryClient(ServerRegistry):
         self.telemetry = LatencyMetricAggregator()
         self.service_type = service_type
         self.penalty_latency = penalty_latency
-        self.bandit = Exp3Dynamic(gamma=0.2, L_max=penalty_latency)
+        self.bandit = UniformBandit()#Exp3Dynamic(gamma=0.2, L_max=penalty_latency)
 
     def _is_cache_valid(self, cache_key: str) -> bool:
         """Check if a cache entry is still valid"""
@@ -66,13 +66,18 @@ class RegistryClient(ServerRegistry):
 
         # Get fresh server list
         roster = await self.roster()
+        logging.info(f"Raw roster data: {roster}")
+        
         m: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
         for server in roster["servers"]:
             metadata = server.get("metadata", {})
             model_path = metadata.get(self.service_type, "default")
+            logging.info(f"Processing server {server.get('uri', 'unknown')} with metadata {metadata}, model_path: {model_path}")
             m[model_path].append(server)
 
+        logging.info(f"Processed models: {dict(m)}")
+        
         # Update cache
         self._cache[cache_key] = dict(m)  # Convert defaultdict to regular dict
         self._cache_timestamps[cache_key] = time.time()
@@ -126,8 +131,12 @@ class RegistryClient(ServerRegistry):
         return result
 
     async def sample_servers(self, value: str, n: int):
-
         servers = await self.get_all(value)
+        
+        # Handle case when no servers are available
+        if not servers:
+            return []
+            
         result, _ = self.bandit.get_arm(servers, k=n)  # Get URIs for bandit selection
         return result
 
@@ -173,6 +182,22 @@ class RegistryClient(ServerRegistry):
         else:
             self._cache.pop(model_path, None)
             self._cache_timestamps.pop(model_path, None)
+
+    async def close(self):
+        """Close the registry and clean up resources"""
+        try:
+            if hasattr(self, 'store') and self.store:
+                await self.store.close()
+        except Exception as e:
+            logging.error(f"Error closing registry: {e}")
+
+    async def __aenter__(self):
+        """Context manager entry"""
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit with cleanup"""
+        await self.close()
 
 
 # Example usage
