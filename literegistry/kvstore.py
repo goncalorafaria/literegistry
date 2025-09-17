@@ -163,6 +163,11 @@ class FileSystemKVStore(KeyValueStore):
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, _get_keys)
 
+def get_kvstore(url: str = "redis://klone-login01.hyak.local:6379", db: int = 0):
+    if url.startswith("redis://"):
+        return RedisKVStore(url, db)
+    else:
+        return FileSystemKVStore(url)
 
 # Usage Example
 async def main():
