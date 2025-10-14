@@ -33,23 +33,23 @@ def check_registry(verbose=False, registry_dir="/gscratch/ark/graf/registry"):
     # pp.pprint(r.get("allenai/Llama-3.1-Tulu-3-8B-SFT"))
 
 
-def check_summary(registry_dir="/gscratch/ark/graf/registry"):
-    r = RegistryClient(get_kvstore(registry_dir))
+def check_summary(registry="/gscratch/ark/graf/registry"):
+    r = RegistryClient(get_kvstore(registry))
 
     for k, v in asyncio.run(r.models()).items():
         print(f"{colored(k, 'red')} :{colored(len(v),'green')}")
 
 
 def main(
-    mode: str = "detail",
-    registry_dir="redis://klone-login01.hyak.local:6379"
+    mode: str = "summary",
+    registry="redis://klone-login01.hyak.local:6379"
 ):
   
     if mode == "detail":
-        check_registry(registry_dir)
+        check_registry(registry)
  
     elif mode == "summary":
-        check_summary(registry_dir)
+        check_summary(registry)
 
     else:   
         raise ValueError("Invalid mode")
