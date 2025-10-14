@@ -1,20 +1,7 @@
 # LiteRegistry
 
-LiteRegistry is a lightweight, flexible service registry and discovery system with built-in telemetry and caching. It supports multiple storage backends and provides async-first APIs for modern Python applications.
+Lightweight service registry and discovery system for distributed model inference clusters. Built for vLLM deployments on HPC environments with load balancing and automatic failover.
 
-## Features
-
-- 🌐 HTTP client with automatic retry and server rotation
-- 🔄 Parallel request handling with concurrency controls
-- 📈 Automatic latency reporting and server health tracking
-
-- 🔄 Flexible storage backends (FileSystem, Consul)
-- 📊 Built-in telemetry and latency tracking
-- 🚀 Async-first API design
-- 💾 Intelligent caching with TTL
-- ⚖️ Load balancing with latency-aware routing
-- 🔍 Model-aware service discovery
-- ❤️ Health checking with automatic inactive server pruning
 
 ## Installation
 
@@ -22,227 +9,186 @@ LiteRegistry is a lightweight, flexible service registry and discovery system wi
 pip install literegistry
 ```
 
+## Components
+
+### Registry (Key-Value Store)
+The registry stores service metadata and health information. Choose between:
+- **FileSystem**: Simple file-based storage for single-node setups
+- **Redis**: Distributed storage for multi-node HPC clusters (recommended for production)
+
+The registry tracks which model servers are available, their endpoints, and performance metrics.
+
+### vLLM Module
+Wraps vLLM servers with automatic registry integration. When you launch vLLM through LiteRegistry, it:
+- Auto-registers with the registry on startup
+- Sends heartbeats to maintain active status
+- Reports performance metrics
+
+### Gateway Server
+HTTP reverse proxy that routes client requests to model servers. Features:
+- OpenAI-compatible API endpoints (`/v1/completions`, `/v1/models`, `/classify`)
+- Automatic load balancing based on server latency
+- Model routing based on the `model` parameter in requests
+
+### CLI Tool
+Command-line interface for monitoring your cluster:
+- View registered models and server counts
+- Check server health and request statistics
+- Monitor latency metrics and request throughput
+
+### Client Library
+Python API for programmatic interaction:
+- `RegistryClient`: Register servers and query available models
+- `RegistryHTTPClient`: Make requests with automatic failover and retry
+
+### How Components Work Together
+
+```
+1. vLLM servers register themselves:
+   vLLM Instance → Registry (Redis/FS)
+   
+2. Client sends request to Gateway:
+   Client → Gateway Server
+   
+3. Gateway queries Registry and routes to best server:
+   Gateway → Registry (get available servers)
+   Gateway → vLLM Instance (send request)
+   
+4. Gateway reports metrics back:
+   Gateway → Registry (update latency/stats)
+```
+
+## HPC Cluster Deployment
+
+Complete workflow for deploying distributed model inference:
+
+**1. Start Redis Server**
+```bash
+python -m literegistry.redis --port 6379
+```
+
+**2. Launch vLLM Instances** (supports all standard vLLM arguments)
+```bash
+python -m literegistry.vllm \
+  --model "meta-llama/Llama-3.1-8B-Instruct" \
+  --registry redis://login-node:6379 \
+  --tensor-parallel-size 4
+```
+
+**3. Start Gateway Server**
+```bash
+python -m literegistry.gateway \
+  --registry redis://login-node:6379 \
+  --host 0.0.0.0 \
+  --port 8080
+```
+
+**4. Monitor Cluster**
+```bash
+# Summary view
+python -m literegistry.cli --mode summary --registry redis://login-node:6379
+
 ## Quick Start
 
-### Basic Server Registration
+### Basic Usage
 
 ```python
-from literegistry import ServerRegistry, FileSystemKVStore
+from literegistry import RegistryClient, get_kvstore
 import asyncio
 
 async def main():
-    # Initialize with filesystem backend
-    store = FileSystemKVStore("registry_data")
-    registry = ServerRegistry(store)
+    # Auto-detect backend (redis:// or file path)
+    store = get_kvstore("redis://localhost:6379")
+    client = RegistryClient(store, service_type="model_path")
     
     # Register a server
-    server_id = await registry.register_server(8000, {"service": "api"})
+    await client.register(
+        port=8000,
+        metadata={"model_path": "meta-llama/Llama-3.1-8B-Instruct"}
+    )
     
-    # Get active servers
-    roster = await registry.roster()
-    print(f"Active servers: {roster}")
+    # List available models
+    models = await client.models()
+    print(models)
 
 asyncio.run(main())
 ```
 
-### Model Registry with Load Balancing
+### HTTP Client with Automatic Failover
 
 ```python
-from literegistry import ModelRegistry, ConsulKVStore
-from aioconsul import Consul
+from literegistry import RegistryHTTPClient
 
-async def main():
-    # Initialize with Consul backend
-    async with Consul() as consul:
-        store = ConsulKVStore(consul, prefix="services/")
-        registry = ModelRegistry(store)
-        
-        # Register a model server
-        await registry.register_server(8000, {
-            "model_path": "gpt-3",
-            "capacity": "high"
-        })
-        
-        # Get best server for model
-        best_uri = await registry.get("gpt-3")
-        
-        # Report latency for load balancing
-        registry.report_latency(best_uri, 0.5)
-```
-
-## Storage Backends
-
-### FileSystem Backend
-
-```python
-from literegistry import FileSystemKVStore
-
-store = FileSystemKVStore("registry_data")
-```
-
-### Consul Backend
-
-```python
-from literegistry import ConsulKVStore
-from aioconsul import Consul
-
-async with Consul() as consul:
-    store = ConsulKVStore(consul, prefix="services/")
-```
-
-## Advanced Usage
-
-### Error Handling with HTTP Client
-
-The HTTP client provides comprehensive error handling:
-
-```python
-async with RegistryHTTPClient(registry, "gpt-3") as client:
-    try:
-        result, _ = await client.request_with_rotation(
-            "v1/completions",
-            payload,
-            timeout=30,
-            max_retries=3
-        )
-    except ValueError as e:
-        # Handle bad request errors
-        print(f"Bad request: {e}")
-    except RuntimeError as e:
-        # Handle retry exhaustion
-        print(f"All retries failed: {e}")
-```
-
-### Parallel Request Configuration
-
-Control parallel request behavior:
-
-```python
-# Configure maximum parallel requests
-max_parallel = 5  # Allow up to 5 concurrent requests
-
-results = await client.parallel_requests(
-    "v1/completions",
-    large_payload_list,
-    timeout=30,
-    max_retries=3,
-    max_parallel_requests=max_parallel
-)
-```
-
-### Custom Backend Implementation
-
-Create your own storage backend by implementing the `KeyValueStore` interface:
-
-```python
-class CustomStore(KeyValueStore):
-    async def get(self, key: str) -> Optional[bytes]:
-        ...
-    
-    async def set(self, key: str, value: Union[bytes, str]) -> bool:
-        ...
-    
-    async def delete(self, key: str) -> bool:
-        ...
-    
-    async def exists(self, key: str) -> bool:
-        ...
-    
-    async def keys(self) -> List[str]:
-        ...
-```
-
-### HTTP Client Usage
-
-The package includes a robust HTTP client that integrates with the registry system:
-
-```python
-from literegistry import RegistryHTTPClient, ModelRegistry
-
-# Initialize registry
-registry = ModelRegistry(store)
-
-# Use the client with context manager
-async with RegistryHTTPClient(registry, "gpt-3") as client:
-    # Single request with automatic retries and server rotation
-    result, server_idx = await client.request_with_rotation(
+async with RegistryHTTPClient(client, "meta-llama/Llama-3.1-8B-Instruct") as http_client:
+    result, _ = await http_client.request_with_rotation(
         "v1/completions",
         {"prompt": "Hello"},
         timeout=30,
         max_retries=3
     )
-    
-    # Parallel requests with concurrency control
-    payloads = [
-        {"prompt": "Hello"},
-        {"prompt": "World"}
-    ]
-    results = await client.parallel_requests(
+```
+
+## Storage Backends
+
+LiteRegistry supports different backends depending on your deployment:
+
+**FileSystem** - For single-node or shared filesystem environments
+```python
+from literegistry import FileSystemKVStore
+store = FileSystemKVStore("registry_data")
+```
+Use when: Running on a single machine or when all nodes share a filesystem (common in HPC clusters with NFS). Note: Can bottleneck with high concurrency.
+
+**Redis** - For distributed multi-node clusters
+```python
+from literegistry import RedisKVStore
+store = RedisKVStore("redis://localhost:6379")
+```
+Use when: Running across multiple nodes without shared storage, or need high-concurrency access. Recommended for production HPC deployments.
+
+## Advanced Usage
+
+### Gateway API
+
+The gateway provides OpenAI-compatible HTTP endpoints that work with existing tools:
+
+```bash
+# Send completion request
+curl -X POST http://localhost:8080/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "meta-llama/Llama-3.1-8B-Instruct", "prompt": "Hello"}'
+
+# List all available models
+curl http://localhost:8080/v1/models
+
+# Check gateway health
+curl http://localhost:8080/health
+```
+
+The gateway automatically routes requests to the appropriate model server based on the `model` field.
+
+### Batch Processing with Parallel Requests
+
+Process multiple requests concurrently with automatic load balancing:
+
+```python
+async with RegistryHTTPClient(client, model) as http_client:
+    # Process 100 requests with max 5 concurrent
+    results = await http_client.parallel_requests(
         "v1/completions",
-        payloads,
+        payloads_list,
+        max_parallel_requests=5,
         timeout=30,
-        max_retries=3,
-        max_parallel_requests=2
+        max_retries=3
     )
 ```
 
-The HTTP client provides:
-- Automatic server rotation on failures
-- Built-in retry mechanism with exponential backoff
-- Integrated latency reporting
-- Parallel request handling with concurrency limits
-- Proper session management via context manager
-- Automatic server list refresh on failures
+This is useful for batch inference workloads. The client handles retry logic and server rotation automatically.
 
-### FastAPI Integration
-
-```python
-from fastapi import FastAPI
-from literegistry import RequestCounterMiddleware, ServerRegistry
-
-app = FastAPI()
-registry = ServerRegistry(store)
-
-# Add request tracking middleware
-app.add_middleware(RequestCounterMiddleware, registry=registry)
-
-# Automatically track request counts
-@app.get("/")
-async def root():
-    return {"message": "Hello World"}
-```
-
-### Telemetry and Load Balancing
-
-The ModelRegistry provides intelligent load balancing based on server latency:
-
-```python
-registry = ModelRegistry(store)
-
-# Get multiple servers weighted by performance
-uris = await registry.get_all("gpt-3", n=3)  # Get 3 servers
-
-# Report latencies to improve load balancing
-for uri in uris:
-    response_time = await make_request(uri)
-    registry.report_latency(uri, response_time)
-```
-
-## Configuration
-
-Key configuration options:
-
-```python
-registry = ModelRegistry(
-    store,
-    max_history=3600,  # Request history window
-    cache_ttl=300,     # Cache TTL in seconds
-)
-```
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions welcome! Please submit a Pull Request.
 
 ## License
 

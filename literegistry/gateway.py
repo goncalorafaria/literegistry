@@ -28,10 +28,11 @@ from starlette.middleware.cors import CORSMiddleware
 from starlette.routing import Route
 import uvicorn
 from literegistry.client import RegistryClient
-from literegistry.kvstore import FileSystemKVStore, RedisKVStore
+from literegistry import get_kvstore
 import pprint
 from termcolor import colored
 import os
+import socket
 
 
 
@@ -188,16 +189,10 @@ class StarletteGatewayServer:
             self.logger.error(f"Cleanup error: {e}")
 
 
-async def main():
+async def main(registry="redis://klone-login03.hyak.local:6379", port=8080):
     """Simple main function without restart loops."""
-    registry_path = os.getenv("REGISTRY_PATH", "redis://klone-login01.hyak.local:6379")
-    port = int(os.getenv("PORT", "8080"))
     
-    # Create store and registry
-    if "redis://" in registry_path:
-        store = RedisKVStore(registry_path)
-    else:
-        store = FileSystemKVStore(registry_path)
+    store = get_kvstore(registry)
     
     registry = RegistryClient(store=store, service_type="model_path")
     server = StarletteGatewayServer(registry, port=port)
@@ -211,6 +206,10 @@ async def main():
     loop = asyncio.get_running_loop()
     for sig in [signal.SIGINT, signal.SIGTERM]:
         loop.add_signal_handler(sig, signal_handler)
+    
+    gateway_url=f"http://{socket.getfqdn()}:{port}"
+    
+    print(f"Gateway server started at {gateway_url}")
     
     try:
         await server.start()
@@ -226,10 +225,8 @@ def create_app():
     registry_path = os.getenv("REGISTRY_PATH", "redis://klone-login01.hyak.local:6379")
     
     try:
-        if "redis://" in registry_path:
-            store = RedisKVStore(registry_path)
-        else:
-            store = FileSystemKVStore(registry_path)
+        
+        store=get_kvstore(registry_path)
         
         registry = RegistryClient(store=store, service_type="model_path")
         server = StarletteGatewayServer(registry)

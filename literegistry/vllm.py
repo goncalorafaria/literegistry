@@ -11,7 +11,7 @@ import math
 import random
 
 
-from literegistry import ServerRegistry, FileSystemKVStore, RedisKVStore
+from literegistry import ServerRegistry, get_kvstore
 
 
 def parse_vllm_requests(metrics_text: str) -> Tuple[float, float]:
@@ -82,10 +82,7 @@ class VLLMServerManager:
 
         # Initialize registry
         
-        if "redis://" in registry:
-            store = RedisKVStore(registry)
-        else:
-            store = FileSystemKVStore(registry)
+        store=get_kvstore(registry)
             
         self.registry = ServerRegistry(
             store=store,
