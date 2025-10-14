@@ -1,6 +1,6 @@
 # LiteRegistry
 
-Lightweight service registry and discovery system for distributed model inference clusters. Built for vLLM deployments on HPC environments with load balancing and automatic failover.
+Lightweight service registry and discovery system for distributed model inference clusters. Built for deployments on HPC environments with load balancing and automatic failover.
 
 
 ## Installation
