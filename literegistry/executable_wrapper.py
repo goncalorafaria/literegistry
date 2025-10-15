@@ -2,52 +2,15 @@ import subprocess
 import requests
 import time
 import socket
-import fire
 import threading
 import asyncio
-from typing import Tuple
-import re
-import math
-import random
-
+from abc import ABC, abstractmethod
 
 from literegistry import ServerRegistry, get_kvstore
 
 
-def parse_vllm_requests(metrics_text: str) -> Tuple[float, float]:
-    """
-    Parse VLLM metrics text and extract running and waiting requests.
-
-    Args:
-        metrics_text (str): Raw prometheus-style metrics text
-
-    Returns:
-        Tuple[float, float]: A tuple containing (running_requests, waiting_requests)
-
-    Example:
-        running, waiting = parse_vllm_requests(metrics_text)
-        total_requests = running + waiting
-    """
-    # Pattern to match metric lines with their values
-    pattern = r"vllm:num_requests_(\w+){.*?} (-?\d+\.?\d*)"
-
-    # Find all matches in the text
-    matches = re.finditer(pattern, metrics_text)
-
-    # Initialize values
-    metrics = {"running": 0.0, "waiting": 0.0}
-
-    # Extract values from matches
-    for match in matches:
-        metric_type = match.group(1)
-        if metric_type in ["running", "waiting"]:
-            # print(match.group(2))
-            metrics[metric_type] = math.floor(float(match.group(2)))
-
-    return metrics["running"] + metrics["waiting"]
-
-
-class VLLMServerManager:
+class ExecutableWrapper(ABC):
+    """Abstract base class for LLM server managers (vLLM, SGLang, etc.)"""
 
     def __init__(
         self,
@@ -55,13 +18,11 @@ class VLLMServerManager:
         model: str = "allenai/Llama-3.1-Tulu-3-8B-DPO",
         port: int = 8000,
         host: str = "0.0.0.0",
-      
- 
         max_history=3600,
         **kwargs,
     ):
         """
-        Initialize VLLM server manager
+        Initialize server manager
 
         Args:
             model: Model name/path
@@ -69,21 +30,17 @@ class VLLMServerManager:
             host: Server host
             registry: Directory for server registry 
             max_history: Maximum history for registry
-            **kwargs: Additional arguments to pass to vLLM server (e.g., enable_chunked_prefill=True)
+            **kwargs: Additional arguments to pass to the server
         """
         self.model = model
-
         self.port = port
         self.host = host 
         self.metrics_port = self.port
-       
         self.url = f"http://{socket.getfqdn()}"
-        self.extra_kwargs = kwargs  # Store extra kwargs for vLLM server
+        self.extra_kwargs = kwargs
 
         # Initialize registry
-        
-        store=get_kvstore(registry)
-            
+        store = get_kvstore(registry)
         self.registry = ServerRegistry(
             store=store,
             max_history=max_history,
@@ -92,21 +49,47 @@ class VLLMServerManager:
         self.process = None
         self.should_run = True
 
+    @abstractmethod
+    def get_server_command(self) -> list:
+        """
+        Return the base command to start the server.
+        
+        Returns:
+            list: Command components like ["python", "-m", "module.name"]
+        """
+        pass
+
+    @abstractmethod
+    def get_model_flag(self) -> str:
+        """
+        Return the command-line flag for specifying the model.
+        
+        Returns:
+            str: Flag name like "--model" or "--model-path"
+        """
+        pass
+
+    @abstractmethod
+    def get_server_name(self) -> str:
+        """
+        Return the name of the server for logging.
+        
+        Returns:
+            str: Server name like "vLLM" or "SGLang"
+        """
+        pass
+
     def start_server(self):
-        """Start the vLLM server as a subprocess"""
-        cmd = [
-            "python",
-            "-m",
-            "vllm.entrypoints.openai.api_server",  #    entrypoints/api_server.py # openai.
-            "--model",
+        """Start the server as a subprocess"""
+        cmd = self.get_server_command()
+        cmd.extend([
+            self.get_model_flag(),
             self.model,
             "--host",
             self.host,
             "--port",
             str(self.port),
-        ]
-
-        # cmd.extend(["--prometheus-port", str(self.metrics_port)])  # or any other port
+        ])
 
         # Add extra kwargs to the command
         for key, value in self.extra_kwargs.items():
@@ -122,12 +105,13 @@ class VLLMServerManager:
                 cmd.extend([arg_name, str(value)])
 
         print(cmd)
-        print(f"vllm_server_{self.registry.server_id}.log")
-        log_file = open(f"vllm_server_{self.registry.server_id}.log", "w")
+        #log_filename = f"{self.get_server_name().lower()}_server_{self.registry.server_id}.log"
+        #print(log_filename)
+        #   log_file = open(log_filename, "w")
         self.process = subprocess.Popen(
-            cmd, stdout=log_file, stderr=subprocess.STDOUT, universal_newlines=True
+            cmd, stdout=None, stderr=None, universal_newlines=True
         )
-        print(f"Started vLLM server with PID {self.process.pid}")
+        print(f"Started {self.get_server_name()} server with PID {self.process.pid}")
 
         # Register server with metadata
         metadata = {
@@ -136,18 +120,6 @@ class VLLMServerManager:
             "port": self.port,
             "extra_kwargs": self.extra_kwargs,
         }
-        
-        """
-        "route": "v1/completions",
-            "args": [
-                "prompt",
-                "model",
-                "max_tokens",
-                "temperature",
-                "stop",
-                "logprobs",
-            ],
-        """
         
         asyncio.run(
             self.registry.register_server(
@@ -158,12 +130,11 @@ class VLLMServerManager:
         )
 
     def check_health(self):
-        """Check if vLLM server is responding"""
+        """Check if server is responding"""
         try:
             response = requests.get(f"http://localhost:{self.port}/v1/models")
             return response.status_code == 200
         except requests.exceptions.RequestException:
-
             return False
 
     def heartbeat_loop(self):
@@ -205,42 +176,3 @@ class VLLMServerManager:
         finally:
             self.cleanup()
 
-def main(
-    model: str = "meta-llama/Llama-3.1-8B-Instruct",  # "allenai/Llama-3.1-Tulu-3-8B-DPO",  # allenai/Llama-3.1-Tulu-3-8B-SFT
-    host: str = "0.0.0.0", 
-    registry: str = "/gscratch/ark/graf/registry",
-    port: int = None,
-    **kwargs,
-):
-    """
-    Run vLLM server with monitoring
-
-    Args:
-        model: Model name/path
-        host: Server host 
-        registry: Directory for server registry
-        port: Server port (random if not specified)
-        **kwargs: Additional arguments to pass to vLLM server (e.g., enable_chunked_prefill=True, max_num_seqs=256)
-        
-    Example:
-        python vllm_wrapper.py --model allenai/Llama-3.1-Tulu-3-8B-DPO --enable_chunked_prefill=True --max_num_seqs=256
-    """
-    manager = VLLMServerManager(
-        model=model,
-        port=random.randint(8000, 12000) if port is None else port,
-        host=host,
-        registry=registry,
-        **kwargs,
-    )
-    manager.run()
-
-
-if __name__ == "__main__":
-    """python -m vllm.entrypoints.openai.api_server  --model allenai/Llama-3.1-Tulu-3-8B-DPO \
-    --host 0.0.0.0 \
-    --port 8000 \
-    --tensor-parallel-size 1 \
-    --gpu-memory-utilization 0.95
-    """
-
-    fire.Fire(main)

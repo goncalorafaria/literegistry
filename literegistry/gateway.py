@@ -33,7 +33,7 @@ import pprint
 from termcolor import colored
 import os
 import socket
-
+import fire
 
 
 class StarletteGatewayServer:
@@ -189,7 +189,7 @@ class StarletteGatewayServer:
             self.logger.error(f"Cleanup error: {e}")
 
 
-async def main(registry="redis://klone-login03.hyak.local:6379", port=8080):
+async def main_async(registry="redis://klone-login03.hyak.local:6379", port=8080):
     """Simple main function without restart loops."""
     
     store = get_kvstore(registry)
@@ -246,5 +246,8 @@ def create_app():
         return app
 
 
+def main(registry="redis://klone-login03.hyak.local:6379", port=8080):
+    asyncio.run(main_async(registry, port))
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    fire.Fire(main)

@@ -8,6 +8,7 @@ import time
 import subprocess
 import shutil
 import os
+import fire
 
 
 class RedisKVStore(KeyValueStore):
@@ -148,7 +149,7 @@ def start_redis_server(port=6379, redis_server_path=None):
     return url
 
 # Usage Example
-async def main(port=6379):  
+async def main_async(port=6379):  
     # FileSystem Example
     #fs_store = FileSystemKVStore()
     #await fs_store.set("test1.txt", "Hello FS!")
@@ -157,7 +158,9 @@ async def main(port=6379):
     url = start_redis_server(port)
     print(f"Redis server started with URL: {url}")
     
+def main(port=6379):
+    asyncio.run(main_async(port))
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+   fire.Fire(main)

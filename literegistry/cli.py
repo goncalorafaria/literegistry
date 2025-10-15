@@ -3,8 +3,12 @@ import pprint
 from termcolor import colored
 import asyncio
 from literegistry import RegistryClient, get_kvstore
-
-
+import fire
+import literegistry.redis as redis
+import literegistry.gateway as gateway
+import literegistry.vllm_wrapper as vllm
+import literegistry.sglang_wrapper as sglang
+    
 def check_registry(verbose=False, registry_dir="/gscratch/ark/graf/registry"):
     
     r = RegistryClient(get_kvstore(registry_dir))
@@ -33,29 +37,24 @@ def check_registry(verbose=False, registry_dir="/gscratch/ark/graf/registry"):
     # pp.pprint(r.get("allenai/Llama-3.1-Tulu-3-8B-SFT"))
 
 
-def check_summary(registry="/gscratch/ark/graf/registry"):
+def check_summary(registry="redis://klone-login01.hyak.local:6379"):
     r = RegistryClient(get_kvstore(registry))
 
     for k, v in asyncio.run(r.models()).items():
         print(f"{colored(k, 'red')} :{colored(len(v),'green')}")
 
 
-def main(
-    mode: str = "summary",
-    registry="redis://klone-login01.hyak.local:6379"
-):
-  
-    if mode == "detail":
-        check_registry(registry)
- 
-    elif mode == "summary":
-        check_summary(registry)
-
-    else:   
-        raise ValueError("Invalid mode")
+def main():
+    
+    fire.Fire({
+        "summary": check_summary,
+        "redis": redis.main,
+        "gateway": gateway.main,
+        "vllm": vllm.main,
+        "sglang": sglang.main,
+    })
 
 
 if __name__ == "__main__":
-    import fire
 
-    fire.Fire(main)
+    main()
