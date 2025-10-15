@@ -67,7 +67,7 @@ Complete workflow for deploying distributed model inference:
 literegistry redis --port 6379
 ```
 
-**2. Launch vLLM Instances** (supports all standard vLLM arguments)
+**2. Launch vLLM/SGLang Instances** (supports all standard vLLM/SGLang arguments)
 ```bash
 literegistry vllm \
   --model "meta-llama/Llama-3.1-8B-Instruct" \
