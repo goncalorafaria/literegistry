@@ -45,8 +45,15 @@ def main(
     os.environ.pop("http_proxy", None)
     os.environ.pop("https_proxy", None)
     os.environ.pop("no_proxy", None)
-
+    os.environ.pop("HTTP_PROXY", None)
+    os.environ.pop("HTTPS_PROXY", None)
     
+    """
+    unset http_proxy
+    unset https_proxy
+    unset HTTP_PROXY
+    unset HTTPS_PROXY
+    """
 
     manager = SGLangServerManager(
         model=model,

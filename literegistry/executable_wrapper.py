@@ -19,6 +19,7 @@ class ExecutableWrapper(ABC):
         port: int = 8000,
         host: str = "0.0.0.0",
         max_history=3600,
+        heartbeat_interval=30,
         **kwargs,
     ):
         """
@@ -38,6 +39,7 @@ class ExecutableWrapper(ABC):
         self.metrics_port = self.port
         self.url = f"http://{socket.getfqdn()}"
         self.extra_kwargs = kwargs
+        self.heartbeat_interval = heartbeat_interval
 
         # Initialize registry
         store = get_kvstore(registry)
@@ -145,7 +147,7 @@ class ExecutableWrapper(ABC):
                 # print("Heartbeat sent. Status: healthy")
             else:
                 print("Server unhealthy!")
-            time.sleep(10)
+            time.sleep(self.heartbeat_interval)
 
     def cleanup(self):
         """Clean up resources"""
