@@ -64,12 +64,12 @@ Complete workflow for deploying distributed model inference:
 
 **1. Start Redis Server**
 ```bash
-python -m literegistry.redis --port 6379
+literegistry redis --port 6379
 ```
 
 **2. Launch vLLM Instances** (supports all standard vLLM arguments)
 ```bash
-python -m literegistry.vllm \
+literegistry vllm \
   --model "meta-llama/Llama-3.1-8B-Instruct" \
   --registry redis://login-node:6379 \
   --tensor-parallel-size 4
@@ -77,7 +77,7 @@ python -m literegistry.vllm \
 
 **3. Start Gateway Server**
 ```bash
-python -m literegistry.gateway \
+literegistry gateway \
   --registry redis://login-node:6379 \
   --host 0.0.0.0 \
   --port 8080
@@ -86,7 +86,8 @@ python -m literegistry.gateway \
 **4. Monitor Cluster**
 ```bash
 # Summary view
-python -m literegistry.cli --mode summary --registry redis://login-node:6379
+literegistry summary --registry redis://login-node:6379
+```
 
 ## Quick Start
 
