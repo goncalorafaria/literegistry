@@ -120,6 +120,7 @@ class ExecutableWrapper(ABC):
             "model_path": self.model,
             "host": self.host,
             "port": self.port,
+            "backend": self.get_server_name().lower(),  # "vllm" or "sglang"
             "extra_kwargs": self.extra_kwargs,
         }
         

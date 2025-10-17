@@ -97,6 +97,7 @@ class StarletteGatewayServer:
             
     async def handle_completions(self,request: Request):
         """Handle completion requests."""
+        payload = None
         try:
             payload = await request.json()
             model = payload.get("model")
@@ -121,13 +122,46 @@ class StarletteGatewayServer:
                 return JSONResponse(result)
                 
         except Exception as e:
-            #self.logger.error(f"Completion error: {e}")
-            self.logger.error(f"Completion error: {e} : {json.dumps(payload, indent=4)}")
+            if payload:
+                self.logger.error(f"Completion error: {e} : {json.dumps(payload, indent=4)}")
+            else:
+                self.logger.error(f"Completion error: {e}")
             return JSONResponse({
                 "error": str(e),
                 "status": "failed"
             }, status_code=500)
+    
+    async def handle_classify(self,request: Request):
+        """Handle classify requests."""
+        payload = None
+        try:
+            payload = await request.json()
+            input = payload.get("input")
+            model = payload.get("model")
+            
+            # Use the HTTP client
+            from literegistry.http import RegistryHTTPClient
+            
+            async with RegistryHTTPClient(
+                self.registry, 
+                model,
+                timeout=self.timeout,
+                max_retries=self.max_retries
+            ) as client:
+                result, _ = await client.request_with_rotation("classify", payload)
+                return JSONResponse(result)
                 
+        except Exception as e:
+            if payload:
+                self.logger.error(f"Classify error: {e} : {json.dumps(payload, indent=4)}")
+            else:
+                self.logger.error(f"Classify error: {e}")
+            return JSONResponse({
+                "error": str(e),
+                "status": "failed"
+            }, status_code=500)
+            
+            
     def _create_app(self):
         """Create the Starlette application with minimal error handling."""
         
@@ -137,7 +171,8 @@ class StarletteGatewayServer:
             routes=[
                 Route("/health", self.health_check, methods=["GET"]),
                 Route("/v1/models", self.list_models, methods=["GET"]),
-                Route("/v1/completions", self.handle_completions, methods=["POST"])
+                Route("/v1/completions", self.handle_completions, methods=["POST"]),
+                Route("/classify", self.handle_classify, methods=["POST"])
             ]
         )
         
@@ -189,12 +224,12 @@ class StarletteGatewayServer:
             self.logger.error(f"Cleanup error: {e}")
 
 
-async def main_async(registry="redis://klone-login03.hyak.local:6379", port=8080):
+async def main_async(registry="redis://klone-login03.hyak.local:6379", port=8080,cache_ttl=20):
     """Simple main function without restart loops."""
     
     store = get_kvstore(registry)
     
-    registry = RegistryClient(store=store, service_type="model_path")
+    registry = RegistryClient(store=store, service_type="model_path",cache_ttl=cache_ttl)
     server = StarletteGatewayServer(registry, port=port)
     
     # Set up signal handling
@@ -248,6 +283,63 @@ def create_app():
 
 def main(registry="redis://klone-login03.hyak.local:6379", port=8080):
     asyncio.run(main_async(registry, port))
+
+
+def run_in_thread(registry="redis://klone-login03.hyak.local:6379", port=8080):
+    """
+    Thread-safe entry point for running the gateway in a separate thread.
+    
+    This function creates its own event loop and doesn't register signal handlers,
+    making it safe to call from non-main threads.
+    
+    Args:
+        registry: Registry connection string (e.g., "redis://host:port")
+        port: Port to run the gateway server on
+    """
+    # Create a new event loop for this thread
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    try:
+        # Initialize registry components
+        store = get_kvstore(registry)
+        registry_client = RegistryClient(store=store, service_type="model_path")
+        server = StarletteGatewayServer(registry_client, port=port)
+        
+        # Set up uvicorn access logger to use root logger
+        import logging
+        access_logger = logging.getLogger("uvicorn.access")
+        access_logger.setLevel(logging.INFO)
+        access_logger.propagate = True  # Propagate to root logger
+        
+        # Create uvicorn config
+        config = uvicorn.Config(
+            app=server.app,
+            host="0.0.0.0",
+            port=port,
+            log_level="info",
+            access_log=True,  # Enable access logs to see HTTP requests
+            log_config=None  # Use default logging, which will propagate to our handlers
+        )
+        
+        # Run server without signal handlers (since we're in a thread)
+        uvicorn_server = uvicorn.Server(config)
+        
+        gateway_url = f"http://{socket.getfqdn()}:{port}"
+        print(f"Gateway server started at {gateway_url}")
+        
+        # Run the server in this thread's event loop
+        loop.run_until_complete(uvicorn_server.serve())
+        
+    except KeyboardInterrupt:
+        print("Gateway interrupted")
+    except Exception as e:
+        print(f"Gateway error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        loop.close()
+
 
 if __name__ == "__main__":
     fire.Fire(main)

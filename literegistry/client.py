@@ -66,17 +66,17 @@ class RegistryClient(ServerRegistry):
 
         # Get fresh server list
         roster = await self.roster()
-        logging.info(f"Raw roster data: {roster}")
+        #logging.info(f"Raw roster data: {roster}")
         
         m: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
         for server in roster["servers"]:
             metadata = server.get("metadata", {})
             model_path = metadata.get(self.service_type, "default")
-            logging.info(f"Processing server {server.get('uri', 'unknown')} with metadata {metadata}, model_path: {model_path}")
+            #logging.info(f"Processing server {server.get('uri', 'unknown')} with metadata {metadata}, model_path: {model_path}")
             m[model_path].append(server)
 
-        logging.info(f"Processed models: {dict(m)}")
+        #logging.info(f"Processed models: {dict(m)}")
         
         # Update cache
         self._cache[cache_key] = dict(m)  # Convert defaultdict to regular dict
