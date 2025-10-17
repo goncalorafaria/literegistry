@@ -1,18 +1,48 @@
 """
 LiteRegistry Gateway Server
 
-This module provides a lightweight gateway server using Starlette and uvicorn.
+Production-grade gateway server using Starlette and uvicorn.
+
+ARCHITECTURE:
+    ✅ Single shared aiohttp session for ALL requests
+    ✅ Connection pooling managed by aiohttp (no manual pooling)
+    ✅ Unlimited connections with 2-minute keep-alive
+    ✅ DNS caching (5 minutes)
+    ✅ Automatic retry and server rotation on failures
+    ✅ Starlette lifespan for proper resource management
+    ✅ No file descriptor leaks
+
+KEY IMPROVEMENTS:
+    - BEFORE: 128 clients × 100 connections = 12,800 file descriptors ❌
+    - AFTER:  1 shared session × unlimited = Efficient pooling ✅
 
 RECOMMENDED USAGE (most efficient):
+    ulimit -n 65536
     uvicorn literegistry.gateway:app --host 0.0.0.0 --port 8080 --workers 8
 
 ALTERNATIVE USAGE (for development/testing):
-    python -m literegistry.gateway
+    ulimit -n 65536
+    python -m literegistry.gateway --registry='redis://...' --port=8080
+
+ENDPOINTS:
+    GET  /health         - Health check
+    GET  /session-stats  - Shared session statistics (monitoring)
+    GET  /v1/models      - List available models
+    POST /v1/completions - Completion requests
+    POST /classify       - Classification requests
 
 Environment variables:
     REGISTRY_PATH: Registry connection string (default: redis://klone-login01.hyak.local:6379)
     PORT: Server port (default: 8080)
     WORKERS: Number of worker processes (default: 1)
+
+MONITORING:
+    curl http://localhost:8080/session-stats
+    
+    Response shows shared session configuration:
+    - connector_limit: 0 (unlimited)
+    - keepalive_timeout: 120 seconds
+    - dns_cache_ttl: 300 seconds
 """
 
 import asyncio
@@ -21,6 +51,8 @@ import logging
 import signal
 import sys
 from typing import Dict, List, Optional, Any
+from collections import defaultdict
+from contextlib import asynccontextmanager
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -29,6 +61,7 @@ from starlette.routing import Route
 import uvicorn
 from literegistry.client import RegistryClient
 from literegistry import get_kvstore
+from literegistry.shared_session import get_session_manager
 import pprint
 from termcolor import colored
 import os
@@ -37,7 +70,14 @@ import fire
 
 
 class StarletteGatewayServer:
-    """Ultra-lightweight gateway server using Starlette and uvicorn."""
+    """
+    Production-grade gateway server using Starlette and uvicorn.
+    
+    Architecture:
+    - Single shared aiohttp session for all requests
+    - Connections managed by aiohttp's built-in pooling
+    - No manual client pooling needed
+    """
 
     def __init__(
         self,
@@ -60,7 +100,6 @@ class StarletteGatewayServer:
         
         # Create app
         self.app = self._create_app()
-    
 
     async def health_check(self,request: Request):
         """Health check endpoint."""
@@ -77,6 +116,39 @@ class StarletteGatewayServer:
                 "status": "unhealthy",
                 "error": str(e)
             }, status_code=503)
+    
+    async def session_stats(self, request: Request):
+        """
+        Shared session statistics endpoint for monitoring.
+        
+        Reports status of the shared aiohttp session.
+        """
+        session_manager = get_session_manager()
+        
+        stats = {
+            "shared_session_initialized": session_manager.is_initialized,
+            "architecture": "single_shared_session",
+            "pattern": "production_grade"
+        }
+        
+        if session_manager.is_initialized:
+            try:
+                session = session_manager.get_session()
+                connector = session.connector
+                stats.update({
+                    "session_closed": session.closed,
+                    "connector_limit": connector.limit,
+                    "connector_limit_per_host": connector.limit_per_host,
+                    "keepalive_timeout": connector.keepalive_timeout,
+                    "dns_cache_ttl": connector.ttl_dns_cache
+                })
+            except Exception as e:
+                stats["error"] = str(e)
+        
+        return JSONResponse({
+            "status": "success",
+            "session_info": stats
+        })
     
     async def list_models(self,request: Request):
         """List available models."""
@@ -96,8 +168,13 @@ class StarletteGatewayServer:
             }, status_code=500)
             
     async def handle_completions(self,request: Request):
-        """Handle completion requests."""
+        """
+        Handle completion requests.
+        
+        Uses shared aiohttp session via RegistryHTTPClient for optimal performance.
+        """
         payload = None
+        
         try:
             payload = await request.json()
             model = payload.get("model")
@@ -109,14 +186,15 @@ class StarletteGatewayServer:
             
             self.logger.info(f"Processing request for model: {model}")
             
-            # Use the HTTP client
+            # Use shared session via RegistryHTTPClient
             from literegistry.http import RegistryHTTPClient
             
             async with RegistryHTTPClient(
-                self.registry, 
+                self.registry,
                 model,
                 timeout=self.timeout,
-                max_retries=self.max_retries
+                max_retries=self.max_retries,
+                use_shared_session=True  # Use shared session!
             ) as client:
                 result, _ = await client.request_with_rotation("v1/completions", payload)
                 return JSONResponse(result)
@@ -132,21 +210,32 @@ class StarletteGatewayServer:
             }, status_code=500)
     
     async def handle_classify(self,request: Request):
-        """Handle classify requests."""
+        """
+        Handle classify requests.
+        
+        Uses shared aiohttp session via RegistryHTTPClient for optimal performance.
+        """
         payload = None
+        
         try:
             payload = await request.json()
             input = payload.get("input")
             model = payload.get("model")
             
-            # Use the HTTP client
+            if not model:
+                return JSONResponse({
+                    "error": "model parameter required"
+                }, status_code=400)
+            
+            # Use shared session via RegistryHTTPClient
             from literegistry.http import RegistryHTTPClient
             
             async with RegistryHTTPClient(
-                self.registry, 
+                self.registry,
                 model,
                 timeout=self.timeout,
-                max_retries=self.max_retries
+                max_retries=self.max_retries,
+                use_shared_session=True  # Use shared session!
             ) as client:
                 result, _ = await client.request_with_rotation("classify", payload)
                 return JSONResponse(result)
@@ -163,17 +252,40 @@ class StarletteGatewayServer:
             
             
     def _create_app(self):
-        """Create the Starlette application with minimal error handling."""
+        """Create the Starlette application with lifespan management."""
         
+        # Lifespan context manager for proper resource management
+        # Initialize shared session at startup for optimal connection reuse
+        @asynccontextmanager
+        async def lifespan(app: Starlette):
+            # STARTUP: Initialize shared aiohttp session
+            app.state.gateway_server = self
+            
+            session_manager = get_session_manager()
+            await session_manager.initialize()
+            
+            self.logger.info("✅ Gateway started with shared aiohttp session")
+            self.logger.info(f"   Architecture: Single shared session for all requests")
+            self.logger.info(f"   Connection pooling: Managed by aiohttp")
+            
+            yield
+            
+            # SHUTDOWN: Cleanup resources
+            self.logger.info("Shutting down gateway...")
+            await session_manager.shutdown()
+            await self.shutdown()
+            self.logger.info("✅ Gateway shutdown complete")
         
-        # Create app with routes
+        # Create app with routes and lifespan
         app = Starlette(
             routes=[
                 Route("/health", self.health_check, methods=["GET"]),
+                Route("/session-stats", self.session_stats, methods=["GET"]),
                 Route("/v1/models", self.list_models, methods=["GET"]),
                 Route("/v1/completions", self.handle_completions, methods=["POST"]),
                 Route("/classify", self.handle_classify, methods=["POST"])
-            ]
+            ],
+            lifespan=lifespan
         )
         
         # Add CORS
@@ -215,11 +327,18 @@ class StarletteGatewayServer:
             raise
     
     async def shutdown(self):
-        """Graceful shutdown."""
+        """
+        Graceful shutdown.
+        
+        Note: Shared session cleanup is handled by session_manager in lifespan.
+        """
         self._shutdown_event.set()
+        
+        # Close registry store
         try:
             if hasattr(self.registry, 'store'):
                 await self.registry.store.close()
+                self.logger.info("Registry store closed")
         except Exception as e:
             self.logger.error(f"Cleanup error: {e}")
 

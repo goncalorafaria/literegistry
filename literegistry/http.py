@@ -4,6 +4,7 @@ from typing import Dict, List, Tuple, Optional
 import logging
 from literegistry.client import RegistryClient
 from literegistry.kvstore import FileSystemKVStore
+from literegistry.shared_session import get_shared_session
 from tqdm import tqdm
 
 # Configure logging
@@ -12,7 +13,12 @@ logger = logging.getLogger(__name__)
 
 
 class RegistryHTTPClient:
-    """HTTP client for making requests to model servers via the registry."""
+    """
+    HTTP client for making requests to model servers via the registry.
+    
+    Uses shared aiohttp session when available for optimal connection reuse,
+    creating a temporary session only as fallback.
+    """
 
     def __init__(
         self,
@@ -21,6 +27,7 @@ class RegistryHTTPClient:
         max_parallel_requests: int = 512,
         timeout: float = 60,
         max_retries: int = 5,
+        use_shared_session: bool = True,
     ):
         """
         Initialize the HTTP client.
@@ -28,37 +35,84 @@ class RegistryHTTPClient:
         Args:
             registry: ModelRegistry instance for service discovery
             value: Model path to use for server selection
+            use_shared_session: If True, use shared session (recommended)
         """
         self.registry = registry
         self.value = value
         self._session: Optional[aiohttp.ClientSession] = None
+        self._owns_session = False  # Track if we created the session
         self.max_parallel_requests = max_parallel_requests
         self.timeout = timeout
         self.max_retries = max_retries
-        # Add connection pooling limits
+        self.use_shared_session = use_shared_session
         self._connector = None
 
     async def __aenter__(self):
-        # Create connector with connection pooling limits
-        self._connector = aiohttp.TCPConnector(
-            limit=500,  # Total connection pool size
-            limit_per_host=100,  # Max connections per host
-            ttl_dns_cache=600,  # DNS cache TTL
-            use_dns_cache=True,
-            keepalive_timeout=60,
-            enable_cleanup_closed=True
+        """
+        Initialize session - prefer shared session, create temporary if needed.
+        
+        Production pattern: Try shared session first for connection reuse.
+        """
+        # Try to get shared session (optimal for connection reuse)
+        if self.use_shared_session:
+            shared_session = await get_shared_session()
+            if shared_session is not None and not shared_session.closed:
+                self._session = shared_session
+                self._owns_session = False
+                logger.debug(f"Using shared session for {self.value}")
+                return self
+        
+        # Fallback: Create temporary session
+        logger.warning(
+            f"Shared session not available for {self.value}, creating temporary session. "
+            "This is less efficient - ensure shared session is initialized at startup."
         )
-        self._session = aiohttp.ClientSession(connector=self._connector)
+        
+        self._connector = aiohttp.TCPConnector(
+            limit=100,
+            limit_per_host=20,
+            ttl_dns_cache=300,
+            use_dns_cache=True,
+            keepalive_timeout=30,
+            enable_cleanup_closed=True,
+            force_close=False,
+        )
+        
+        timeout = aiohttp.ClientTimeout(
+            total=self.timeout,
+            connect=10,
+            sock_read=self.timeout
+        )
+        
+        self._session = aiohttp.ClientSession(
+            connector=self._connector,
+            timeout=timeout,
+            connector_owner=True
+        )
+        self._owns_session = True
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """
+        Cleanup - only close session if we created it (not shared).
+        
+        Important: Never close the shared session here - it's managed at app level.
+        """
         try:
-            if self._session:
+            # Only close if we own the session (not shared)
+            if self._owns_session and self._session:
                 await self._session.close()
+                await asyncio.sleep(0.25)  # Graceful close
                 self._session = None
-            if self._connector:
-                await self._connector.close()
-                self._connector = None
+                
+                if self._connector:
+                    await self._connector.close()
+                    self._connector = None
+            
+            # Reset state
+            self._session = None
+            self._owns_session = False
+            
         except Exception as e:
             logger.error(f"Error closing HTTP client session: {e}")
 
