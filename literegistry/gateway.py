@@ -1,28 +1,22 @@
 """
 LiteRegistry Gateway Server
 
-Production-grade gateway server using Starlette and uvicorn.
+This module provides a production-grade gateway server using Starlette and uvicorn,
+following best practices from LiteLLM and modern async Python patterns.
 
-ARCHITECTURE:
-    ✅ Single shared aiohttp session for ALL requests
-    ✅ Connection pooling managed by aiohttp (no manual pooling)
-    ✅ Unlimited connections with 2-minute keep-alive
-    ✅ DNS caching (5 minutes)
-    ✅ Automatic retry and server rotation on failures
-    ✅ Starlette lifespan for proper resource management
-    ✅ No file descriptor leaks
-
-KEY IMPROVEMENTS:
-    - BEFORE: 128 clients × 100 connections = 12,800 file descriptors ❌
-    - AFTER:  1 shared session × unlimited = Efficient pooling ✅
+FEATURES:
+    - Connection pooling with persistent HTTP clients (no file descriptor leaks)
+    - Automatic retry and server rotation on failures
+    - Starlette lifespan management for proper resource cleanup
+    - Connection pool monitoring endpoint
+    - Graceful shutdown handling
+    - CORS support
 
 RECOMMENDED USAGE (most efficient):
-    ulimit -n 65536
     uvicorn literegistry.gateway:app --host 0.0.0.0 --port 8080 --workers 8
 
 ALTERNATIVE USAGE (for development/testing):
-    ulimit -n 65536
-    python -m literegistry.gateway --registry='redis://...' --port=8080
+    python -m literegistry.gateway
 
 ENDPOINTS:
     GET  /health         - Health check

@@ -1,5 +1,7 @@
 # LiteRegistry
 
+![LiteRegistry](literegistry.png)
+
 Lightweight service registry and discovery system for distributed model inference clusters. Built for deployments on HPC environments with load balancing and automatic failover.
 
 
