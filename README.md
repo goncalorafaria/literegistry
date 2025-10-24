@@ -99,7 +99,7 @@ async with RegistryHTTPClient(client, "meta-llama/Llama-3.1-8B-Instruct") as htt
     )
 ```
 
-## Storage Backends
+### Storage Backends
 
 LiteRegistry supports different backends depending on your deployment:
 
