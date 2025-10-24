@@ -1,4 +1,4 @@
-![LiteRegistry](literegistry.png)
+<img src="literegistry.png" alt="LiteRegistry" style="object-fit: cover; height: 200px; width: 100%;">
 
 Lightweight service registry and discovery system for distributed model inference clusters. Built for deployments on HPC environments with load balancing and automatic failover.
 
@@ -186,6 +186,18 @@ async with RegistryHTTPClient(client, model) as http_client:
 
 This is useful for batch inference workloads. The client handles retry logic and server rotation automatically.
 
+## Citation
+
+If you use LiteRegistry in your research, please cite:
+
+```
+@software{literegistry2025,
+  title={literegistry: Lightweight Service Discovery for Distributed Model Inference},
+  author={Faria, Gonçalo and Smith, Noah},
+  year={2024},
+  url={https://github.com/goncalorafaria/literegistry}
+}
+```
 
 ## Contributing
 
