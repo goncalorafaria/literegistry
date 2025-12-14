@@ -61,6 +61,7 @@ from termcolor import colored
 import os
 import socket
 import fire
+import time
 
 
 class StarletteGatewayServer:
@@ -78,8 +79,8 @@ class StarletteGatewayServer:
         registry: RegistryClient,
         host: str = "0.0.0.0",
         port: int = 8080,
-        timeout: float = 60,
-        max_retries: int = 3
+        timeout: float = 20,
+        max_retries: int = 20
     ):
         self.registry = registry
         self.host = host
@@ -178,7 +179,7 @@ class StarletteGatewayServer:
                     "error": "model parameter required"
                 }, status_code=400)
             
-            self.logger.info(f"Processing request for model: {model}")
+            self.logger.info(f"Processing [completions] request for model: {model} - time : {time.time()}")
             
             # Use shared session via RegistryHTTPClient
             from literegistry.http import RegistryHTTPClient
@@ -221,6 +222,7 @@ class StarletteGatewayServer:
                     "error": "model parameter required"
                 }, status_code=400)
             
+            self.logger.info(f"Processing [classify] request for model: {model} - time : {time.time()}")
             # Use shared session via RegistryHTTPClient
             from literegistry.http import RegistryHTTPClient
             
@@ -301,8 +303,13 @@ class StarletteGatewayServer:
         
         return app
     
-    async def start(self):
+    async def start(self, workers: int = 1):
         """Start the server - no restart logic."""
+        if workers > 1:
+            # For multiple workers, we need to use uvicorn.run() which is blocking
+            # This will be handled differently in main_async
+            raise ValueError("Multiple workers must be started via uvicorn CLI or use start_with_workers()")
+        
         config = uvicorn.Config(
             app=self.app,
             host=self.host,
@@ -312,13 +319,28 @@ class StarletteGatewayServer:
         )
         
         server = uvicorn.Server(config)
-        self.logger.info(f"Starting server on {self.host}:{self.port}")
+        self.logger.info(f"Starting server on {self.host}:{self.port} (single worker)")
         
         try:
             await server.serve()
         except Exception as e:
             self.logger.error(f"Server error: {e}")
             raise
+    
+    def start_with_workers(self, workers: int = 1):
+        """Start the server with multiple workers (blocking call)."""
+        self.logger.info(f"Starting server on {self.host}:{self.port} with {workers} workers")
+        # Note: uvicorn.run() with workers requires an import string, not an app object
+        # The registry path should be set via REGISTRY_PATH environment variable
+        # or passed to create_app() function
+        uvicorn.run(
+            "literegistry.gateway:create_app",
+            host=self.host,
+            port=self.port,
+            workers=workers,
+            log_level="info",
+            access_log=False
+        )
     
     async def shutdown(self):
         """
@@ -337,15 +359,17 @@ class StarletteGatewayServer:
             self.logger.error(f"Cleanup error: {e}")
 
 
-async def main_async(registry="redis://klone-login03.hyak.local:6379", port=8080,cache_ttl=20):
+async def main_async(registry="redis://klone-login03.hyak.local:6379", port=8080, cache_ttl=20):
     """Simple main function without restart loops."""
     
     store = get_kvstore(registry)
     
-    registry = RegistryClient(store=store, service_type="model_path",cache_ttl=cache_ttl)
+    registry = RegistryClient(store=store, service_type="model_path", cache_ttl=cache_ttl)
     server = StarletteGatewayServer(registry, port=port)
     
-    # Set up signal handling
+    gateway_url = f"http://{socket.getfqdn()}:{port}"
+    
+    # Set up signal handling for single worker async mode
     def signal_handler():
         print("Received shutdown signal")
         asyncio.create_task(server.shutdown())
@@ -355,9 +379,7 @@ async def main_async(registry="redis://klone-login03.hyak.local:6379", port=8080
     for sig in [signal.SIGINT, signal.SIGTERM]:
         loop.add_signal_handler(sig, signal_handler)
     
-    gateway_url=f"http://{socket.getfqdn()}:{port}"
-    
-    print(f"Gateway server started at {gateway_url}")
+    print(f"Gateway server started at {gateway_url} (single worker)")
     
     try:
         await server.start()
@@ -394,8 +416,22 @@ def create_app():
         return app
 
 
-def main(registry="redis://klone-login03.hyak.local:6379", port=8080):
-    asyncio.run(main_async(registry, port))
+def main(registry="redis://klone-login03.hyak.local:6379", port=8080, workers=1):
+    """Main entry point. Use workers > 1 for multi-worker mode."""
+    # If multiple workers, use blocking uvicorn.run() with import string
+    # Set REGISTRY_PATH env var so create_app() can use it
+    if workers > 1:
+        # Set environment variable for create_app() to use
+        os.environ["REGISTRY_PATH"] = registry
+        store = get_kvstore(registry)
+        registry_client = RegistryClient(store=store, service_type="model_path")
+        server = StarletteGatewayServer(registry_client, port=port)
+        gateway_url = f"http://{socket.getfqdn()}:{port}"
+        print(f"Gateway server starting at {gateway_url} with {workers} workers")
+        server.start_with_workers(workers=workers)
+    else:
+        # Single worker uses async mode
+        asyncio.run(main_async(registry, port))
 
 
 def run_in_thread(registry="redis://klone-login03.hyak.local:6379", port=8080):

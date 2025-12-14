@@ -22,9 +22,10 @@ class RegistryClient(ServerRegistry):
         self,
         store: KeyValueStore,
         max_history: int = 3600,
-        cache_ttl: int = 60 * 5,
+        cache_ttl: int = 5,
         service_type="model_path",
         penalty_latency=200,
+        max_heartbeat_interval=15,
     ):
         """
         Initialize ModelRegistry
@@ -34,7 +35,7 @@ class RegistryClient(ServerRegistry):
             max_history: Maximum number of requests to track
             cache_ttl: Time-to-live for cache entries in seconds
         """
-        super().__init__(store, max_history)
+        super().__init__(store, max_history, max_heartbeat_interval)
         self._cache: Dict[str, Any] = {}
         self._cache_timestamps: Dict[str, float] = {}
         self.cache_ttl = cache_ttl

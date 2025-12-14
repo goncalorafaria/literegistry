@@ -3,13 +3,13 @@ import random
 
 from literegistry.executable_wrapper import ExecutableWrapper
 import os
-
+# python3 -m sglang.launch_server 
 class SGLangServerManager(ExecutableWrapper):
     """SGLang server manager implementation"""
 
     def get_server_command(self) -> list:
         """Return the command to start SGLang server"""
-        return ["python", "-m", "sglang.launch_server"]
+        return ["python3", "-m", "sglang.launch_server"]
 
     def get_model_flag(self) -> str:
         """Return the model flag for SGLang"""
@@ -23,7 +23,7 @@ class SGLangServerManager(ExecutableWrapper):
 def main(
     model: str = "meta-llama/Llama-3.1-8B-Instruct",
     host: str = "0.0.0.0", 
-    registry: str = "/gscratch/ark/graf/registry",
+    registry: str = "/mmfs1/home/gfaria/registry",
     port: int = None,
     **kwargs,
 ):

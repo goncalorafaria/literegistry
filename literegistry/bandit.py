@@ -55,13 +55,14 @@ class Exp3Dynamic:
 
             max_log = max(self.weights.values())
             # unnormalized "weights" shifted by max to avoid overflow
-            self.weights = {a: (lw - max_log) for a, lw in self.weights.items()}
-            exp_weights = {a: math.exp(lw) for a, lw in self.weights.items()}
+            # Use temporary variable to avoid destroying self.weights!
+            shifted_weights = {a: (lw - max_log) for a, lw in self.weights.items()}
+            exp_weights = {a: math.exp(lw) for a, lw in shifted_weights.items()}
             total_w = sum(exp_weights.values())
 
             floor = self.gamma / K
             return {
-                arm: (w / (total_w + 1e-4))  # +(1 - self.gamma) * +  floor
+                arm: (1 - self.gamma) * (w / (total_w + 1e-9)) + floor
                 for arm, w in exp_weights.items()
             }
 
@@ -114,7 +115,7 @@ class Exp3Dynamic:
             x_hat = r / (p_arm + 1e-7)
             self.weights[arm_id] += self._eta() * x_hat
 
-            self.t += 1
+        self.t += 1
 
     def get_probabilities(self):
         """Return the current probability distribution (after syncing)."""
@@ -133,7 +134,7 @@ class UniformBandit(Exp3Dynamic):
             
             self.weights[arm_id] = 0
 
-            self.t += 1
+        self.t += 1
         
         
         

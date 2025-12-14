@@ -5,6 +5,8 @@ import socket
 import threading
 import asyncio
 from abc import ABC, abstractmethod
+import os
+import resource 
 
 from literegistry import ServerRegistry, get_kvstore
 
@@ -19,7 +21,7 @@ class ExecutableWrapper(ABC):
         port: int = 8000,
         host: str = "0.0.0.0",
         max_history=3600,
-        heartbeat_interval=30,
+        heartbeat_interval=10,
         **kwargs,
     ):
         """
@@ -83,6 +85,24 @@ class ExecutableWrapper(ABC):
 
     def start_server(self):
         """Start the server as a subprocess"""
+        
+        # Increase ulimit for file descriptors in child process
+        def raise_nofile(soft: int = 65536) -> None:
+            cur_soft, cur_hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            new_soft = min(soft, cur_hard)
+            resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, cur_hard))
+            # optional: print for sanity
+            print("RLIMIT_NOFILE:", resource.getrlimit(resource.RLIMIT_NOFILE))
+        
+        # Also set in parent process (for any immediate operations)
+        raise_nofile(65536)
+        
+        ## print conda prefix
+        print(f"Conda prefix: {os.environ['CONDA_PREFIX']}")
+        print("Conda prefix subprocess:", subprocess.getoutput("echo $CONDA_PREFIX"))
+        print("which nvcc", subprocess.getoutput("which nvcc"))
+        print("nvcc --version\n", subprocess.getoutput("nvcc --version"))
+        
         cmd = self.get_server_command()
         cmd.extend([
             self.get_model_flag(),
@@ -110,8 +130,15 @@ class ExecutableWrapper(ABC):
         #log_filename = f"{self.get_server_name().lower()}_server_{self.registry.server_id}.log"
         #print(log_filename)
         #   log_file = open(log_filename, "w")
+        
+        # Use preexec_fn to set ulimit in the child process before it executes
+        # This ensures the limit is set even if inheritance doesn't work as expected
         self.process = subprocess.Popen(
-            cmd, stdout=None, stderr=None, universal_newlines=True
+            cmd, 
+            stdout=None, 
+            stderr=None, 
+            universal_newlines=True,
+            preexec_fn=lambda: raise_nofile(65536)
         )
         print(f"Started {self.get_server_name()} server with PID {self.process.pid}")
 

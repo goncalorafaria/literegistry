@@ -25,8 +25,8 @@ class RegistryHTTPClient:
         registry: RegistryClient,
         value: str,
         max_parallel_requests: int = 512,
-        timeout: float = 60,
-        max_retries: int = 5,
+        timeout: float = 15,
+        max_retries: int = 10,
         use_shared_session: bool = True,
     ):
         """
@@ -69,8 +69,8 @@ class RegistryHTTPClient:
         )
         
         self._connector = aiohttp.TCPConnector(
-            limit=100,
-            limit_per_host=20,
+            limit=2048,
+            limit_per_host=1024,
             ttl_dns_cache=300,
             use_dns_cache=True,
             keepalive_timeout=30,
@@ -143,10 +143,11 @@ class RegistryHTTPClient:
         endpoint: str,
         payload: Dict,
         initial_server_idx: int = 0,
+        server_cache_size=32,
     ) -> Tuple[Dict, int]:
         """Make a request with automatic server rotation on failure."""
         servers = await self.registry.sample_servers(
-            self.value, n=self.max_parallel_requests
+            self.value, n=server_cache_size
         )
         total_servers = len(servers)
 
