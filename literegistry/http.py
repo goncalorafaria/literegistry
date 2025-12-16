@@ -59,7 +59,7 @@ class RegistryHTTPClient:
             if shared_session is not None and not shared_session.closed:
                 self._session = shared_session
                 self._owns_session = False
-                logger.debug(f"Using shared session for {self.value}")
+                #logger.debug(f"Using shared session for {self.value}")
                 return self
         
         # Fallback: Create temporary session
@@ -69,7 +69,7 @@ class RegistryHTTPClient:
         )
         
         self._connector = aiohttp.TCPConnector(
-            limit=2048,
+            limit=4048,
             limit_per_host=1024,
             ttl_dns_cache=300,
             use_dns_cache=True,
@@ -143,13 +143,13 @@ class RegistryHTTPClient:
         endpoint: str,
         payload: Dict,
         initial_server_idx: int = 0,
-        server_cache_size=32,
     ) -> Tuple[Dict, int]:
         """Make a request with automatic server rotation on failure."""
-        servers = await self.registry.sample_servers(
-            self.value, n=server_cache_size
+        start_time = asyncio.get_event_loop().time()
+        servers_and_probs = await self.registry.sample_servers(
+            self.value, n=self.max_retries
         )
-        total_servers = len(servers)
+        total_servers = len(servers_and_probs)
 
         if not total_servers:
             raise RuntimeError(f"No servers available for model {self.value}")
@@ -162,7 +162,11 @@ class RegistryHTTPClient:
 
             try:
                 server_idx = server_idx % total_servers
-                server = servers[server_idx].rstrip("/")
+                
+                server, prob = servers_and_probs[server_idx]
+                server = server.rstrip("/")
+                
+                
                 result = await self._make_http_request(server, endpoint, payload)
 
                 if "status" in result and result["status"] == "failed":
@@ -170,8 +174,9 @@ class RegistryHTTPClient:
 
                 # Report successful request latency
                 latency = asyncio.get_event_loop().time() - start_time
-                self.registry.report_latency(server, latency)
-
+                self.registry.report_latency(server, latency, prob=prob, success=True)
+                #logging.info(f"Request successful to {server}: Latency: {latency} seconds")
+                
                 return result, server_idx
 
             except Exception as e:
@@ -186,11 +191,11 @@ class RegistryHTTPClient:
 
                 # Report failed request latency
                 latency = asyncio.get_event_loop().time() - start_time
-                self.registry.report_latency(server, latency, success=False)
+                self.registry.report_latency(server, latency, prob=prob, success=False)
 
                 # Get fresh server list
-                servers = await self.registry.get_all(self.value, force=False)
-                total_servers = len(servers)
+                servers_and_probs = await self.registry.sample_servers(self.value, n=self.max_retries)
+                total_servers = len(servers_and_probs)
 
                 # Rotate to next server
                 server_idx = server_idx + 1  # % total_servers

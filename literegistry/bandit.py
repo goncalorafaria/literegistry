@@ -1,6 +1,7 @@
 import math
 import random
 import time, os
+import logging 
 
 
 class Exp3Dynamic:
@@ -8,13 +9,52 @@ class Exp3Dynamic:
     Exp3 with dynamic arms. On each select, you pass the current list of active IDs;
     the router will add new arms (initializing their weight to the average of existing
     weights) and remove any that are no longer active.
+    
+    Parameters:
+        gamma (float): Exploration parameter in [0, 1]. Controls exploration vs exploitation.
+            Lower = more exploitation (faster convergence but may miss good arms).
+            Higher = more exploration (better for non-stationary or changing environments).
+            
+            Practical guidelines:
+            - Few arms (2-5): 0.1-0.2
+            - Medium arms (5-10): 0.15-0.25  
+            - Many arms (>10): 0.2-0.3
+            - Non-stationary/dynamic arms: 0.2-0.4
+            - Static environment, long runs: 0.05-0.15
+            - Default 0.2 works well for most cases
+            
+        L_max (float): Maximum expected latency for reward normalization.
+            Used to normalize rewards: reward = 1 - min(latency/L_max, 1.0) for successes.
+            
+            How to choose:
+            - Should be >= worst-case latency you expect to see
+            - Good default: 95th percentile of historical latencies
+            - Rule of thumb: 2-3x your typical latency
+            - Too small (< typical latency): fast arms get same reward (less differentiation)
+            - Too large (>> typical latency): all arms get similar rewards (slower learning)
+            - Example: if latencies are 0.1-0.5s, use L_max=1.0-1.5s
+            
+        init_weight (float): Initial weight for new arms (converted to log(init_weight) internally).
+            - Default 1.0 is standard (becomes log(1.0) = 0.0 in log space)
+            - All arms start equal, so this parameter has minimal practical effect
+            - Keep at 1.0 unless you have specific reasons to change it
+            
+    Example:
+        # For a service with typical latency 0.2-0.8s, expecting 5-10 endpoints
+        bandit = Exp3Dynamic(gamma=0.2, L_max=1.5, init_weight=1.0)
+        
+        # For highly dynamic environment with many changing endpoints
+        bandit = Exp3Dynamic(gamma=0.3, L_max=2.0)
+        
+        # For stable environment with few arms, prioritize exploitation
+        bandit = Exp3Dynamic(gamma=0.1, L_max=1.0)
     """
 
     def __init__(self, gamma=0.2, L_max=1.0, init_weight=1.0):
         self.gamma = gamma
         self.L_max = L_max
         self.init_weight = init_weight
-        self.weights = {}  # arm_id -> weight
+        self.weights = {}  # arm_id -> log_weight (stored in log space for numerical stability)
         self.t = 0  # rounds elapsed
         random.seed(time.time() + os.getpid())
 
@@ -29,18 +69,19 @@ class Exp3Dynamic:
             return
             
         # add any new arms
+        # Note: We store log weights, so initialize new arms to log(init_weight)
+        # For init_weight=1.0, this means log(1.0) = 0.0
+        init_log_w = math.log(self.init_weight) if self.init_weight > 0 else -1
+        
         if not self.weights:
             for arm in active_ids:
-                self.weights[arm] = self.init_weight
+                self.weights[arm] = init_log_w
         else:
-            if len(self.weights) > 0:
-                avg_w = sum(self.weights.values()) / len(self.weights)
-            else:
-                avg_w = 0
-
+            # Average of existing log weights to initialize new arms
+            avg_log_w = sum(self.weights.values()) / len(self.weights)
             for arm in active_ids:
                 if arm not in self.weights:
-                    self.weights[arm] = avg_w
+                    self.weights[arm] = avg_log_w
 
         # remove any that have gone offline
         for arm in list(self.weights):
@@ -81,6 +122,7 @@ class Exp3Dynamic:
         self._sync_arms(active_ids)
         probs = self._get_probabilities()
 
+        
         # Handle case when no probabilities are available
         if not probs:
             return [], []
@@ -95,7 +137,7 @@ class Exp3Dynamic:
         chosen = random.choices(arms, weights=ps, k=k)
         return chosen, [probs[chosen_i] for chosen_i in chosen]
 
-    def update(self, arm_id, success, latency):
+    def update(self, arm_id, success, latency, prob=1.0):
         """
         After routing to arm_id (with probability p_arm) and observing:
         - success: bool
@@ -105,14 +147,14 @@ class Exp3Dynamic:
         arm_dist = self._get_probabilities()
 
         if arm_id in arm_dist:
-            p_arm = arm_dist[arm_id]
+          
             # normalized reward: fast success → near 1, slow or failure → near 0
             if success:
-                r = 1 - min(latency / self.L_max, 1.0)
+                r = - min(latency / self.L_max, 1.0)
             else:
-                r = 0.0
+                r = -1
 
-            x_hat = r / (p_arm + 1e-7)
+            x_hat = r / (prob+ 1e-7)
             self.weights[arm_id] += self._eta() * x_hat
 
         self.t += 1
@@ -125,7 +167,9 @@ class Exp3Dynamic:
     
 class UniformBandit(Exp3Dynamic):
     def __init__(self):
-        super().__init__(gamma=0.2, L_max=1.0, init_weight=0.0)
+        # Use init_weight=1.0 so log weights initialize to log(1.0)=0.0
+        # This ensures uniform distribution (all arms have equal log weights)
+        super().__init__(gamma=0.2, L_max=1.0, init_weight=1.0)
         
     def update(self, arm_id, success, latency):
         arm_dist = self._get_probabilities()

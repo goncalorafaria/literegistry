@@ -44,8 +44,8 @@ import json
 import logging
 import signal
 import sys
-from typing import Dict, List, Optional, Any
-from collections import defaultdict
+from typing import Dict, List, Optional, Any, Tuple
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -62,7 +62,8 @@ import os
 import socket
 import fire
 import time
-
+# Use shared session via RegistryHTTPClient
+from literegistry.http import RegistryHTTPClient
 
 class StarletteGatewayServer:
     """
@@ -79,7 +80,7 @@ class StarletteGatewayServer:
         registry: RegistryClient,
         host: str = "0.0.0.0",
         port: int = 8080,
-        timeout: float = 20,
+        timeout: float = 15,
         max_retries: int = 20
     ):
         self.registry = registry
@@ -88,6 +89,24 @@ class StarletteGatewayServer:
         self.timeout = timeout
         self.max_retries = max_retries
         self._shutdown_event = asyncio.Event()
+        
+        # Request tracking for statistics (sliding window of 5 seconds)
+        self._request_history: deque = deque()  # Stores (timestamp, duration, model) tuples
+        self._request_lock = asyncio.Lock()
+        self._stats_window_seconds = 5.0
+        self._stats_log_interval_seconds = 5.0
+        self._last_stats_log = 0.0
+        
+        # Request type counting for periodic reporting
+        self._request_type_counts: defaultdict = defaultdict(int)  # Tracks counts by request type
+        self._request_type_lock = asyncio.Lock()
+        self._request_type_log_interval_seconds = 5.0
+        self._last_request_type_log = 0.0
+        
+        # Probabilities logging for periodic reporting
+        self._probabilities_log_interval_seconds = 5.0
+        self._last_probabilities_log = 0.0
+        self._probabilities_lock = asyncio.Lock()
         
         # Configure logging
         logging.basicConfig(level=logging.INFO)
@@ -161,6 +180,90 @@ class StarletteGatewayServer:
                 "error": str(e),
                 "status": "failed"
             }, status_code=500)
+    
+    async def _record_request_and_log_stats(self, model: str, duration: float):
+        """
+        Record a request and log statistics for requests in the last 5 seconds.
+        
+        Args:
+            model: Model name
+            duration: Request duration in seconds
+        """
+        current_time = time.time()
+        
+        async with self._request_lock:
+            # Add current request
+            self._request_history.append((current_time, duration, model))
+            
+            # Remove old entries (older than stats_window_seconds)
+            cutoff_time = current_time - self._stats_window_seconds
+            while self._request_history and self._request_history[0][0] < cutoff_time:
+                self._request_history.popleft()
+            
+            # Calculate statistics for recent requests, grouped by model
+            if self._request_history:
+                # Group durations by model name
+                model_durations: defaultdict = defaultdict(list)
+                for _, d, m in self._request_history:
+                    model_durations[m].append(d)
+                
+                # Log stats at most once per stats_log_interval_seconds
+                if current_time - self._last_stats_log >= self._stats_log_interval_seconds:
+                    self._last_stats_log = current_time
+                    
+                    # Build stats string for each model
+                    stats_parts = []
+                    for model_name in sorted(model_durations.keys()):
+                        durations = model_durations[model_name]
+                        count = len(durations)
+                        avg_duration = sum(durations) / count
+                        max_duration = max(durations)
+                        stats_parts.append(
+                            f"{model_name}: {count} reqs, avg: {avg_duration:.3f}s, max: {max_duration:.3f}s"
+                        )
+                    
+                    if stats_parts:
+                        stats_str = ", ".join(stats_parts)
+                        self.logger.info(
+                            f"Completion stats (last {self._stats_window_seconds}s): {stats_str}"
+                        )
+    
+    async def _log_probabilities_periodically(self):
+        """
+        Log bandit algorithm probabilities periodically (every 5 seconds).
+        Only logs if the interval has elapsed since last log.
+        """
+        current_time = time.time()
+        
+        async with self._probabilities_lock:
+            if current_time - self._last_probabilities_log >= self._probabilities_log_interval_seconds:
+                self._last_probabilities_log = current_time
+                probs = self.registry.bandit._get_probabilities()
+                sorted_probs = sorted([(k, round(p, 3)) for k, p in probs.items()], key=lambda x: x[1])
+                self.logger.info(f"Probs: {sorted_probs}")
+    
+    async def _record_request_type(self, request_type: str):
+        """
+        Record an incoming request by type and periodically log counts.
+        
+        Args:
+            request_type: Type of request (e.g., "completions", "classify", "health", "models", "session-stats")
+        """
+        current_time = time.time()
+        
+        async with self._request_type_lock:
+            # Increment count for this request type
+            self._request_type_counts[request_type] += 1
+            
+            # Log counts periodically (every 5 seconds)
+            if current_time - self._last_request_type_log >= self._request_type_log_interval_seconds:
+                self._last_request_type_log = current_time
+                
+                if self._request_type_counts:
+                    counts_str = ", ".join([f"{rtype}: {count}" for rtype, count in sorted(self._request_type_counts.items())])
+                    self.logger.info(f"Request counts (last {self._request_type_log_interval_seconds}s): {counts_str}")
+                    # Reset counts after logging
+                    self._request_type_counts.clear()
             
     async def handle_completions(self,request: Request):
         """
@@ -168,21 +271,25 @@ class StarletteGatewayServer:
         
         Uses shared aiohttp session via RegistryHTTPClient for optimal performance.
         """
+        start_time = time.time()
         payload = None
         
         try:
             payload = await request.json()
             model = payload.get("model")
+            model_name = model if model else "unknown"
+            
+            # Record request type by model name
+            await self._record_request_type(model_name)
             
             if not model:
+                duration = time.time() - start_time
+                self.logger.info(f"Processing [completions] request for model: {model_name} - duration: {duration:.3f}s")
+                await self._record_request_and_log_stats(model_name, duration)
                 return JSONResponse({
                     "error": "model parameter required"
                 }, status_code=400)
             
-            self.logger.info(f"Processing [completions] request for model: {model} - time : {time.time()}")
-            
-            # Use shared session via RegistryHTTPClient
-            from literegistry.http import RegistryHTTPClient
             
             async with RegistryHTTPClient(
                 self.registry,
@@ -191,14 +298,30 @@ class StarletteGatewayServer:
                 max_retries=self.max_retries,
                 use_shared_session=True  # Use shared session!
             ) as client:
+                start_duration = time.time() - start_time
+                # self.logger.info(f"Processing [completions] request for model: {model} - duration: {start_duration:.3f}s")
                 result, _ = await client.request_with_rotation("v1/completions", payload)
+                duration = time.time() - start_time
+                #self.logger.info(f"Completed [completions] request for model: {model} - duration: {duration:.3f}s")
+                await self._record_request_and_log_stats(model, duration)
+                await self._log_probabilities_periodically()
+                
                 return JSONResponse(result)
+            
+            
+            
                 
         except Exception as e:
+            duration = time.time() - start_time
+            model_name = payload.get("model", "unknown") if payload else "unknown"
+            # Record request type if payload parsing failed (payload is None)
+            if payload is None:
+                await self._record_request_type("unknown")
             if payload:
-                self.logger.error(f"Completion error: {e} : {json.dumps(payload, indent=4)}")
+                self.logger.error(f"Completion error: {e} : {json.dumps(payload, indent=4)} - duration: {duration:.3f}s")
             else:
-                self.logger.error(f"Completion error: {e}")
+                self.logger.error(f"Completion error: {e} - duration: {duration:.3f}s")
+            await self._record_request_and_log_stats(model_name, duration)
             return JSONResponse({
                 "error": str(e),
                 "status": "failed"

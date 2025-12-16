@@ -3,7 +3,7 @@ import asyncio
 from pathlib import Path
 from typing import Optional, Union, List
 import functools
-
+import logging
 
 class KeyValueStore(abc.ABC):
     """Abstract base class for key-value storage"""
@@ -43,6 +43,7 @@ class FileSystemKVStore(KeyValueStore):
 
     async def get(self, key: str) -> Optional[bytes]:
         key_path = self.root / key
+                
         try:
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(None, key_path.read_bytes)
@@ -79,5 +80,8 @@ class FileSystemKVStore(KeyValueStore):
 
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, _get_keys)
-    
+
+    async def close(self):
+        """No-op for compatibility; nothing to close for filesystem store."""
+        pass
 

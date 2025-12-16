@@ -10,6 +10,13 @@ from literegistry.telemetry import LatencyMetricAggregator
 from literegistry.bandit import Exp3Dynamic, UniformBandit
 import asyncio
 import numpy as np
+import os
+DEBUG =os.getenv("DEBUG", "False") == "True"
+
+if DEBUG:
+    logging.basicConfig(level=logging.DEBUG)
+else:
+    logging.basicConfig(level=logging.INFO)
 
 
 class RegistryClient(ServerRegistry):
@@ -22,9 +29,9 @@ class RegistryClient(ServerRegistry):
         self,
         store: KeyValueStore,
         max_history: int = 3600,
-        cache_ttl: int = 5,
+        cache_ttl: int = 40,
         service_type="model_path",
-        penalty_latency=200,
+        penalty_latency=20,
         max_heartbeat_interval=15,
     ):
         """
@@ -42,7 +49,8 @@ class RegistryClient(ServerRegistry):
         self.telemetry = LatencyMetricAggregator()
         self.service_type = service_type
         self.penalty_latency = penalty_latency
-        self.bandit = UniformBandit()#Exp3Dynamic(gamma=0.2, L_max=penalty_latency)
+        self.bandit = Exp3Dynamic(gamma=0.05, L_max=penalty_latency)
+        self._models_lock = asyncio.Lock()  # Lock to prevent concurrent roster() calls
 
     def _is_cache_valid(self, cache_key: str) -> bool:
         """Check if a cache entry is still valid"""
@@ -62,28 +70,35 @@ class RegistryClient(ServerRegistry):
         """
         cache_key = "_" + self.service_type
 
+        # Fast path: check cache before acquiring lock
         if not force and self._is_cache_valid(cache_key):
             return self._cache[cache_key]
 
-        # Get fresh server list
-        roster = await self.roster()
-        #logging.info(f"Raw roster data: {roster}")
-        
-        m: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        # Acquire lock to prevent concurrent roster() calls that cause file I/O contention
+        async with self._models_lock:
+            # Double-check: another coroutine might have populated cache while we were waiting
+            if not force and self._is_cache_valid(cache_key):
+                return self._cache[cache_key]
 
-        for server in roster["servers"]:
-            metadata = server.get("metadata", {})
-            model_path = metadata.get(self.service_type, "default")
-            #logging.info(f"Processing server {server.get('uri', 'unknown')} with metadata {metadata}, model_path: {model_path}")
-            m[model_path].append(server)
+            # Get fresh server list (this involves file I/O operations)
+            roster = await self.roster()
+            #logging.info(f"Raw roster data: {roster}")
+            
+            m: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
-        #logging.info(f"Processed models: {dict(m)}")
-        
-        # Update cache
-        self._cache[cache_key] = dict(m)  # Convert defaultdict to regular dict
-        self._cache_timestamps[cache_key] = time.time()
+            for server in roster["servers"]:
+                metadata = server.get("metadata", {})
+                model_path = metadata.get(self.service_type, "default")
+                #logging.info(f"Processing server {server.get('uri', 'unknown')} with metadata {metadata}, model_path: {model_path}")
+                m[model_path].append(server)
 
-        return self._cache[cache_key]
+            #logging.info(f"Processed models: {dict(m)}")
+            
+            # Update cache
+            self._cache[cache_key] = dict(m)  # Convert defaultdict to regular dict
+            self._cache_timestamps[cache_key] = time.time()
+
+            return self._cache[cache_key]
 
     async def get_all(
         self, value: str, force: bool = False, n: Optional[int] = None
@@ -138,8 +153,8 @@ class RegistryClient(ServerRegistry):
         if not servers:
             return []
             
-        result, _ = self.bandit.get_arm(servers, k=n)  # Get URIs for bandit selection
-        return result
+        result, probs = self.bandit.get_arm(servers, k=n)  # Get URIs for bandit selection
+        return list(zip(result, probs))
 
     async def get(self, value: str, force: bool = False) -> str:
         """
@@ -160,9 +175,9 @@ class RegistryClient(ServerRegistry):
             raise ValueError(f"Model {value} not found in registry")
         return cached_uris[0]
 
-    def report_latency(self, uri: str, response_time: float, success: bool = True):
+    def report_latency(self, uri: str, response_time: float, prob: float = 1.0, success: bool = True):
         """Report request latency for a URI"""
-        self.bandit.update(uri, latency=response_time, success=success)
+        self.bandit.update(uri, latency=response_time, prob=prob, success=success)
 
         if success:
             self.telemetry.report(uri, response_time)
