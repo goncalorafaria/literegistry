@@ -304,7 +304,7 @@ class StarletteGatewayServer:
                 duration = time.time() - start_time
                 #self.logger.info(f"Completed [completions] request for model: {model} - duration: {duration:.3f}s")
                 await self._record_request_and_log_stats(model, duration)
-                await self._log_probabilities_periodically()
+                #await self._log_probabilities_periodically()
                 
                 return JSONResponse(result)
             

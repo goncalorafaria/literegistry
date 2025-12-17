@@ -171,7 +171,7 @@ class UniformBandit(Exp3Dynamic):
         # This ensures uniform distribution (all arms have equal log weights)
         super().__init__(gamma=0.2, L_max=1.0, init_weight=1.0)
         
-    def update(self, arm_id, success, latency):
+    def update(self, arm_id, success, latency, prob=1.0):
         arm_dist = self._get_probabilities()
 
         if arm_id in arm_dist:
