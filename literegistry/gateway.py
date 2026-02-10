@@ -80,7 +80,7 @@ class StarletteGatewayServer:
         registry: RegistryClient,
         host: str = "0.0.0.0",
         port: int = 8080,
-        timeout: float = 15,
+        timeout: float = 62,
         max_retries: int = 20
     ):
         self.registry = registry
@@ -284,7 +284,7 @@ class StarletteGatewayServer:
             
             if not model:
                 duration = time.time() - start_time
-                self.logger.info(f"Processing [completions] request for model: {model_name} - duration: {duration:.3f}s")
+                #self.logger.info(f"Processing [completions] request for model: {model_name} - duration: {duration:.3f}s")
                 await self._record_request_and_log_stats(model_name, duration)
                 return JSONResponse({
                     "error": "model parameter required"
@@ -321,6 +321,8 @@ class StarletteGatewayServer:
                 self.logger.error(f"Completion error: {e} : {json.dumps(payload, indent=4)} - duration: {duration:.3f}s")
             else:
                 self.logger.error(f"Completion error: {e} - duration: {duration:.3f}s")
+                
+                
             await self._record_request_and_log_stats(model_name, duration)
             return JSONResponse({
                 "error": str(e),
@@ -333,21 +335,24 @@ class StarletteGatewayServer:
         
         Uses shared aiohttp session via RegistryHTTPClient for optimal performance.
         """
+        start_time = time.time()
         payload = None
         
         try:
             payload = await request.json()
             input = payload.get("input")
             model = payload.get("model")
+            model_name = model if model else "unknown"
+            
+            # Record request type by model name
+            await self._record_request_type(model_name)
             
             if not model:
+                duration = time.time() - start_time
+                await self._record_request_and_log_stats(model_name, duration)
                 return JSONResponse({
                     "error": "model parameter required"
                 }, status_code=400)
-            
-            self.logger.info(f"Processing [classify] request for model: {model} - time : {time.time()}")
-            # Use shared session via RegistryHTTPClient
-            from literegistry.http import RegistryHTTPClient
             
             async with RegistryHTTPClient(
                 self.registry,
@@ -357,13 +362,22 @@ class StarletteGatewayServer:
                 use_shared_session=True  # Use shared session!
             ) as client:
                 result, _ = await client.request_with_rotation("classify", payload)
+                duration = time.time() - start_time
+                await self._record_request_and_log_stats(model, duration)
                 return JSONResponse(result)
                 
         except Exception as e:
+            duration = time.time() - start_time
+            model_name = payload.get("model", "unknown") if payload else "unknown"
+            # Record request type if payload parsing failed (payload is None)
+            if payload is None:
+                await self._record_request_type("unknown")
             if payload:
-                self.logger.error(f"Classify error: {e} : {json.dumps(payload, indent=4)}")
+                self.logger.error(f"Classify error: {e} : {json.dumps(payload, indent=4)} - duration: {duration:.3f}s")
             else:
-                self.logger.error(f"Classify error: {e}")
+                self.logger.error(f"Classify error: {e} - duration: {duration:.3f}s")
+            
+            await self._record_request_and_log_stats(model_name, duration)
             return JSONResponse({
                 "error": str(e),
                 "status": "failed"
@@ -482,13 +496,13 @@ class StarletteGatewayServer:
             self.logger.error(f"Cleanup error: {e}")
 
 
-async def main_async(registry="redis://klone-login03.hyak.local:6379", port=8080, cache_ttl=20):
+async def main_async(registry="redis://klone-login03.hyak.local:6379", port=8080, cache_ttl=20,timeout=15):
     """Simple main function without restart loops."""
     
     store = get_kvstore(registry)
     
     registry = RegistryClient(store=store, service_type="model_path", cache_ttl=cache_ttl)
-    server = StarletteGatewayServer(registry, port=port)
+    server = StarletteGatewayServer(registry, port=port, timeout=timeout)
     
     gateway_url = f"http://{socket.getfqdn()}:{port}"
     
@@ -516,13 +530,13 @@ async def main_async(registry="redis://klone-login03.hyak.local:6379", port=8080
 def create_app():
     """Create app for uvicorn."""
     registry_path = os.getenv("REGISTRY_PATH", "redis://klone-login01.hyak.local:6379")
-    
+    timeout = os.getenv("TIMEOUT", 59)
     try:
         
         store=get_kvstore(registry_path)
         
         registry = RegistryClient(store=store, service_type="model_path")
-        server = StarletteGatewayServer(registry)
+        server = StarletteGatewayServer(registry, timeout=int(timeout))
         return server.app
         
     except Exception as e:
@@ -539,25 +553,26 @@ def create_app():
         return app
 
 
-def main(registry="redis://klone-login03.hyak.local:6379", port=8080, workers=1):
+def main(registry="redis://klone-login03.hyak.local:6379", port=8080, workers=1, timeout=61):
     """Main entry point. Use workers > 1 for multi-worker mode."""
     # If multiple workers, use blocking uvicorn.run() with import string
     # Set REGISTRY_PATH env var so create_app() can use it
     if workers > 1:
         # Set environment variable for create_app() to use
         os.environ["REGISTRY_PATH"] = registry
+        os.environ["TIMEOUT"] = str(timeout)
         store = get_kvstore(registry)
         registry_client = RegistryClient(store=store, service_type="model_path")
-        server = StarletteGatewayServer(registry_client, port=port)
+        server = StarletteGatewayServer(registry_client, port=port, timeout=timeout)
         gateway_url = f"http://{socket.getfqdn()}:{port}"
         print(f"Gateway server starting at {gateway_url} with {workers} workers")
         server.start_with_workers(workers=workers)
     else:
         # Single worker uses async mode
-        asyncio.run(main_async(registry, port))
+        asyncio.run(main_async(registry, port, timeout=timeout))
 
 
-def run_in_thread(registry="redis://klone-login03.hyak.local:6379", port=8080):
+def run_in_thread(registry="redis://klone-login03.hyak.local:6379", port=8080, timeout=15):
     """
     Thread-safe entry point for running the gateway in a separate thread.
     
@@ -576,7 +591,7 @@ def run_in_thread(registry="redis://klone-login03.hyak.local:6379", port=8080):
         # Initialize registry components
         store = get_kvstore(registry)
         registry_client = RegistryClient(store=store, service_type="model_path")
-        server = StarletteGatewayServer(registry_client, port=port)
+        server = StarletteGatewayServer(registry_client, port=port, timeout=timeout)
         
         # Set up uvicorn access logger to use root logger
         import logging

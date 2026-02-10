@@ -25,7 +25,7 @@ class RegistryHTTPClient:
         registry: RegistryClient,
         value: str,
         max_parallel_requests: int = 512,
-        timeout: float = 15,
+        timeout: float = 63,
         max_retries: int = 10,
         use_shared_session: bool = True,
     ):
@@ -180,17 +180,19 @@ class RegistryHTTPClient:
                 return result, server_idx
 
             except Exception as e:
-                logging.error(
-                    f"Attempt {self.value}:{attempt + 1} failed on server {server}: {str(e)}"
-                )
-                ## print traceback
-                #import traceback
-                #traceback.print_exc()
                 
+                ## print traceback
+                import traceback
+                traceback.print_exc()
+                logging.error(
+                    f"Attempt {self.value}:{attempt + 1} failed on server {server}: {str(e)} - {traceback.format_exc()} - {payload}"
+                )
                 attempt += 1
 
                 # Report failed request latency
                 latency = asyncio.get_event_loop().time() - start_time
+                
+                logging.error(f"failed request timeout: {latency}- expected {self.timeout}")
                 self.registry.report_latency(server, latency, prob=prob, success=False)
 
                 # Get fresh server list

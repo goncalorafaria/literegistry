@@ -49,7 +49,7 @@ class RegistryClient(ServerRegistry):
         self.telemetry = LatencyMetricAggregator()
         self.service_type = service_type
         self.penalty_latency = penalty_latency
-        self.bandit = Exp3Dynamic(gamma=0.05, L_max=penalty_latency)
+        self.bandit = Exp3Dynamic(gamma=0.1, L_max=penalty_latency)
         self._models_lock = asyncio.Lock()  # Lock to prevent concurrent roster() calls
 
     def _is_cache_valid(self, cache_key: str) -> bool:
