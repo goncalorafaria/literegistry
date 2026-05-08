@@ -395,7 +395,7 @@ class StarletteGatewayServer:
 
         try:
             payload = await request.json()
-            model = payload.get("model", "python")
+            model = "python"
 
             await self._record_request_type(model)
 
@@ -420,7 +420,7 @@ class StarletteGatewayServer:
 
         except Exception as e:
             duration = time.time() - start_time
-            model_name = payload.get("model", "python") if payload else "python"
+            model_name = "python"
             if payload is None:
                 await self._record_request_type("python")
             if payload:
