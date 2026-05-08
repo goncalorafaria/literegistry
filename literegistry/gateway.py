@@ -24,6 +24,7 @@ ENDPOINTS:
     GET  /v1/models      - List available models
     POST /v1/completions - Completion requests
     POST /classify       - Classification requests
+    POST /python         - Python execution requests
 
 Environment variables:
     REGISTRY_PATH: Registry connection string (default: redis://klone-login01.hyak.local:6379)
@@ -382,6 +383,56 @@ class StarletteGatewayServer:
                 "error": str(e),
                 "status": "failed"
             }, status_code=500)
+
+    async def handle_python(self, request: Request):
+        """
+        Handle stateless Python execution requests.
+
+        Routes to code executor servers registered under model_path="python".
+        """
+        start_time = time.time()
+        payload = None
+
+        try:
+            payload = await request.json()
+            model = payload.get("model", "python")
+
+            await self._record_request_type(model)
+
+            if "code" not in payload:
+                duration = time.time() - start_time
+                await self._record_request_and_log_stats(model, duration)
+                return JSONResponse({
+                    "error": "code parameter required"
+                }, status_code=400)
+
+            async with RegistryHTTPClient(
+                self.registry,
+                model,
+                timeout=self.timeout,
+                max_retries=self.max_retries,
+                use_shared_session=True
+            ) as client:
+                result, _ = await client.request_with_rotation("python", payload)
+                duration = time.time() - start_time
+                await self._record_request_and_log_stats(model, duration)
+                return JSONResponse(result)
+
+        except Exception as e:
+            duration = time.time() - start_time
+            model_name = payload.get("model", "python") if payload else "python"
+            if payload is None:
+                await self._record_request_type("python")
+            if payload:
+                self.logger.error(f"Python execution error: {e} : {json.dumps(payload, indent=4)} - duration: {duration:.3f}s")
+            else:
+                self.logger.error(f"Python execution error: {e} - duration: {duration:.3f}s")
+
+            await self._record_request_and_log_stats(model_name, duration)
+            return JSONResponse({
+                "error": str(e),
+                "status": "failed"
+            }, status_code=500)
             
             
     def _create_app(self):
@@ -416,7 +467,8 @@ class StarletteGatewayServer:
                 Route("/session-stats", self.session_stats, methods=["GET"]),
                 Route("/v1/models", self.list_models, methods=["GET"]),
                 Route("/v1/completions", self.handle_completions, methods=["POST"]),
-                Route("/classify", self.handle_classify, methods=["POST"])
+                Route("/classify", self.handle_classify, methods=["POST"]),
+                Route("/python", self.handle_python, methods=["POST"])
             ],
             lifespan=lifespan
         )

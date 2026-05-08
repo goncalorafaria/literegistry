@@ -8,7 +8,7 @@ with open("requirements.txt", "r") as fr:
 
 setuptools.setup(
     name="literegistry",
-    version="1.0.2",
+    version="1.0.4",
     author="Goncalo Faria",
     author_email="gfaria@cs.washington.edu",
     description="Package for implementing service discovery in a really lite way.",

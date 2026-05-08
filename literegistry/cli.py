@@ -8,6 +8,7 @@ import literegistry.redis as redis
 import literegistry.gateway as gateway
 import literegistry.vllm_wrapper as vllm
 import literegistry.sglang_wrapper as sglang
+import literegistry.code_server as code_server
     
 def check_registry(verbose=False, registry_dir="/gscratch/ark/graf/registry"):
     
@@ -43,6 +44,16 @@ def check_summary(registry="redis://klone-login01.hyak.local:6379"):
     for k, v in asyncio.run(r.models()).items():
         print(f"{colored(k, 'red')} :{colored(len(v),'green')}")
 
+def check_detail(registry="redis://klone-login01.hyak.local:6379"):
+    r = RegistryClient(get_kvstore(registry))
+
+    for k, v in asyncio.run(r.models()).items():
+        print(f"{colored(k, 'red')} : {colored(len(v),'green')}")
+        for item in v:
+            print(colored("--" * 20, "blue"))
+            print(f"\t{colored('uri', 'green')}:{item['uri']}")
+            print(f"\t{colored('metadata', 'green')}:{item['metadata']}")
+
 
 def main():
     
@@ -52,6 +63,8 @@ def main():
         "gateway": gateway.main,
         "vllm": vllm.main,
         "sglang": sglang.main,
+        "detail": check_detail,
+        "code": code_server.main,
     })
 
 
