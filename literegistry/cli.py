@@ -9,6 +9,7 @@ import literegistry.gateway as gateway
 import literegistry.vllm_wrapper as vllm
 import literegistry.sglang_wrapper as sglang
 import literegistry.code_server as code_server
+import literegistry.console.launcher as console_launcher
     
 def check_registry(verbose=False, registry_dir="/gscratch/ark/graf/registry"):
     
@@ -65,6 +66,7 @@ def main():
         "sglang": sglang.main,
         "detail": check_detail,
         "code": code_server.main,
+        "console": console_launcher.main,
     })
 
 

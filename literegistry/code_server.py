@@ -1,4 +1,4 @@
-## this code was mostly taken from RLM and DrTulu. 
+## this code was mostly taken from RLM and DrTulu.
 
 import ast
 import asyncio
@@ -6,9 +6,11 @@ import copy
 import importlib
 import io
 import logging
+import math
 import os
 import signal
 import socket
+import sys
 import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor
@@ -88,6 +90,7 @@ _SAFE_BUILTINS = {
     "memoryview": memoryview,
     "complex": complex,
     "object": object,
+    "__build_class__": __build_class__,
     "super": super,
     "property": property,
     "staticmethod": staticmethod,
@@ -136,30 +139,101 @@ _RESERVED_TOOL_NAMES = frozenset(
 
 # Tools are server-side allowlisted because HTTP requests cannot safely send Python functions.
 DEFAULT_TOOL_SPECS: dict[str, str] = {
+    "_strptime": "_strptime",
+    "abc": "abc",
+    "argparse": "argparse",
+    "ast": "ast",
+    "base64": "base64",
+    "binascii": "binascii",
+    "bisect": "bisect",
+    "calendar": "calendar",
     "collections": "collections",
+    "copy": "copy",
+    "cmath": "cmath",
+    "csv": "csv",
     "datetime": "datetime",
+    "decimal": "decimal",
+    "difflib": "difflib",
+    "fnmatch": "fnmatch",
     "functools": "functools",
+    "hashlib": "hashlib",
+    "heapq": "heapq",
+    "hmac": "hmac",
+    "html": "html",
+    "html.parser": "html.parser",
+    "ipaddress": "ipaddress",
     "itertools": "itertools",
     "json": "json",
+    "keyword": "keyword",
+    "locale": "locale",
     "lxml": "lxml",
     "math": "math",
+    "numbers": "numbers",
     "numpy": "numpy",
+    "operator": "operator",
     "pandas": "pandas",
+    "platform": "platform",
+    "pprint": "pprint",
+    "pytz": "pytz",
     "random": "random",
-    "sympy": "sympy",
-    "scipy": "scipy",
-    "time": "time",
-    "typing": "typing",
-    "yaml": "yaml",
     "re": "re",
+    "scipy": "scipy",
+    "secrets": "secrets",
+    "shlex": "shlex",
+    "string": "string",
+    "struct": "struct",
+    "sympy": "sympy",
+    "textwrap": "textwrap",
+    "time": "time",
+    "tqdm": "tqdm",
+    "traceback": "traceback",
+    "types": "types",
+    "typing": "typing",
+    "unidecode": "unidecode",
+    "unicodedata": "unicodedata",
+    "warnings": "warnings",
+    "yaml": "yaml",
+    "zoneinfo": "zoneinfo",
+    "zlib": "zlib",
     "statistics": "statistics",
     "mean": "statistics:mean",
     "median": "statistics:median",
 }
 
+
+def _max_int_str_digits() -> int:
+    """Match Python's JSON int string safety limit (see :func:`sys.get_int_max_str_digits`)."""
+    try:
+        lim = sys.get_int_max_str_digits()
+    except AttributeError:
+        return 4300
+    return lim if lim != 0 else 10**9
+
+
+def _int_too_large_for_json_serialization(value: int) -> bool:
+    if value == 0:
+        return False
+    lim = _max_int_str_digits()
+    if lim >= 10**8:
+        return False
+    # Upper bound on decimal digit count without converting the int to str.
+    digit_upper = int(abs(value).bit_length() * math.log10(2.0)) + 2
+    return digit_upper > lim
+
+
 def _serialize_value(value: Any) -> Any:
     """Convert local variables to JSON-friendly values."""
-    if value is None or isinstance(value, (bool, int, float, str)):
+    if value is None:
+        return value
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return "TOOBIG" if _int_too_large_for_json_serialization(value) else value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return "TOOBIG"
+        return value
+    if isinstance(value, str):
         return value
     if isinstance(value, ModuleType):
         return f"<module '{value.__name__}'>"
@@ -186,7 +260,9 @@ def _resolve_tool(name: str, tool_specs: dict[str, str]) -> Any:
     if name in _RESERVED_TOOL_NAMES:
         raise ValueError(f"Tool name '{name}' is reserved")
     if name not in tool_specs:
-        raise ValueError(f"Tool '{name}' is not allowlisted. Available: {sorted(tool_specs)}")
+        raise ValueError(
+            f"Tool '{name}' is not allowlisted. Available: {sorted(tool_specs)}"
+        )
 
     spec = tool_specs[name]
     if ":" not in spec:
@@ -216,15 +292,70 @@ def _worker_init(preimport_tools: list[str], tool_specs: dict[str, str]) -> None
             pass
 
 
-def _validate_no_imports(code: str, label: str) -> None:
-    """Reject import statements before code is executed."""
+def _allowed_import_roots(tool_specs: dict[str, str]) -> frozenset[str]:
+    """Top-level packages users may ``import`` / ``import from`` (matches tool_specs)."""
+    roots: set[str] = set()
+    for alias, spec in tool_specs.items():
+        roots.add(alias.partition(".")[0])
+        roots.add(spec.split(":")[0].partition(".")[0])
+    return frozenset(roots)
+
+
+def _make_restricted_import(tool_specs: dict[str, str]):
+    """``builtins.__import__`` that only loads allowlisted top-level packages."""
+    allowed = _allowed_import_roots(tool_specs)
+
+    def __import__(name: str, _globals=None, _locals=None, fromlist=(), level=0):
+        del _globals, _locals, fromlist
+        if level != 0:
+            raise ImportError("relative imports are not allowed")
+        if not isinstance(name, str) or not name.strip():
+            raise ImportError(f"invalid module name: {name!r}")
+        stripped = name.strip()
+        root = stripped.partition(".")[0]
+        if root != "__future__" and root not in allowed:
+            raise ImportError(
+                f"import of top-level package {root!r} is not allowed; "
+                f"allowed: {sorted(allowed)} plus __future__"
+            )
+        return importlib.import_module(stripped)
+
+    return __import__
+
+
+def _validate_allowlisted_imports(
+    code: str, label: str, tool_specs: dict[str, str]
+) -> None:
+    """Reject imports from modules outside the server's tool_specs allowlist."""
+    allowed = _allowed_import_roots(tool_specs)
     tree = ast.parse(code, mode="exec")
     for node in ast.walk(tree):
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            raise ValueError(
-                f"{label} cannot contain import statements. "
-                "Pass allowlisted modules through custom_tools instead."
-            )
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top = alias.name.partition(".")[0]
+                if top == "__future__":
+                    continue
+                if top not in allowed:
+                    raise ValueError(
+                        f"{label} cannot import {alias.name!r}; only server-allowlisted "
+                        f"modules are permitted (got top-level {top!r})."
+                    )
+            continue
+
+        if isinstance(node, ast.ImportFrom):
+            if node.level != 0:
+                raise ValueError(f"{label} cannot use relative imports.")
+            module = node.module
+            if module is None:
+                raise ValueError(f"{label} has an invalid import-from statement.")
+            if module.split(".")[0] == "__future__":
+                continue
+            top = module.partition(".")[0]
+            if top not in allowed:
+                raise ValueError(
+                    f"{label} cannot import from {module!r}; only server-allowlisted "
+                    f"modules are permitted (got top-level {top!r})."
+                )
 
 
 def _final_var_factory(locals_dict: dict[str, Any], final_answer: list[str | None]):
@@ -248,7 +379,9 @@ def _final_var_factory(locals_dict: dict[str, Any], final_answer: list[str | Non
 
 def _show_vars_factory(locals_dict: dict[str, Any]):
     def _show_vars() -> str:
-        available = {k: type(v).__name__ for k, v in locals_dict.items() if not k.startswith("_")}
+        available = {
+            k: type(v).__name__ for k, v in locals_dict.items() if not k.startswith("_")
+        }
         if not available:
             return "No variables created yet."
         return f"Available variables: {available}"
@@ -276,34 +409,41 @@ def _run_user_code(
 
     stdout, stderr = io.StringIO(), io.StringIO()
     start_time = time.perf_counter()
-    local_vars: dict[str, Any] = {}
     final_answer: list[str | None] = [None]
- 
-    try:
-        _validate_no_imports(code, "code")
-        if setup_code:
-            _validate_no_imports(setup_code, "setup_code")
+    namespace: dict[str, Any] = {}
+    keys_before_exec: set[str] = set()
 
+    try:
         resolved_tool_specs = tool_specs or DEFAULT_TOOL_SPECS
+        _validate_allowlisted_imports(code, "code", resolved_tool_specs)
+        if setup_code:
+            _validate_allowlisted_imports(setup_code, "setup_code", resolved_tool_specs)
+
         tool_names = custom_tools if custom_tools is not None else default_tools or []
-        globals_dict: dict[str, Any] = {
-            "__builtins__": _SAFE_BUILTINS.copy(),
+        safe_builtins = _SAFE_BUILTINS.copy()
+        safe_builtins["__import__"] = _make_restricted_import(resolved_tool_specs)
+        # Single namespace: separate globals/locals break cross-function calls
+        # (defs bind to locals, lookups inside functions use globals).
+        namespace = {
+            "__builtins__": safe_builtins,
             "__name__": "__main__",
         }
 
-        local_vars["context_0"] = copy.deepcopy(context_payload)
-        local_vars["context"] = local_vars["context_0"]
+        namespace["context_0"] = copy.deepcopy(context_payload)
+        namespace["context"] = namespace["context_0"]
 
         for name in tool_names:
-            local_vars[name] = _resolve_tool(name, resolved_tool_specs)
+            namespace[name] = _resolve_tool(name, resolved_tool_specs)
 
-        globals_dict["FINAL_VAR"] = _final_var_factory(local_vars, final_answer)
-        globals_dict["SHOW_VARS"] = _show_vars_factory(local_vars)
+        namespace["FINAL_VAR"] = _final_var_factory(namespace, final_answer)
+        namespace["SHOW_VARS"] = _show_vars_factory(namespace)
+
+        keys_before_exec = set(namespace)
 
         with redirect_stdout(stdout), redirect_stderr(stderr):
             if setup_code:
-                exec(compile(setup_code, "<setup-code>", "exec"), globals_dict, local_vars)
-            exec(compile(code, "<user-code>", "exec"), globals_dict, local_vars)
+                exec(compile(setup_code, "<setup-code>", "exec"), namespace)
+            exec(compile(code, "<user-code>", "exec"), namespace)
 
         success = True
         error = stderr.getvalue() or None
@@ -316,9 +456,9 @@ def _run_user_code(
     result_locals = {}
     if return_locals:
         result_locals = {
-            key: _serialize_value(value)
-            for key, value in local_vars.items()
-            if not key.startswith("_")
+            key: _serialize_value(namespace[key])
+            for key in namespace
+            if key not in keys_before_exec and not key.startswith("_")
         }
 
     return {
@@ -389,7 +529,9 @@ class StatelessCodeExecutorConfig:
         ]
     )
     preimport_tools: list[str] = field(default_factory=lambda: list(DEFAULT_TOOL_SPECS))
-    tool_specs: dict[str, str] = field(default_factory=lambda: DEFAULT_TOOL_SPECS.copy())
+    tool_specs: dict[str, str] = field(
+        default_factory=lambda: DEFAULT_TOOL_SPECS.copy()
+    )
     pool_size: int = field(default_factory=lambda: os.cpu_count() or 1)
     outer_timeout_grace_seconds: int = 1
     host: str = "0.0.0.0"
@@ -398,15 +540,14 @@ class StatelessCodeExecutorConfig:
     registry: str = "redis://klone-login01.hyak.local:6379"
     max_history: int = 3600
     heartbeat_interval: int = 30
-    
-    
+
 
 class StatelessCodeExecutorServer:
     """FastAPI server wrapper for stateless Python code execution."""
 
     def __init__(self, config: StatelessCodeExecutorConfig | None = None):
         self.config = config or StatelessCodeExecutorConfig()
-        
+
         self.registry = ServerRegistry(
             store=get_kvstore(self.config.registry),
             max_history=self.config.max_history,
@@ -414,7 +555,7 @@ class StatelessCodeExecutorServer:
         self.url = f"http://{socket.getfqdn()}"
         self.should_run = False
         self.heartbeat_task: asyncio.Task | None = None
-        
+
         _preimport_tools(self.config.preimport_tools, self.config.tool_specs)
         self.process_pool: ProcessPoolExecutor | None = self._new_pool()
         self.app = FastAPI(title=self.config.title)
@@ -569,11 +710,17 @@ class StatelessCodeExecutorServer:
     def _install_routes(self) -> None:
         @self.app.post("/python", response_model=CodeResponse)
         async def execute_code(req: CodeRequest) -> CodeResponse:
-            truncated_code = (req.code[:197] + "...") if len(req.code) > 200 else req.code
+            truncated_code = (
+                (req.code[:197] + "...") if len(req.code) > 200 else req.code
+            )
             logger.info(
                 "Received execute request max_runtime=%ss tools=%s code=%r",
                 req.max_runtime,
-                req.custom_tools if req.custom_tools is not None else self.config.default_tools,
+                (
+                    req.custom_tools
+                    if req.custom_tools is not None
+                    else self.config.default_tools
+                ),
                 truncated_code,
             )
 
@@ -621,7 +768,6 @@ def create_app(config: StatelessCodeExecutorConfig | None = None) -> FastAPI:
     return StatelessCodeExecutorServer(config).app
 
 
-
 def main(
     host: str = "0.0.0.0",
     port: int = 1212,
@@ -634,7 +780,7 @@ def main(
     outer_timeout_grace_seconds: int = 1,
     log_level: str = "INFO",
     registry: str = "redis://klone-login01.hyak.local:6379",
-    heartbeat_interval: int = 30,
+    heartbeat_interval: int = 4,
 ) -> None:
     """Run the server with uvicorn."""
     import uvicorn
@@ -648,7 +794,7 @@ def main(
         outer_timeout_grace_seconds=outer_timeout_grace_seconds,
         host=host,
         port=port,
-        registry=registry, 
+        registry=registry,
         heartbeat_interval=heartbeat_interval,
     )
     server = StatelessCodeExecutorServer(config)

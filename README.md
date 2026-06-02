@@ -26,12 +26,50 @@ literegistry vllm \
   --tensor-parallel-size 4
 ```
 
+To launch vLLM inside Apptainer, choose the Apptainer runtime and provide any
+binds or container environment variables. The default vLLM Apptainer image is
+`vllm-openai_latest-cu129-ubuntu2404.sif`, pulled from
+`docker://vllm/vllm-openai:latest-cu129-ubuntu2404`. Apptainer launches also
+bind `$HOME` plus the shell-derived Hugging Face cache paths by default. If
+`HF_HOME`, `HF_CACHE`, `HUGGINGFACE_HUB_CACHE`, `HF_HUB_CACHE`,
+`TRANSFORMERS_CACHE`, or `VLLM_CACHE_ROOT` are set in the launching shell, those
+values are passed into the container; otherwise LiteRegistry falls back to
+cache paths under `$HOME/.cache`.
+
+```bash
+literegistry vllm \
+  --runtime apptainer \
+  --model /mmfs1/gscratch/ark/graf/judges-that-code/thinker/tinker-sft-demo_vllm_model \
+  --registry redis://login-node:6379 \
+  --port 7248 \
+  --tensor-parallel-size 1 \
+  --dtype float16 \
+  --max-model-len 4096 \
+  --trust-remote-code \
+  --language-model-only \
+  --safetensors-load-strategy prefetch
+```
+
+For SGLang, the default Apptainer image is `sglang_latest.sif`, pulled from
+the official `docker://lmsysorg/sglang:latest` image. It uses the same shared
+Hugging Face cache defaults.
+
 **3. Start Gateway Server**
 ```bash
 literegistry gateway \
   --registry redis://login-node:6379 \
   --host 0.0.0.0 \
   --port 8080
+```
+
+**Start Python Code Executor**
+
+LiteRegistry can also register a stateless Python code execution service. The
+service registers itself under `model_path="python"` so the gateway can route
+`POST /python` requests to available executor workers.
+
+```bash
+literegistry code --registry redis://klone-login01.hyak.local:6379
 ```
 
 **4. Interact with Gateway**
@@ -49,9 +87,20 @@ curl http://localhost:8080/v1/models
 
 # Check gateway health
 curl http://localhost:8080/health
+
+# Execute Python through the gateway
+curl -X POST http://localhost:8080/python \
+  -H "Content-Type: application/json" \
+  -d '{"code": "print(2 + 2)", "max_runtime": 1.0}'
+
+# Execute Python with a context payload
+curl -X POST http://localhost:8080/python \
+  -H "Content-Type: application/json" \
+  -d '{"code": "data = json.loads(context)\nprint(data[\"name\"])\nprint(data[\"score\"] + 1)", "context_payload": "{\"name\": \"alice\", \"score\": 41}", "max_runtime": 3}'
 ```
 
 The gateway automatically routes requests to the appropriate model server based on the `model` field.
+For code execution, it routes `/python` requests to services registered as `python`.
 
 **5. Monitor Cluster**
 ```bash
