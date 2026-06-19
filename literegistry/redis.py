@@ -9,6 +9,7 @@ import subprocess
 import shutil
 import os
 import fire
+from literegistry.runtime import build_runtime
 
 
 class RedisKVStore(KeyValueStore):
@@ -93,7 +94,20 @@ class RedisKVStore(KeyValueStore):
             self._redis = None
 
 
-def start_redis_server(port=6379, redis_server_path=None):
+def start_redis_server(
+    port=6379,
+    redis_server_path=None,
+    runtime="apptainer",
+    image="redis_7-alpine.sif",
+    image_source="docker://redis:7-alpine",
+    pull_image=True,
+    workdir=None,
+    bind=None,
+    env=None,
+    apptainer_cleanenv=True,
+    apptainer_executable="apptainer",
+    apptainer_extra_args=None,
+):
     """
     Start a Redis server instance.
     
@@ -101,41 +115,70 @@ def start_redis_server(port=6379, redis_server_path=None):
         port: Port number for Redis server
         redis_server_path: Optional path to redis-server binary. If not provided,
                           will check REDIS_SERVER_PATH env var, then search PATH.
+        runtime: Launch runtime ("local" or "apptainer")
+        image: Apptainer image path when runtime="apptainer"
+        image_source: Optional source used by "apptainer pull"
+        pull_image: Pull image_source before launch when provided
+        bind: Apptainer bind mount(s), e.g. /host:/container
+        env: Apptainer environment entry or entries as KEY=VALUE
     
     Returns:
         Redis URL string
     """
-    # Find redis-server binary
-    if redis_server_path is None:
-        # Check environment variable first (for custom installations)
-        redis_server_path = os.environ.get('REDIS_SERVER_PATH')
-        
-        if redis_server_path:
-            # Expand ~ in the path
-            redis_server_path = os.path.expanduser(redis_server_path)
-        else:
-            # Fall back to searching in PATH
-            redis_server_path = shutil.which('redis-server')
-        
+    launch_runtime = build_runtime(
+        runtime=runtime,
+        image=image,
+        image_source=image_source,
+        pull_image=pull_image,
+        workdir=workdir,
+        bind=bind,
+        env=env,
+        apptainer_nv=False,
+        apptainer_cleanenv=apptainer_cleanenv,
+        apptainer_executable=apptainer_executable,
+        apptainer_extra_args=apptainer_extra_args,
+    )
+
+    if launch_runtime.name == "local":
+        # Find redis-server binary
         if redis_server_path is None:
-            raise RuntimeError(
-                "redis-server not found. Please either:\n"
-                "  1. Install redis-server and ensure it's in your PATH, or\n"
-                "  2. Set REDIS_SERVER_PATH environment variable to the binary path, or\n"
-                "  3. Pass redis_server_path parameter to this function"
-            )
+            # Check environment variable first (for custom installations)
+            redis_server_path = os.environ.get('REDIS_SERVER_PATH')
+
+            if redis_server_path:
+                # Expand ~ in the path
+                redis_server_path = os.path.expanduser(redis_server_path)
+            else:
+                # Fall back to searching in PATH
+                redis_server_path = shutil.which('redis-server')
+
+            if redis_server_path is None:
+                raise RuntimeError(
+                    "redis-server not found. Please either:\n"
+                    "  1. Install redis-server and ensure it's in your PATH, or\n"
+                    "  2. Set REDIS_SERVER_PATH environment variable to the binary path, or\n"
+                    "  3. Pass redis_server_path parameter to this function"
+                )
+        else:
+            # Expand ~ in provided path
+            redis_server_path = os.path.expanduser(redis_server_path)
+        server_command = [redis_server_path]
     else:
-        # Expand ~ in provided path
-        redis_server_path = os.path.expanduser(redis_server_path)
+        launch_runtime.prepare()
+        server_command = ["redis-server"]
     
     # Start Redis server with your exact parameters
-    process = subprocess.Popen([
-        redis_server_path,
-        "--save", "",
-        "--appendonly", "no",
-        "--port", str(port),
-        "--protected-mode", "no"
-    ])
+    process = subprocess.Popen(
+        launch_runtime.build_command(
+            [
+                *server_command,
+                "--save", "",
+                "--appendonly", "no",
+                "--port", str(port),
+                "--protected-mode", "no",
+            ]
+        )
+    )
 
     # Give it a moment to start
     time.sleep(2)
@@ -149,17 +192,71 @@ def start_redis_server(port=6379, redis_server_path=None):
     return url
 
 # Usage Example
-async def main_async(port=6379):  
+async def main_async(
+    port=6379,
+    runtime="apptainer",
+    image="redis_7-alpine.sif",
+    image_source="docker://redis:7-alpine",
+    pull_image=True,
+    redis_server_path=None,
+    workdir=None,
+    bind=None,
+    env=None,
+    apptainer_cleanenv=True,
+    apptainer_executable="apptainer",
+    apptainer_extra_args=None,
+):
     # FileSystem Example
     #fs_store = FileSystemKVStore()
     #await fs_store.set("test1.txt", "Hello FS!")
     #await fs_store.set("test2.txt", "World FS!")
     #print(await fs_store.keys())  # ['test1.txt', 'test2.txt']
-    url = start_redis_server(port)
+    url = start_redis_server(
+        port=port,
+        redis_server_path=redis_server_path,
+        runtime=runtime,
+        image=image,
+        image_source=image_source,
+        pull_image=pull_image,
+        workdir=workdir,
+        bind=bind,
+        env=env,
+        apptainer_cleanenv=apptainer_cleanenv,
+        apptainer_executable=apptainer_executable,
+        apptainer_extra_args=apptainer_extra_args,
+    )
     print(f"Redis server started with URL: {url}")
     
-def main(port=6379):
-    asyncio.run(main_async(port))
+def main(
+    port=6379,
+    runtime="apptainer",
+    image="redis_7-alpine.sif",
+    image_source="docker://redis:7-alpine",
+    pull_image=True,
+    redis_server_path=None,
+    workdir=None,
+    bind=None,
+    env=None,
+    apptainer_cleanenv=True,
+    apptainer_executable="apptainer",
+    apptainer_extra_args=None,
+):
+    asyncio.run(
+        main_async(
+            port=port,
+            runtime=runtime,
+            image=image,
+            image_source=image_source,
+            pull_image=pull_image,
+            redis_server_path=redis_server_path,
+            workdir=workdir,
+            bind=bind,
+            env=env,
+            apptainer_cleanenv=apptainer_cleanenv,
+            apptainer_executable=apptainer_executable,
+            apptainer_extra_args=apptainer_extra_args,
+        )
+    )
 
 
 if __name__ == "__main__":
