@@ -31,7 +31,9 @@ class RegistryClient(ServerRegistry):
         max_history: int = 3600,
         cache_ttl: int = 40,
         service_type="model_path",
-        penalty_latency=500,
+        penalty_latency=60.0,
+        bandit_gamma=0.2,
+        bandit_l_max: Optional[float] = None,
         max_heartbeat_interval=15,
     ):
         """
@@ -49,7 +51,9 @@ class RegistryClient(ServerRegistry):
         self.telemetry = LatencyMetricAggregator()
         self.service_type = service_type
         self.penalty_latency = penalty_latency
-        self.bandit = Exp3Dynamic(gamma=0.5, L_max=penalty_latency)
+        self.bandit_gamma = bandit_gamma
+        self.bandit_l_max = bandit_l_max or penalty_latency
+        self.bandit = Exp3Dynamic(gamma=bandit_gamma, L_max=self.bandit_l_max)
         self._models_lock = asyncio.Lock()  # Lock to prevent concurrent roster() calls
 
     def _is_cache_valid(self, cache_key: str) -> bool:

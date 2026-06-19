@@ -8,6 +8,22 @@ from typing import Dict, List, Optional, Sequence, Union
 EnvInput = Optional[Union[Dict[str, str], str, Sequence[str]]]
 ListInput = Optional[Union[str, Sequence[str]]]
 
+
+def default_apptainer_image_dir() -> str:
+    """Return the default directory for Apptainer SIF images ($HOME / ~)."""
+    if os.environ.get("LITEREGISTRY_APPTAINER_IMAGE_DIR"):
+        return os.environ["LITEREGISTRY_APPTAINER_IMAGE_DIR"]
+    return os.environ.get("HOME") or os.path.expanduser("~")
+
+
+def resolve_apptainer_image(image: str, image_dir: Optional[str] = None) -> str:
+    """Resolve a relative SIF name to $HOME so pulls are not cwd-dependent."""
+    if os.path.isabs(image):
+        return image
+    directory = image_dir or default_apptainer_image_dir()
+    return os.path.join(directory, os.path.basename(image))
+
+
 @dataclass
 class ImageSpec:
     """Container image configuration."""
@@ -76,7 +92,13 @@ class ApptainerRuntime(ContainerRuntime):
         executable: str = "apptainer",
         extra_args: ListInput = None,
     ):
-        super().__init__(image_spec)
+        resolved_spec = ImageSpec(
+            image=resolve_apptainer_image(image_spec.image),
+            source=image_spec.source,
+            pull=image_spec.pull,
+            workdir=image_spec.workdir,
+        )
+        super().__init__(resolved_spec)
         self.binds = _normalize_list(binds)
         self.env = _normalize_env(env)
         self.nv = nv
@@ -86,14 +108,18 @@ class ApptainerRuntime(ContainerRuntime):
 
     def prepare(self) -> None:
         if self.image_spec.pull and self.image_spec.source:
-            if os.path.exists(self.image_spec.image):
-                print(f"Using existing Apptainer image: {self.image_spec.image}")
+            image_path = self.image_spec.image
+            if os.path.exists(image_path):
+                print(f"Using existing Apptainer image: {image_path}")
                 return
+            parent = os.path.dirname(image_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
             subprocess.run(
                 [
                     self.executable,
                     "pull",
-                    self.image_spec.image,
+                    image_path,
                     self.image_spec.source,
                 ],
                 check=True,

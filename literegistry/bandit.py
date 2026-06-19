@@ -92,24 +92,28 @@ class Exp3Dynamic:
         K = len(self.weights)
         if K == 0:
             return {}
-        else:
 
-            min_log = min(self.weights.values())
-            # unnormalized "weights" shifted by max to avoid overflow
-            # Use temporary variable to avoid destroying self.weights!
-            shifted_weights = {a: (lw - min_log) for a, lw in self.weights.items()}
-            
-            max_log = max(shifted_weights.values())
-            shifted_weights = {a: (lw - max_log) for a, lw in shifted_weights.items()}
-            
-            self.weights = shifted_weights
-            
-            exp_weights = {a: math.exp(lw) for a, lw in shifted_weights.items()}
-            total_w = sum(exp_weights.values())
-            return {
-                arm: (w / (total_w + 1e-9))
-                for arm, w in exp_weights.items()
-            }
+        max_log = max(self.weights.values())
+        exp_weights = {
+            arm: math.exp(log_weight - max_log)
+            for arm, log_weight in self.weights.items()
+        }
+        total_w = sum(exp_weights.values())
+        floor = self.gamma / K
+        return {
+            arm: (1 - self.gamma) * (w / (total_w + 1e-9)) + floor
+            for arm, w in exp_weights.items()
+        }
+
+    def _renormalize_weights(self):
+        if not self.weights:
+            return
+
+        max_log = max(self.weights.values())
+        self.weights = {
+            arm: log_weight - max_log
+            for arm, log_weight in self.weights.items()
+        }
 
     def get_arm(self, active_ids, k=1):
         """
@@ -160,6 +164,7 @@ class Exp3Dynamic:
 
             x_hat = r / (prob+ 1e-7)
             self.weights[arm_id] += self._eta() * x_hat
+            self._renormalize_weights()
 
         self.t += 1
 

@@ -36,7 +36,7 @@ class VLLMServerManager(ExecutableWrapper):
 
 def main(
     model: str = "meta-llama/Llama-3.1-8B-Instruct",
-    host: str = "0.0.0.0", 
+    host: str = "0.0.0.0",
     registry: str = "/gscratch/ark/graf/registry",
     port: int = None,
     runtime: str = "apptainer",
@@ -57,7 +57,7 @@ def main(
 
     Args:
         model: Model name/path
-        host: Server host 
+        host: Server host
         registry: Directory for server registry
         port: Server port (random if not specified)
         runtime: Launch runtime ("local" or "apptainer")
@@ -67,7 +67,7 @@ def main(
         bind: Apptainer bind mount(s), e.g. /host:/container
         env: Apptainer environment entry or entries as KEY=VALUE
         **kwargs: Additional arguments to pass to vLLM server (e.g., enable_chunked_prefill=True, max_num_seqs=256)
-        
+
     Example:
         python -m literegistry.vllm --model allenai/Llama-3.1-Tulu-3-8B-DPO --enable_chunked_prefill=True --max_num_seqs=256
     """
