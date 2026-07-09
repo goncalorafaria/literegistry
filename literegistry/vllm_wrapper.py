@@ -1,5 +1,6 @@
 import fire
 import random
+import sys
 
 from literegistry.executable_wrapper import ExecutableWrapper
 from literegistry.runtime import (
@@ -17,7 +18,7 @@ class VLLMServerManager(ExecutableWrapper):
         """Return the command to start vLLM server"""
         if self.runtime.name == "apptainer":
             return ["vllm", "serve"]
-        return ["python", "-m", "vllm.entrypoints.openai.api_server"]
+        return [sys.executable, "-m", "vllm.entrypoints.openai.api_server"]
 
     def get_model_args(self) -> list:
         """Return vLLM model arguments."""

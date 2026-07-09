@@ -34,7 +34,7 @@ class RegistryClient(ServerRegistry):
         penalty_latency=60.0,
         bandit_gamma=0.2,
         bandit_l_max: Optional[float] = None,
-        max_heartbeat_interval=15,
+        max_heartbeat_interval=60 * 4,
     ):
         """
         Initialize ModelRegistry

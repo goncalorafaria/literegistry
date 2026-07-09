@@ -482,13 +482,14 @@ class StarletteGatewayServer:
         )
         
         # Single error handler
-        @app.exception_handler(Exception)
         async def global_exception_handler(request: Request, exc: Exception):
             self.logger.error(f"Unhandled exception: {exc}")
             return JSONResponse({
                 "error": f"Internal server error - {exc}",
                 "status": "failed"
             }, status_code=500)
+        
+        app.add_exception_handler(Exception, global_exception_handler)
         
         return app
     

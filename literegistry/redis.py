@@ -98,6 +98,8 @@ def start_redis_server(
     port=6379,
     redis_server_path=None,
     runtime="apptainer",
+    foreground=False,
+    log=None,
     image="redis_7-alpine.sif",
     image_source="docker://redis:7-alpine",
     pull_image=True,
@@ -116,6 +118,10 @@ def start_redis_server(
         redis_server_path: Optional path to redis-server binary. If not provided,
                           will check REDIS_SERVER_PATH env var, then search PATH.
         runtime: Launch runtime ("local" or "apptainer")
+        foreground: Run Redis attached to this process instead of starting it in
+                    the background and returning.
+        log: Optional file path to append the Redis URL to. Missing parent
+             directories and the file are created.
         image: Apptainer image path when runtime="apptainer"
         image_source: Optional source used by "apptainer pull"
         pull_image: Pull image_source before launch when provided
@@ -167,27 +173,39 @@ def start_redis_server(
         launch_runtime.prepare()
         server_command = ["redis-server"]
     
-    # Start Redis server with your exact parameters
-    process = subprocess.Popen(
-        launch_runtime.build_command(
-            [
-                *server_command,
-                "--save", "",
-                "--appendonly", "no",
-                "--port", str(port),
-                "--protected-mode", "no",
-            ]
-        )
-    )
-
-    # Give it a moment to start
-    time.sleep(2)
-
     # get hostname
     hostname = socket.gethostname()
     url = socket.getfqdn()
 
     url = f"redis://{url}:{port}"
+
+    command = launch_runtime.build_command(
+        [
+            *server_command,
+            "--save", "",
+            "--appendonly", "no",
+            "--port", str(port),
+            "--protected-mode", "no",
+        ]
+    )
+
+    print(f"REDIS_URL={url}", flush=True)
+    if log is not None:
+        log_path = os.path.expanduser(log)
+        log_dir = os.path.dirname(log_path)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        with open(log_path, "a") as log_file:
+            log_file.write(f"{url}\n")
+
+    if foreground:
+        print(f"Redis server running with URL: {url}", flush=True)
+        subprocess.run(command, check=True)
+    else:
+        subprocess.Popen(command)
+
+        # Give it a moment to start
+        time.sleep(2)
 
     return url
 
@@ -195,6 +213,8 @@ def start_redis_server(
 async def main_async(
     port=6379,
     runtime="apptainer",
+    foreground=False,
+    log=None,
     image="redis_7-alpine.sif",
     image_source="docker://redis:7-alpine",
     pull_image=True,
@@ -215,6 +235,8 @@ async def main_async(
         port=port,
         redis_server_path=redis_server_path,
         runtime=runtime,
+        foreground=foreground,
+        log=log,
         image=image,
         image_source=image_source,
         pull_image=pull_image,
@@ -230,6 +252,8 @@ async def main_async(
 def main(
     port=6379,
     runtime="apptainer",
+    foreground=False,
+    log=None,
     image="redis_7-alpine.sif",
     image_source="docker://redis:7-alpine",
     pull_image=True,
@@ -245,6 +269,8 @@ def main(
         main_async(
             port=port,
             runtime=runtime,
+            foreground=foreground,
+            log=log,
             image=image,
             image_source=image_source,
             pull_image=pull_image,
