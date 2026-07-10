@@ -1,0 +1,32 @@
+configurations:
+  # Example 1: Inline vLLM configuration for Llama 3.1 8B
+  - device_name: "l40-8"
+    target_instances: 8
+    inline_config:
+      script_type: vllm
+      args:
+        model: "meta-llama/Llama-3.1-8B-Instruct"
+        tensor_parallel_size: ${DEVICE_COUNT}
+        gpu_memory_utilization: 0.95
+        max-model-len: 4096
+        dtype: bfloat16
+      launcher: literegistry
+  
+  # Example 2: Different model on different hardware
+  - device_name: "a40-8"
+    target_instances: 4
+    inline_config:
+      script_type: vllm
+      args:
+        model: "meta-llama/Llama-3.1-70B-Instruct"
+        tensor_parallel_size: ${DEVICE_COUNT}
+        gpu_memory_utilization: 0.90
+        max-model-len: 8192
+        dtype: bfloat16
+      launcher: literegistry
+  
+  # Example 3: Mix inline config with reference to existing config
+  - device_name: "l40s-8"
+    target_instances: 8
+    script_spec: "llama8b"  # Reference to existing config file
+

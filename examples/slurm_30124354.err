@@ -1,0 +1,35 @@
+[1;36m(VllmWorker rank=0 pid=33234)[0;0m Loading safetensors checkpoint shards:   0% Completed | 0/4 [00:00<?, ?it/s]
+[1;36m(VllmWorker rank=0 pid=33234)[0;0m Loading safetensors checkpoint shards:  25% Completed | 1/4 [00:17<00:51, 17.32s/it]
+[1;36m(VllmWorker rank=0 pid=33234)[0;0m Loading safetensors checkpoint shards:  50% Completed | 2/4 [00:30<00:29, 15.00s/it]
+[1;36m(VllmWorker rank=0 pid=33234)[0;0m Loading safetensors checkpoint shards:  75% Completed | 3/4 [00:32<00:08,  8.92s/it]
+[1;36m(VllmWorker rank=0 pid=33234)[0;0m Loading safetensors checkpoint shards: 100% Completed | 4/4 [00:44<00:00, 10.35s/it]
+[1;36m(VllmWorker rank=0 pid=33234)[0;0m Loading safetensors checkpoint shards: 100% Completed | 4/4 [00:44<00:00, 11.23s/it]
+[1;36m(VllmWorker rank=0 pid=33234)[0;0m 
+[1;36m(VllmWorker rank=7 pid=33241)[0;0m /gscratch/ark/graf/miniconda3/envs/multilora/lib/python3.10/site-packages/torch/utils/cpp_extension.py:2356: UserWarning: TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+[1;36m(VllmWorker rank=7 pid=33241)[0;0m If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'].
+[1;36m(VllmWorker rank=7 pid=33241)[0;0m   warnings.warn(
+[1;36m(VllmWorker rank=1 pid=33235)[0;0m /gscratch/ark/graf/miniconda3/envs/multilora/lib/python3.10/site-packages/torch/utils/cpp_extension.py:2356: UserWarning: TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+[1;36m(VllmWorker rank=1 pid=33235)[0;0m If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'].
+[1;36m(VllmWorker rank=1 pid=33235)[0;0m   warnings.warn(
+[1;36m(VllmWorker rank=4 pid=33238)[0;0m /gscratch/ark/graf/miniconda3/envs/multilora/lib/python3.10/site-packages/torch/utils/cpp_extension.py:2356: UserWarning: TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+[1;36m(VllmWorker rank=2 pid=33236)[0;0m /gscratch/ark/graf/miniconda3/envs/multilora/lib/python3.10/site-packages/torch/utils/cpp_extension.py:2356: UserWarning: TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+[1;36m(VllmWorker rank=4 pid=33238)[0;0m If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'].
+[1;36m(VllmWorker rank=3 pid=33237)[0;0m /gscratch/ark/graf/miniconda3/envs/multilora/lib/python3.10/site-packages/torch/utils/cpp_extension.py:2356: UserWarning: TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+[1;36m(VllmWorker rank=2 pid=33236)[0;0m If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'].
+[1;36m(VllmWorker rank=4 pid=33238)[0;0m   warnings.warn(
+[1;36m(VllmWorker rank=6 pid=33240)[0;0m /gscratch/ark/graf/miniconda3/envs/multilora/lib/python3.10/site-packages/torch/utils/cpp_extension.py:2356: UserWarning: TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+[1;36m(VllmWorker rank=3 pid=33237)[0;0m If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'].
+[1;36m(VllmWorker rank=2 pid=33236)[0;0m   warnings.warn(
+[1;36m(VllmWorker rank=6 pid=33240)[0;0m If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'].
+[1;36m(VllmWorker rank=3 pid=33237)[0;0m   warnings.warn(
+[1;36m(VllmWorker rank=0 pid=33234)[0;0m /gscratch/ark/graf/miniconda3/envs/multilora/lib/python3.10/site-packages/torch/utils/cpp_extension.py:2356: UserWarning: TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+[1;36m(VllmWorker rank=6 pid=33240)[0;0m   warnings.warn(
+[1;36m(VllmWorker rank=5 pid=33239)[0;0m /gscratch/ark/graf/miniconda3/envs/multilora/lib/python3.10/site-packages/torch/utils/cpp_extension.py:2356: UserWarning: TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+[1;36m(VllmWorker rank=0 pid=33234)[0;0m If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'].
+[1;36m(VllmWorker rank=5 pid=33239)[0;0m If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'].
+[1;36m(VllmWorker rank=5 pid=33239)[0;0m   warnings.warn(
+[1;36m(VllmWorker rank=0 pid=33234)[0;0m   warnings.warn(
+INFO:     Started server process [32782]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+[2025-10-16T11:18:02.843] error: *** JOB 30124354 ON g3117 CANCELLED AT 2025-10-16T11:18:02 DUE to SIGNAL Terminated ***

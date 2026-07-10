@@ -1,0 +1,1046 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Introducing LiteRegistry - Lightweight Service Discovery for Distributed Model Inference</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+            font-size: 18px;
+            line-height: 1.6;
+            color: #333;
+            background-color: #ffffff;
+        }
+
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        header {
+            background-color: #222;
+            color: #fff;
+            padding: 60px 20px;
+            text-align: center;
+            margin-bottom: 50px;
+        }
+
+        h1 {
+            font-size: 42px;
+            line-height: 1.2;
+            font-weight: 300;
+            margin-bottom: 20px;
+            color: #fff;
+        }
+
+        h2 {
+            font-size: 32px;
+            line-height: 1.3;
+            font-weight: 300;
+            margin-top: 50px;
+            margin-bottom: 25px;
+            color: #222;
+            border-bottom: 2px solid #de3412;
+            padding-bottom: 10px;
+        }
+
+        h3 {
+            font-size: 26px;
+            line-height: 1.3;
+            font-weight: 400;
+            margin-top: 40px;
+            margin-bottom: 20px;
+            color: #333;
+        }
+
+        h4 {
+            font-size: 22px;
+            line-height: 1.4;
+            font-weight: 500;
+            margin-top: 30px;
+            margin-bottom: 15px;
+            color: #444;
+        }
+
+        p {
+            margin-bottom: 20px;
+            color: #444;
+        }
+
+        .tldr {
+            background-color: #f8f9fa;
+            border-left: 4px solid #de3412;
+            padding: 20px 25px;
+            margin: 30px 0;
+            font-style: italic;
+            color: #555;
+        }
+
+        .callout {
+            background-color: #fff9f0;
+            border: 2px solid #de3412;
+            border-radius: 8px;
+            padding: 25px;
+            margin: 30px 0;
+        }
+
+        .callout h4 {
+            margin-top: 0;
+            color: #de3412;
+        }
+
+        .diagram-placeholder {
+            background: linear-gradient(135deg, #f5f5f5 0%, #e9e9e9 100%);
+            border: 2px dashed #999;
+            border-radius: 8px;
+            padding: 40px 20px;
+            margin: 30px 0;
+            text-align: center;
+            font-style: italic;
+            color: #666;
+            min-height: 200px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .diagram-placeholder::before {
+            content: "📊 ";
+            font-size: 32px;
+            display: block;
+            margin-bottom: 10px;
+        }
+
+        pre {
+            background-color: #f6f8fa;
+            border: 1px solid #e1e4e8;
+            border-radius: 6px;
+            padding: 20px;
+            overflow-x: auto;
+            margin: 25px 0;
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 14px;
+            line-height: 1.5;
+        }
+
+        code {
+            background-color: #f6f8fa;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 15px;
+            color: #e83e8c;
+        }
+
+        pre code {
+            background-color: transparent;
+            padding: 0;
+            color: #333;
+        }
+
+        ul, ol {
+            margin: 20px 0 20px 40px;
+        }
+
+        li {
+            margin-bottom: 10px;
+            line-height: 1.7;
+        }
+
+        strong, b {
+            font-weight: 600;
+            color: #222;
+        }
+
+        em, i {
+            font-style: italic;
+        }
+
+        a {
+            color: #de3412;
+            text-decoration: none;
+            transition: opacity 0.2s;
+        }
+
+        a:hover {
+            opacity: 0.7;
+            text-decoration: underline;
+        }
+
+        hr {
+            border: none;
+            border-top: 1px solid #e1e4e8;
+            margin: 40px 0;
+        }
+
+        .section-divider {
+            border-top: 3px solid #de3412;
+            margin: 60px 0;
+        }
+
+        footer {
+            background-color: #1c1c1c;
+            color: #ccc;
+            padding: 40px 20px;
+            margin-top: 80px;
+            text-align: center;
+        }
+
+        footer p {
+            color: #ccc;
+            margin-bottom: 10px;
+        }
+
+        .comparison-table {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 30px;
+            margin: 30px 0;
+        }
+
+        .comparison-column {
+            background-color: #f8f9fa;
+            padding: 20px;
+            border-radius: 8px;
+        }
+
+        .comparison-column h4 {
+            margin-top: 0;
+            margin-bottom: 15px;
+        }
+
+        .timeline-step {
+            margin: 25px 0;
+            padding-left: 20px;
+            border-left: 3px solid #de3412;
+        }
+
+        .timeline-step strong {
+            display: block;
+            font-size: 20px;
+            color: #de3412;
+            margin-bottom: 5px;
+        }
+
+        @media (max-width: 768px) {
+            body {
+                font-size: 16px;
+            }
+
+            h1 {
+                font-size: 32px;
+            }
+
+            h2 {
+                font-size: 26px;
+            }
+
+            h3 {
+                font-size: 22px;
+            }
+
+            h4 {
+                font-size: 19px;
+            }
+
+            .comparison-table {
+                grid-template-columns: 1fr;
+                gap: 20px;
+            }
+
+            pre {
+                font-size: 12px;
+                padding: 15px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="container">
+            <h1>Introducing LiteRegistry: Lightweight Service Discovery for Distributed Model Inference</h1>
+        </div>
+    </header>
+
+    <div class="container">
+        <div class="tldr">
+            <strong>TL;DR:</strong> LiteRegistry is a lightweight service discovery system for distributed ML inference. It's like Kubernetes service discovery, but without the containers, YAML files, or complexity. Built for HPC research clusters where nodes come and go (checkpoint resources, Slurm preemption, spot instances). Just add <code>--registry redis://your-host:6379</code> to your vLLM/SGLang commands and get automatic failover, load balancing, and dynamic scaling. <code>pip install literegistry</code> and you're done.
+        </div>
+
+        <hr class="section-divider">
+
+        <h2>The Reality of Research Computing Today</h2>
+
+        <p>If you're a researcher or student in a modern ML lab, this scenario will sound familiar:</p>
+
+        <p>Your lab has a Slurm cluster. You get some dedicated GPU resources—maybe a few nodes that are "yours" most of the time. But for the big jobs? You're competing for a shared pool of checkpoint resources. These GPUs can be allocated to you when they're free, but at any moment, they can be taken away for higher-priority jobs. Your training run that was humming along on 32 GPUs suddenly drops to 8. Or worse, that inference server you stood up on a borrowed node just disappears.</p>
+
+        <p>This is the reality of academic and industry research computing: <strong>your infrastructure is constantly in flux</strong>. Jobs pop up and drop at any moment. Resources come and go. The cluster you have at 2 PM looks nothing like the cluster you have at 2 AM.</p>
+
+        <p>Traditional distributed computing tools weren't built for this world. They assume a stable cluster where you request N nodes, get N nodes, and keep those N nodes until your job finishes. They treat node failures as exceptional cases, not everyday occurrences. They require manual intervention to handle dynamic resource allocation.</p>
+
+        <h3>What About Kubernetes and Other Orchestration Tools?</h3>
+
+        <p>You might be thinking: "Doesn't Kubernetes solve this?" And you'd be right—for cloud environments. Kubernetes, Docker Swarm, and similar tools have been the standard for service discovery and orchestration in cloud computing for years. They're battle-tested, feature-rich, and widely adopted.</p>
+
+        <p>But here's the problem: <strong>they were designed for containerized cloud environments, not HPC research clusters.</strong></p>
+
+        <p>These tools bring enormous complexity:</p>
+        <ul>
+            <li>Container orchestration when you just need to run Python scripts</li>
+            <li>YAML configuration files that are a full-time job to maintain</li>
+            <li>Docker/container knowledge that not every researcher has</li>
+            <li>Complete infrastructure overhaul to adopt</li>
+            <li>Complexity designed for microservices, not ML workloads</li>
+        </ul>
+
+        <p>When you're a grad student who just wants to run vLLM on some GPUs and have it work when nodes come and go, containerizing your entire workflow is overkill. You don't want to learn Kubernetes, write Dockerfiles, set up a container registry, and completely change how you deploy your research code.</p>
+
+        <p><strong>What if you could get the core benefits—service discovery, health checking, automatic failover—without changing how you work?</strong></p>
+
+        <p><strong>This is why LiteRegistry exists.</strong></p>
+
+        <p>LiteRegistry gives you the orchestration capabilities you need, written in Python, designed for ML workloads, and simple enough to add to your existing Slurm scripts without rewriting everything. No containers required. No YAML files. No infrastructure overhaul. Just <code>pip install literegistry</code> and get back to your research.</p>
+
+        <h2>The Problem: Coordinating Constantly-Changing Distributed Infrastructure</h2>
+
+        <p>Running large language models at scale in distributed environments presents unique challenges—especially when your infrastructure is dynamic. When you have multiple GPU nodes running model servers across an HPC cluster that's constantly changing, how do you:</p>
+
+        <ul>
+            <li>Keep track of which servers are currently available (not which <em>were</em> available 5 minutes ago)?</li>
+            <li>Route client requests to the right server when nodes can disappear mid-request?</li>
+            <li>Handle failures gracefully when "failure" is just Tuesday afternoon?</li>
+            <li>Dynamically scale up when checkpoint resources become available?</li>
+            <li>Scale down gracefully when resources are reclaimed?</li>
+        </ul>
+
+        <p>Imagine you're running a research cluster with dozens of GPU nodes, each hosting different models or multiple replicas of the same model. Your clients need to:</p>
+
+        <ul>
+            <li><strong>Discover</strong> which models are currently available</li>
+            <li><strong>Route</strong> requests to the appropriate server</li>
+            <li><strong>Load balance</strong> across multiple replicas</li>
+            <li><strong>Handle failures</strong> when a server goes down</li>
+            <li><strong>Monitor</strong> performance across the cluster</li>
+        </ul>
+
+        <p>Without a coordination layer, this quickly becomes a nightmare. You'd need to hardcode endpoints, manually update configurations when servers go down, build your own retry logic, and somehow handle the case where half your nodes just got preempted.</p>
+
+        <div class="diagram-placeholder">
+            <div>Diagram of distributed cluster showing multiple GPU nodes, each running vLLM/SGLang servers, all disconnected with question marks between them - illustrating the chaos without a registry. Show some nodes fading out/disappearing to represent preemption</div>
+        </div>
+
+        <p><strong>LiteRegistry provides the missing coordination layer</strong> for this dynamic, ever-changing world.</p>
+
+        <h2>What is LiteRegistry?</h2>
+
+        <p>LiteRegistry is a lightweight service registry and discovery system built specifically for distributed model inference deployments. It's designed from the ground up to handle the reality of modern research computing: resources that come and go, jobs that scale up and down, and failures that are part of normal operation.</p>
+
+        <p>Think of it as a phonebook for your distributed model servers—one that automatically updates itself when servers appear or disappear, routes traffic intelligently, and handles the chaos of a shared HPC environment so you don't have to.</p>
+
+        <p>With first-class support for popular inference engines like <strong>vLLM</strong> and <strong>SGLang</strong>, LiteRegistry makes it simple to:</p>
+
+        <ul>
+            <li><strong>Deploy</strong> model servers that automatically register themselves</li>
+            <li><strong>Route</strong> requests to healthy, available servers</li>
+            <li><strong>Scale</strong> your deployment up or down as resources change</li>
+            <li><strong>Handle failures</strong> without manual intervention</li>
+            <li><strong>Monitor</strong> your entire distributed system from a single dashboard</li>
+        </ul>
+
+        <div class="callout">
+            <h4>💡 Key Insight for Research Labs:</h4>
+            <p>If your lab has a mix of dedicated nodes and checkpoint/preemptible nodes (like most academic clusters do), LiteRegistry is built for you. Submit separate Slurm jobs for your dedicated partition and your checkpoint partition. When checkpoint nodes get preempted, LiteRegistry automatically removes them from the pool. When they come back, resubmit the job and they rejoin automatically. Your clients never need to know what's happening behind the scenes.</p>
+        </div>
+
+        <hr>
+
+        <h2>How LiteRegistry Works</h2>
+
+        <p>In a typical research lab scenario, you might have:</p>
+        <ul>
+            <li>4 dedicated GPU nodes running your primary inference servers</li>
+            <li>8-16 checkpoint nodes that come and go throughout the day</li>
+            <li>Multiple students and researchers sending inference requests</li>
+            <li>Jobs being scheduled and preempted by Slurm constantly</li>
+        </ul>
+
+        <p>LiteRegistry handles all of this dynamically. Here's how:</p>
+
+        <p>LiteRegistry consists of four main components that work together:</p>
+
+        <h3>1. The Registry (Key-Value Store)</h3>
+
+        <p>At the heart of LiteRegistry is a distributed key-value store that tracks all your model servers. Think of it as a phonebook for your cluster—it knows which models are running, where they're located, their health status, and performance metrics.</p>
+
+        <div class="diagram-placeholder">
+            <div>Diagram of central registry (Redis or FileSystem) with metadata storage showing service entries. Show entries dynamically appearing/fading to represent nodes joining and leaving. Fields shown: model_name, endpoint, health_status, last_heartbeat, latency_metrics</div>
+        </div>
+
+        <p>The registry supports two backends:</p>
+
+        <p><strong>FileSystem Backend</strong>: Perfect for single-node setups or HPC clusters with shared filesystems (NFS). Simple to set up with zero dependencies, but can bottleneck under high concurrency when you have many services registering and querying simultaneously.</p>
+
+        <p><strong>Redis Backend</strong>: Recommended for production deployments, especially when running across multiple nodes without shared storage. Provides high-performance concurrent access and is built for distributed systems.</p>
+
+        <h3>2. Model Server Wrappers (vLLM & SGLang)</h3>
+
+        <p>LiteRegistry provides wrappers for popular inference engines that handle all the registration complexity for you. When you launch a vLLM or SGLang server through LiteRegistry, it automatically:</p>
+
+        <ul>
+            <li><strong>Registers</strong> itself with the registry on startup</li>
+            <li><strong>Sends heartbeats</strong> to maintain its active status</li>
+            <li><strong>Reports metrics</strong> like request counts and latency</li>
+            <li><strong>Deregisters</strong> gracefully on shutdown</li>
+        </ul>
+
+        <div class="diagram-placeholder">
+            <div>Diagram of vLLM/SGLang server lifecycle: startup -> register with registry -> periodic heartbeat -> serve requests -> report metrics -> shutdown/deregister</div>
+        </div>
+
+        <p>This means you can spin up and tear down servers dynamically, and the system adapts automatically.</p>
+
+        <h3>3. Gateway Server</h3>
+
+        <p>The Gateway is an HTTP reverse proxy that sits between your clients and model servers. It provides:</p>
+
+        <ul>
+            <li><strong>OpenAI-compatible API</strong> endpoints (<code>/v1/completions</code>, <code>/v1/chat/completions</code>, <code>/v1/models</code>)</li>
+            <li><strong>Automatic load balancing</strong> based on server latency</li>
+            <li><strong>Smart routing</strong> based on the model parameter in requests</li>
+            <li><strong>Health monitoring</strong> and failover</li>
+        </ul>
+
+        <div class="diagram-placeholder">
+            <div>Diagram of request flow: Client -> Gateway Server -> (queries registry for available servers) -> selects best server based on latency -> routes to vLLM/SGLang instance -> returns response</div>
+        </div>
+
+        <p>The Gateway continuously tracks which servers are healthy and routes requests to the fastest available instance. If a server fails, it automatically retries on another replica.</p>
+
+        <h3>4. Client Library & CLI</h3>
+
+        <p>For programmatic access, LiteRegistry provides:</p>
+
+        <ul>
+            <li><strong>RegistryClient</strong>: Register servers and query available models</li>
+            <li><strong>RegistryHTTPClient</strong>: Make requests with automatic failover and retry logic</li>
+        </ul>
+
+        <p>For monitoring, there's a CLI tool:</p>
+
+        <pre><code>literegistry summary --registry redis://your-host:6379</code></pre>
+
+        <div class="diagram-placeholder">
+            <div>Diagram of monitoring dashboard showing: multiple models, server counts per model, health status, request throughput, latency percentiles</div>
+        </div>
+
+        <h2>Getting Started: Installation</h2>
+
+        <p>Installation is straightforward via pip:</p>
+
+        <pre><code>pip install literegistry</code></pre>
+
+        <h2>Running LiteRegistry: Complete Workflow</h2>
+
+        <p>Let's walk through deploying a distributed inference cluster on an HPC system.</p>
+
+        <h3>Step 1: Start the Registry</h3>
+
+        <p>First, you need a central registry. For production deployments, use Redis:</p>
+
+        <pre><code># Start Redis server (or use an existing Redis instance)
+literegistry redis --port 6379</code></pre>
+
+        <p>The Redis server will run on your login node or a dedicated service node. All other components will connect to this registry.</p>
+
+        <p>For development or shared filesystem environments, you can skip this step and use a filesystem path instead (e.g., <code>/shared/registry</code>).</p>
+
+        <h3>Step 2: Launch Model Servers</h3>
+
+        <p>Now spin up your vLLM or SGLang servers. The beauty of LiteRegistry is that you can use <strong>all standard vLLM/SGLang arguments</strong>—the wrapper is transparent.</p>
+
+        <h4>Using vLLM:</h4>
+
+        <pre><code>literegistry vllm \
+  --model "meta-llama/Llama-3.1-8B-Instruct" \
+  --registry redis://login-node:6379 \
+  --tensor-parallel-size 4 \
+  --gpu-memory-utilization 0.9</code></pre>
+
+        <div class="diagram-placeholder">
+            <div>Diagram of GPU node running vLLM: shows the model loaded across 4 GPUs with tensor parallelism, connected to registry with heartbeat arrow. Label the node with "CHECKPOINT NODE - Can be preempted!" to emphasize the dynamic nature</div>
+        </div>
+
+        <h4>Using SGLang:</h4>
+
+        <pre><code>literegistry sglang \
+  --model "meta-llama/Llama-3.1-8B-Instruct" \
+  --registry redis://login-node:6379 \
+  --tp-size 4 \
+  --mem-fraction-static 0.9</code></pre>
+
+        <p>You can launch multiple instances of the same model across different nodes for load balancing, or run different models—LiteRegistry handles all the tracking automatically.</p>
+
+        <p><strong>Notice something?</strong> The only thing that changed from your normal vLLM/SGLang command is adding <code>--registry redis://login-node:6379</code>. That's it. You don't rewrite your launch scripts, you don't containerize anything, you don't change your Slurm submission workflow. You just add one flag and get automatic service discovery.</p>
+
+        <h4>Example: Running multiple replicas</h4>
+
+        <pre><code># On GPU node 1
+literegistry vllm --model "meta-llama/Llama-3.1-8B-Instruct" --registry redis://login:6379
+
+# On GPU node 2  
+literegistry vllm --model "meta-llama/Llama-3.1-8B-Instruct" --registry redis://login:6379
+
+# On GPU node 3
+literegistry vllm --model "mistralai/Mixtral-8x7B-Instruct-v0.1" --registry redis://login:6379</code></pre>
+
+        <p>All three servers automatically register and start sending heartbeats.</p>
+
+        <h3>Step 3: Start the Gateway</h3>
+
+        <p>Launch the Gateway server to handle client requests:</p>
+
+        <pre><code>literegistry gateway \
+  --registry redis://login-node:6379 \
+  --host 0.0.0.0 \
+  --port 8080</code></pre>
+
+        <p>The Gateway immediately queries the registry and starts routing traffic to available servers.</p>
+
+        <div class="diagram-placeholder">
+            <div>Diagram of complete system architecture: multiple vLLM/SGLang servers on different GPU nodes -> central Redis registry <- Gateway server <- multiple clients</div>
+        </div>
+
+        <h3>Step 4: Monitor Your Cluster</h3>
+
+        <p>Use the CLI to check cluster status:</p>
+
+        <pre><code>literegistry summary --registry redis://login-node:6379</code></pre>
+
+        <p>Output:</p>
+        <pre><code>meta-llama/Llama-3.1-8B-Instruct: 2
+mistralai/Mixtral-8x7B-Instruct-v0.1: 1</code></pre>
+
+        <p>This shows you have 2 replicas of Llama running and 1 Mixtral instance.</p>
+
+        <h2>Using the Gateway API</h2>
+
+        <p>Once your cluster is running, clients can send requests to the Gateway using the OpenAI-compatible API:</p>
+
+        <pre><code>curl -X POST http://gateway-host:8080/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "meta-llama/Llama-3.1-8B-Instruct",
+    "prompt": "Explain quantum computing in simple terms",
+    "max_tokens": 100
+  }'</code></pre>
+
+        <p>The Gateway automatically:</p>
+        <ol>
+            <li>Looks up available servers for that model</li>
+            <li>Selects the server with the lowest latency</li>
+            <li>Routes the request</li>
+            <li>Returns the response</li>
+            <li>Updates metrics</li>
+        </ol>
+
+        <p>If that server is down, it automatically tries the next available replica.</p>
+
+        <h2>Writing Code: Server-Side Integration</h2>
+
+        <h3>Registering a Custom Server</h3>
+
+        <p>If you're not using vLLM or SGLang, you can still register any HTTP service with LiteRegistry:</p>
+
+        <pre><code>from literegistry import RegistryClient, get_kvstore
+import asyncio
+
+async def register_my_server():
+    # Connect to registry (Redis or filesystem)
+    store = get_kvstore("redis://localhost:6379")
+    # Or for filesystem: store = get_kvstore("/shared/registry")
+    
+    client = RegistryClient(store, service_type="model_path")
+    
+    # Register your server
+    await client.register(
+        port=8000,
+        metadata={
+            "model_path": "my-custom-model",
+            "model_type": "custom-transformer"
+        }
+    )
+    
+    print("Server registered! Starting heartbeats...")
+    
+    # Keep server alive with heartbeats
+    while True:
+        await asyncio.sleep(10)  # Heartbeat every 10 seconds
+        await client.heartbeat(port=8000)
+
+asyncio.run(register_my_server())</code></pre>
+
+        <p>This pattern lets you integrate any model server into the LiteRegistry ecosystem.</p>
+
+        <h3>Querying Available Models</h3>
+
+        <pre><code>from literegistry import RegistryClient, get_kvstore
+import asyncio
+
+async def list_models():
+    store = get_kvstore("redis://localhost:6379")
+    client = RegistryClient(store, service_type="model_path")
+    
+    # Get all available models and their servers
+    models = await client.models()
+    
+    for model_name, servers in models.items():
+        print(f"\n{model_name}:")
+        for server in servers:
+            print(f"  - {server['base_url']}")
+            print(f"    Last heartbeat: {server.get('last_heartbeat_time')}")
+            print(f"    Request stats: {server.get('request_stats', {})}")
+
+asyncio.run(list_models())</code></pre>
+
+        <h2>Writing Code: Client-Side Usage</h2>
+
+        <h3>Basic HTTP Client with Automatic Failover</h3>
+
+        <p>The <code>RegistryHTTPClient</code> provides automatic failover and retry logic:</p>
+
+        <pre><code>from literegistry import RegistryClient, RegistryHTTPClient, get_kvstore
+import asyncio
+
+async def make_request():
+    store = get_kvstore("redis://localhost:6379")
+    client = RegistryClient(store, service_type="model_path")
+    
+    # Create HTTP client for a specific model
+    async with RegistryHTTPClient(
+        client, 
+        "meta-llama/Llama-3.1-8B-Instruct"
+    ) as http_client:
+        
+        # Make request with automatic retry and rotation
+        result, server_url = await http_client.request_with_rotation(
+            endpoint="v1/completions",
+            payload={
+                "prompt": "Write a haiku about distributed systems",
+                "max_tokens": 50
+            },
+            timeout=30,
+            max_retries=3
+        )
+        
+        print(f"Response from {server_url}:")
+        print(result)
+
+asyncio.run(make_request())</code></pre>
+
+        <p>If the first server fails or times out, the client automatically tries the next available replica.</p>
+
+        <h3>Batch Processing with Parallel Requests</h3>
+
+        <p>For high-throughput workloads, process multiple requests in parallel:</p>
+
+        <pre><code>async def batch_inference():
+    store = get_kvstore("redis://localhost:6379")
+    client = RegistryClient(store, service_type="model_path")
+    
+    # Prepare batch of requests
+    prompts = [
+        {"prompt": f"Question {i}: Tell me about AI", "max_tokens": 50}
+        for i in range(100)
+    ]
+    
+    async with RegistryHTTPClient(
+        client,
+        "meta-llama/Llama-3.1-8B-Instruct"
+    ) as http_client:
+        
+        # Process 100 requests with max 5 concurrent
+        results = await http_client.parallel_requests(
+            endpoint="v1/completions",
+            payloads_list=prompts,
+            max_parallel_requests=5,
+            timeout=30,
+            max_retries=3
+        )
+        
+        print(f"Processed {len(results)} requests")
+        for i, (result, server) in enumerate(results):
+            print(f"Request {i} served by {server}")
+
+asyncio.run(batch_inference())</code></pre>
+
+        <p>The client automatically distributes load across available replicas and handles failures gracefully.</p>
+
+        <h2>A Day in the Life: LiteRegistry in a Research Lab</h2>
+
+        <p>Let's walk through a realistic scenario that shows why LiteRegistry matters:</p>
+
+        <div class="timeline-step">
+            <strong>9 AM</strong>
+            <p>You submit a Slurm job to start 4 vLLM servers on your dedicated nodes. LiteRegistry's vLLM integration automatically registers each server as it comes online. Your inference dashboard shows 4 healthy servers.</p>
+        </div>
+
+        <div class="timeline-step">
+            <strong>11 AM</strong>
+            <p>Checkpoint nodes become available. You submit another job requesting 12 additional nodes. LiteRegistry detects the new servers and adds them to the pool as they register. Now you have 16 servers handling requests.</p>
+        </div>
+
+        <div class="timeline-step">
+            <strong>2 PM</strong>
+            <p>A high-priority job preempts 8 of your checkpoint nodes. Your vLLM servers on those nodes disappear. With traditional tools, this would mean:</p>
+            <ul>
+                <li>Failed requests from clients still trying those endpoints</li>
+                <li>Manual intervention to update your load balancer</li>
+                <li>Downtime while you figure out what happened</li>
+            </ul>
+            <p>With LiteRegistry:</p>
+            <ul>
+                <li>Servers fail to send heartbeats within seconds</li>
+                <li>LiteRegistry marks them as unavailable automatically</li>
+                <li>Client requests route to the 8 remaining healthy servers</li>
+                <li>Zero downtime, zero manual intervention</li>
+            </ul>
+        </div>
+
+        <div class="timeline-step">
+            <strong>4 PM</strong>
+            <p>Those checkpoint nodes become available again. You restart your Slurm job. The servers register themselves and start receiving traffic—automatically.</p>
+        </div>
+
+        <div class="timeline-step">
+            <strong>All day long</strong>
+            <p>Graduate students across your lab are running inference workloads. They don't need to know which nodes are up or down. They just send requests to LiteRegistry's gateway, and it routes them intelligently to whatever servers are currently available.</p>
+        </div>
+
+        <div class="diagram-placeholder">
+            <div>Diagram of a timeline showing the scenario above: nodes appearing, disappearing, and reappearing throughout the day, with LiteRegistry automatically managing the fleet. Show a graph of "Available GPUs" fluctuating from 4->16->8->16 throughout the day, with requests being served continuously despite the changes</div>
+        </div>
+
+        <p>This is the power of LiteRegistry: <strong>it turns the chaos of shared HPC resources into a reliable, self-managing service</strong>.</p>
+
+        <h2>Storage Backend Trade-offs</h2>
+
+        <p>Choosing between FileSystem and Redis backends depends on your deployment:</p>
+
+        <h3>FileSystem Backend</h3>
+
+        <p><strong>Use when:</strong></p>
+        <ul>
+            <li>Running on a single machine for development/testing</li>
+            <li>All nodes share a filesystem (common in HPC with NFS)</li>
+            <li>You want zero additional dependencies</li>
+            <li>You have a small, stable deployment (5-10 servers)</li>
+        </ul>
+
+        <p><strong>Limitations:</strong></p>
+        <ul>
+            <li>Can bottleneck with many concurrent services/clients</li>
+            <li>File locking overhead increases with scale</li>
+            <li>Not ideal for 50+ services or high query rates</li>
+            <li>Can struggle when many nodes are rapidly joining/leaving (e.g., checkpoint nodes being preempted and restarted frequently)</li>
+        </ul>
+
+        <p><strong>Example:</strong></p>
+        <pre><code>from literegistry import FileSystemKVStore
+store = FileSystemKVStore("/shared/cluster/registry")</code></pre>
+
+        <div class="diagram-placeholder">
+            <div>Diagram showing shared filesystem: multiple nodes accessing NFS mount point with file locks and potential contention</div>
+        </div>
+
+        <h3>Redis Backend (Recommended for Production)</h3>
+
+        <p><strong>Use when:</strong></p>
+        <ul>
+            <li>Running across multiple nodes without shared storage</li>
+            <li>Need high-concurrency access (many clients/services)</li>
+            <li>Running production workloads with 10+ services</li>
+            <li><strong>Using checkpoint/preemptible nodes that frequently come and go</strong></li>
+            <li>Deploying on cloud infrastructure with spot instances</li>
+        </ul>
+
+        <p><strong>Advantages:</strong></p>
+        <ul>
+            <li>Built for distributed systems and high concurrency</li>
+            <li>Atomic operations without file locking overhead</li>
+            <li>Better performance at scale</li>
+            <li>Handles rapid node churn (nodes joining/leaving) much better than filesystem</li>
+            <li>Native pub/sub for future features</li>
+            <li>Battle-tested in production environments</li>
+        </ul>
+
+        <p><strong>Why it matters for checkpoint resources:</strong></p>
+        <p>When you're running on a mix of dedicated and checkpoint nodes, Redis shines. It can handle dozens of servers registering, deregistering, sending heartbeats, and updating metrics simultaneously without breaking a sweat. The filesystem backend might struggle when 10 checkpoint nodes all get preempted at once and then 12 new ones register 5 minutes later.</p>
+
+        <p><strong>Example:</strong></p>
+        <pre><code>from literegistry import RedisKVStore
+store = RedisKVStore("redis://login-node:6379")</code></pre>
+
+        <div class="diagram-placeholder">
+            <div>Diagram showing Redis architecture: central Redis server with multiple concurrent connections from different nodes, showing high-throughput capability. Emphasize rapid registration/deregistration events happening simultaneously</div>
+        </div>
+
+        <p><strong>Rule of thumb:</strong></p>
+        <ul>
+            <li><strong>Development/testing</strong>: Filesystem is fine</li>
+            <li><strong>Small stable deployment</strong> (4-8 dedicated nodes): Filesystem works, Redis is better</li>
+            <li><strong>Dynamic environments with checkpoint resources</strong>: Use Redis</li>
+            <li><strong>Production or 10+ services</strong>: Definitely Redis</li>
+        </ul>
+
+        <p>If you're dealing with the reality of checkpoint nodes getting preempted, save yourself the headache and start with Redis from day one.</p>
+
+        <h2>Real-World Example: HPC Research Cluster with Mixed Resources</h2>
+
+        <p>Here's how a typical research group might deploy LiteRegistry on an HPC cluster with both dedicated and checkpoint resources:</p>
+
+        <p><strong>Setup:</strong></p>
+        <ul>
+            <li>4 dedicated GPU nodes (guaranteed), each with 4x A100 GPUs</li>
+            <li>6-12 checkpoint GPU nodes (come and go based on cluster load), each with 4x A100 GPUs</li>
+            <li>Shared NFS storage for datasets</li>
+            <li>Redis running on login node for coordination</li>
+            <li>Slurm scheduler managing all allocations</li>
+        </ul>
+
+        <p><strong>Deployment:</strong></p>
+
+        <pre><code># 1. Start Redis on login node (persistent)
+literegistry redis --port 6379
+
+# 2. Submit SLURM job for DEDICATED nodes (partition=dedicated)
+# These 4 nodes are guaranteed to stay up
+sbatch --partition=dedicated --nodes=4 --gres=gpu:4 --wrap="
+  srun literegistry vllm \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --registry redis://login-node:6379 \
+    --tensor-parallel-size 4
+"
+
+# 3. Submit SLURM job for CHECKPOINT nodes (partition=checkpoint)  
+# These can be preempted at any time - that's okay!
+sbatch --partition=checkpoint --nodes=8 --gres=gpu:4 --wrap="
+  srun literegistry vllm \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --registry redis://login-node:6379 \
+    --tensor-parallel-size 4
+"
+
+# 4. Start Gateway on login node (persistent)
+literegistry gateway \
+  --registry redis://login-node:6379 \
+  --host 0.0.0.0 \
+  --port 8080</code></pre>
+
+        <p><strong>What happens in practice:</strong></p>
+        <ul>
+            <li>Your 4 dedicated nodes register immediately and stay up</li>
+            <li>The 8 checkpoint nodes register as they're allocated (might take a few minutes)</li>
+            <li>When checkpoint nodes are preempted, they disappear from the registry automatically</li>
+            <li>The gateway keeps routing traffic to whatever nodes are currently available</li>
+            <li>When checkpoint nodes become available again, you resubmit the job and they rejoin automatically</li>
+        </ul>
+
+        <p><strong>The key insight</strong>: You're not managing 12 individual endpoints. You're managing a <em>pool</em> of replicas that grows and shrinks dynamically. LiteRegistry handles the complexity.</p>
+
+        <p>Now all researchers can submit requests to <code>http://login-node:8080</code>, and the system automatically handles routing, load balancing, and failover.</p>
+
+        <div class="callout">
+            <h4>💡 Real Talk: Why This Matters for Checkpoint Resources</h4>
+            
+            <p><strong>In this setup, when your checkpoint job gets killed:</strong></p>
+            <ol>
+                <li>Those vLLM processes die</li>
+                <li>They stop sending heartbeats to Redis</li>
+                <li>Within 10-30 seconds, LiteRegistry marks them as dead</li>
+                <li>New requests automatically route to your 4 dedicated nodes</li>
+                <li>Your users see maybe 1-2 failed requests during the transition</li>
+                <li>Everything else just works</li>
+            </ol>
+
+            <p><strong>When checkpoint resources become available again:</strong></p>
+            <ol>
+                <li>Resubmit your Slurm job (or use a cron job to auto-resubmit)</li>
+                <li>New vLLM servers start and register themselves</li>
+                <li>Within seconds, they start receiving traffic</li>
+                <li>Load automatically rebalances across all available servers</li>
+            </ol>
+
+            <p><strong>Without LiteRegistry</strong>, you'd be manually updating load balancer configs, dealing with hardcoded endpoints, and fielding Slack messages from labmates asking why inference is broken.</p>
+
+            <p><strong>With LiteRegistry</strong>, this entire dance happens automatically. You just resubmit the Slurm job and walk away.</p>
+        </div>
+
+        <div class="diagram-placeholder">
+            <div>Diagram showing full HPC deployment: login node with Redis + Gateway at the center. Show two groups of compute nodes: (1) "DEDICATED PARTITION" with 4 solid/permanent-looking nodes, and (2) "CHECKPOINT PARTITION" with 8 nodes that appear semi-transparent or with dashed borders to show they're temporary. Arrows showing heartbeats from all nodes to registry, and request routing from gateway to nodes. Some checkpoint nodes could be faded/grayed out to show they've been preempted</div>
+        </div>
+
+        <h2>Advanced Features</h2>
+
+        <h3>Custom Health Checks</h3>
+
+        <p>You can implement custom health checks for your servers:</p>
+
+        <pre><code>async def custom_health_check(server_info):
+    """Check if server is truly healthy beyond just heartbeat"""
+    # Add custom logic here
+    return server_info.get('last_heartbeat_time') is not None</code></pre>
+
+        <h3>Metrics and Monitoring</h3>
+
+        <p>LiteRegistry tracks detailed metrics for each server:</p>
+        <ul>
+            <li>Request counts (last 5/15/60 minutes)</li>
+            <li>Latency percentiles (p50, p90, p99)</li>
+            <li>Error rates</li>
+            <li>Throughput</li>
+        </ul>
+
+        <p>Access these via the client:</p>
+
+        <pre><code>async def get_metrics():
+    store = get_kvstore("redis://localhost:6379")
+    client = RegistryClient(store, service_type="model_path")
+    
+    models = await client.models()
+    for model_name, servers in models.items():
+        for server in servers:
+            stats = server.get('request_stats', {})
+            print(f"{model_name} @ {server['base_url']}:")
+            print(f"  Last 15min requests: {stats.get('last_15_minutes', 0)}")
+            print(f"  Avg latency: {stats.get('last_15_minutes_latency', 0):.2f}ms")</code></pre>
+
+        <h2>Why LiteRegistry? (And Why Not Just Use Kubernetes?)</h2>
+
+        <p>At this point you might be thinking: "We already have Kubernetes/Consul/Nomad for this."</p>
+
+        <p>Yes, these are powerful orchestration platforms. They absolutely can handle service discovery and failover. But consider the cost:</p>
+
+        <div class="comparison-table">
+            <div class="comparison-column">
+                <h4>What Kubernetes requires:</h4>
+                <ul>
+                    <li>Learning container orchestration</li>
+                    <li>Dockerizing all your ML code</li>
+                    <li>Setting up and maintaining a Kubernetes cluster (or paying for managed K8s)</li>
+                    <li>Writing deployment YAML for each service</li>
+                    <li>Understanding pods, deployments, services, ingresses</li>
+                    <li>Debugging container networking issues</li>
+                    <li>Complete infrastructure migration</li>
+                </ul>
+            </div>
+
+            <div class="comparison-column">
+                <h4>What LiteRegistry requires:</h4>
+                <ul>
+                    <li><code>pip install literegistry</code></li>
+                    <li>Add one argument to your existing vLLM/SGLang launch command: <code>--registry redis://your-host:6379</code></li>
+                    <li>That's it</li>
+                </ul>
+            </div>
+        </div>
+
+        <p><strong>LiteRegistry is purpose-built for researchers running ML workloads:</strong></p>
+        <ul>
+            <li><strong>Lightweight</strong>: ~500 lines of Python, not a full orchestration platform</li>
+            <li><strong>HPC-native</strong>: Works with Slurm, bare metal, SSH—the tools you already use</li>
+            <li><strong>Model-aware</strong>: Routes based on model names and tracks inference-specific metrics</li>
+            <li><strong>Performance-optimized</strong>: Tracks latency and routes to fastest servers</li>
+            <li><strong>Zero-infrastructure</strong>: No cluster setup, no containers, no infrastructure team required</li>
+            <li><strong>Transparent integration</strong>: Works with standard vLLM/SGLang—all their arguments still work</li>
+        </ul>
+
+        <p>You can deploy LiteRegistry in 5 minutes on an existing HPC cluster without changing how you submit jobs, how you write code, or how your team works. Try doing that with Kubernetes.</p>
+
+        <p>It's the right tool for research teams and ML engineers who need service discovery without becoming DevOps engineers.</p>
+
+        <h2>Getting Started Today</h2>
+
+        <p>LiteRegistry is open source and ready to use:</p>
+
+        <pre><code># Install
+pip install literegistry
+
+# Start serving
+literegistry redis --port 6379
+literegistry vllm --model meta-llama/Llama-3.1-8B-Instruct --registry redis://localhost:6379
+literegistry gateway --registry redis://localhost:6379 --port 8080
+
+# Check status
+literegistry summary --registry redis://localhost:6379</code></pre>
+
+        <p>Whether you're running a single GPU workstation or a 100-node HPC cluster, LiteRegistry provides the coordination layer you need for distributed model inference.</p>
+
+        <h2>Getting Started: Try LiteRegistry Today</h2>
+
+        <p>LiteRegistry is designed to meet you where you are:</p>
+
+        <p><strong>Just exploring?</strong> Install with <code>pip install literegistry</code> and try it on your local machine. The filesystem backend works great for development.</p>
+
+        <p><strong>Running a small lab cluster?</strong> Deploy Redis on your login node and start registering your vLLM/SGLang servers. It takes about 5 minutes to get your first distributed setup running.</p>
+
+        <p><strong>Dealing with checkpoint resources and preemption?</strong> This is exactly what LiteRegistry was built for. Let it handle the chaos of nodes coming and going while you focus on your research.</p>
+
+        <p>The complete workflow:</p>
+
+        <pre><code># Install
+pip install literegistry
+
+# Start registry (Redis for multi-node, or use filesystem path for single-node)
+literegistry redis --port 6379
+
+# Launch your vLLM/SGLang servers (on dedicated or checkpoint nodes)
+literegistry vllm --model your-model --registry redis://your-host:6379
+
+# Start the gateway
+literegistry gateway --registry redis://your-host:6379 --port 8080
+
+# Check what's running
+literegistry summary --registry redis://your-host:6379</code></pre>
+
+        <h2>Why This Matters</h2>
+
+        <p>The future of ML research isn't going to be run on perfectly stable, dedicated clusters. It's going to be run on shared resources: checkpoint nodes that come and go, spot instances that can disappear, preemptible VMs that keep costs down.</p>
+
+        <p>LiteRegistry is built for this reality. It's built for the graduate student who has 4 dedicated nodes but needs to opportunistically grab 12 more when they're available. It's built for the research lab that can't afford 100% dedicated resources but can make a mixed allocation work. It's built for the real world of modern ML infrastructure.</p>
+
+        <p><strong>Resources:</strong></p>
+        <ul>
+            <li>GitHub: <a href="#">github.com/your-org/literegistry</a></li>
+            <li>Documentation: <a href="#">docs.literegistry.org</a></li>
+            <li>Examples: <a href="#">github.com/your-org/literegistry/examples</a></li>
+        </ul>
+
+        <h2>Conclusion</h2>
+
+        <p>If you're tired of babysitting distributed inference deployments, manually updating configs when nodes go down, and explaining to users why their requests are failing, LiteRegistry might be exactly what you need.</p>
+
+        <p>It won't make checkpoint resources stop getting preempted. But it will make dealing with that preemption automatic, transparent, and painless.</p>
+
+        <p>Try it out on your next project. Whether you're running 4 GPUs or 400, whether your infrastructure is rock-solid or constantly changing, LiteRegistry can help.</p>
+
+    </div>
+
+    <footer>
+        <div class="container">
+            <p><em>Built for researchers who deal with the reality of shared HPC resources. By researchers who've been there.</em></p>
+            <p><em>Contributions, issues, and feedback welcome on GitHub!</em></p>
+            <p style="margin-top: 20px; font-size: 14px;">© 2025 LiteRegistry Project</p>
+        </div>
+    </footer>
+</body>
+</html>
+

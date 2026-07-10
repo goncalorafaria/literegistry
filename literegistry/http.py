@@ -195,8 +195,11 @@ class RegistryHTTPClient:
                 logging.error(f"failed request timeout: {latency}- expected {self.timeout}")
                 self.registry.report_latency(server, latency, prob=prob, success=False)
 
-                # Get fresh server list
-                servers_and_probs = await self.registry.sample_servers(self.value, n=self.max_retries)
+                servers_and_probs = await self.registry.sample_servers(
+                    self.value,
+                    n=self.max_retries,
+                    force=True,
+                )
                 total_servers = len(servers_and_probs)
 
                 # Rotate to next server

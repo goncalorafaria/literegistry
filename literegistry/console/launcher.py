@@ -1,6 +1,75 @@
+import re
+import shutil
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
+
+_NGROK_URL_RE = re.compile(r"url=(https://[^\s]+)")
+
+
+def _start_ngrok(port, startup_timeout=30):
+    """Start an ngrok tunnel to ``port`` and return (process, public_url).
+
+    The public URL is parsed directly from ngrok's logfmt stdout rather than the
+    local inspection API, because an HTTP proxy on this host intercepts requests
+    to 127.0.0.1:4040. A daemon thread keeps draining ngrok's output for the
+    lifetime of the process so the pipe never blocks.
+
+    Returns (None, None) if ngrok is not installed or fails to come up, so the
+    console still launches without a tunnel.
+    """
+    ngrok_bin = shutil.which("ngrok")
+    if not ngrok_bin:
+        print(
+            "[ngrok] 'ngrok' not found on PATH; skipping tunnel. "
+            "Install it (https://ngrok.com/download) to expose the console.",
+            file=sys.stderr,
+        )
+        return None, None
+
+    proc = subprocess.Popen(
+        [ngrok_bin, "http", str(port), "--log", "stdout", "--log-format", "logfmt"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+
+    result = {"url": None, "err": None}
+
+    def _drain():
+        for line in proc.stdout:
+            if result["url"] is None:
+                m = _NGROK_URL_RE.search(line)
+                if m:
+                    result["url"] = m.group(1)
+                elif "err=" in line and "err=nil" not in line:
+                    result["err"] = line.strip()
+
+    t = threading.Thread(target=_drain, daemon=True)
+    t.start()
+
+    deadline = time.time() + startup_timeout
+    while time.time() < deadline:
+        if result["url"]:
+            break
+        if proc.poll() is not None:
+            print("[ngrok] tunnel process exited early.", file=sys.stderr)
+            return None, None
+        time.sleep(0.5)
+
+    public_url = result["url"]
+    if public_url:
+        print(f"[ngrok] Console public URL: {public_url}")
+    else:
+        msg = "[ngrok] Tunnel did not report a public URL within "
+        msg += f"{startup_timeout}s."
+        if result["err"]:
+            msg += f" Last error: {result['err']}"
+        print(msg, file=sys.stderr)
+    return proc, public_url
 
 
 def _add_arg(command, name, value):
@@ -30,6 +99,7 @@ def main(
     port=None,
     server_address="127.0.0.1",
     server_port=8765,
+    ngrok=True,
 ):
     streamlit_address = address or server_address
     streamlit_port = port or server_port
@@ -64,4 +134,18 @@ def main(
     _add_arg(command, "--vllm-tail-lines", vllm_tail_lines)
     _add_arg(command, "--vllm-window", vllm_window)
 
-    raise SystemExit(subprocess.call(command))
+    ngrok_proc = None
+    if ngrok:
+        ngrok_proc, _ = _start_ngrok(streamlit_port)
+
+    try:
+        returncode = subprocess.call(command)
+    finally:
+        if ngrok_proc is not None and ngrok_proc.poll() is None:
+            ngrok_proc.terminate()
+            try:
+                ngrok_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                ngrok_proc.kill()
+
+    raise SystemExit(returncode)

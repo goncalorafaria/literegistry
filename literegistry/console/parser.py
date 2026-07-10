@@ -1,7 +1,11 @@
+from fnmatch import fnmatch
 from pathlib import Path
 import re
 import subprocess
 import time
+
+
+DEFAULT_LOG_MAX_AGE_SECONDS = 10 * 60
 
 
 REQUEST_RE = re.compile(r"Request counts \(last (?P<window>[\d.]+)s\): (?P<body>.*)")
@@ -61,14 +65,92 @@ def log_roots(logs):
     return [Path(log) for log in logs]
 
 
-def list_log_files(logs):
+def _matches_name_patterns(path, name_patterns):
+    if not name_patterns:
+        return True
+    return any(fnmatch(path.name, pattern) for pattern in name_patterns)
+
+
+def _find_recent_files_fallback(root, name_patterns, max_age_seconds):
+    cutoff = time.time() - max_age_seconds
+    files = []
+    for path in root.rglob("*"):
+        if not path.is_file() or not _matches_name_patterns(path, name_patterns):
+            continue
+        try:
+            if path.stat().st_mtime >= cutoff:
+                files.append(path)
+        except OSError:
+            continue
+    return sorted(files)
+
+
+def find_recent_files(root, name_patterns=None, max_age_seconds=DEFAULT_LOG_MAX_AGE_SECONDS):
+    """List files under root modified within max_age_seconds.
+
+    Uses GNU find for fast directory scans; falls back to a Python walk if find
+    is unavailable or errors out.
+    """
+    if not root.exists():
+        return []
+
+    max_age_minutes = max(1, int(max_age_seconds / 60))
+    cmd = ["find", str(root), "-type", "f", "-mmin", "-{}".format(max_age_minutes)]
+    if name_patterns:
+        if len(name_patterns) == 1:
+            cmd.extend(["-name", name_patterns[0]])
+        else:
+            cmd.append("(")
+            for index, pattern in enumerate(name_patterns):
+                if index > 0:
+                    cmd.append("-o")
+                cmd.extend(["-name", pattern])
+            cmd.append(")")
+
+    cutoff = time.time() - max_age_seconds
+    try:
+        result = subprocess.run(
+            cmd,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return _find_recent_files_fallback(root, name_patterns, max_age_seconds)
+
+    if result.returncode != 0:
+        return _find_recent_files_fallback(root, name_patterns, max_age_seconds)
+
+    files = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        path = Path(line)
+        if not path.is_file():
+            continue
+        try:
+            if path.stat().st_mtime >= cutoff:
+                files.append(path)
+        except OSError:
+            continue
+    return sorted(files)
+
+
+def list_log_files(logs, max_age_seconds=DEFAULT_LOG_MAX_AGE_SECONDS):
     files = []
     seen = set()
     for root in log_roots(logs):
         if root.is_file():
             candidates = [root]
         elif root.exists():
-            candidates = sorted(path for path in root.rglob("*.log") if path.is_file())
+            candidates = find_recent_files(
+                root,
+                name_patterns=["*.log"],
+                max_age_seconds=max_age_seconds,
+            )
         else:
             candidates = []
 

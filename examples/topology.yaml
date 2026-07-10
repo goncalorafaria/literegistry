@@ -1,0 +1,13 @@
+configurations:
+  - device_name: "a40-8"
+    script_spec: "llama8b"
+    target_instances: 8
+  
+  - device_name: "l40-8"
+    script_spec: "llama8b"
+    target_instances: 8
+  
+  - device_name: "l40s-8"
+    script_spec: "llama8b"
+    target_instances: 8
+

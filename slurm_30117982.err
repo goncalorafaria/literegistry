@@ -1,0 +1,11 @@
+Loading safetensors checkpoint shards:   0% Completed | 0/4 [00:00<?, ?it/s]
+Loading safetensors checkpoint shards:  25% Completed | 1/4 [00:16<00:50, 16.74s/it]
+Loading safetensors checkpoint shards:  50% Completed | 2/4 [00:35<00:35, 17.70s/it]
+Loading safetensors checkpoint shards:  75% Completed | 3/4 [00:37<00:10, 10.51s/it]
+Loading safetensors checkpoint shards: 100% Completed | 4/4 [00:49<00:00, 11.43s/it]
+Loading safetensors checkpoint shards: 100% Completed | 4/4 [00:49<00:00, 12.48s/it]
+INFO:     Started server process [68546]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on socket ('0.0.0.0', 10065) (Press CTRL+C to quit)
+[2025-10-15T18:03:27.852] error: *** JOB 30117982 ON g3117 CANCELLED AT 2025-10-15T18:03:27 DUE to SIGNAL Terminated ***

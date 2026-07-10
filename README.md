@@ -18,6 +18,28 @@ Complete workflow for deploying distributed model inference:
 literegistry redis --port 6379
 ```
 
+By default this starts Redis inside Apptainer using the official Redis image
+`redis_7-alpine.sif`, pulled from `docker://redis:7-alpine`. To use a host
+Redis binary instead:
+
+```bash
+literegistry redis --runtime local --port 6379
+```
+
+To keep Redis attached to the current terminal/process, run it in foreground
+mode:
+
+```bash
+literegistry redis --runtime local --foreground --port 6379
+```
+
+Redis startup prints a machine-readable registry URL that includes the selected
+port:
+
+```text
+REDIS_URL=redis://hostname:6379
+```
+
 **2. Launch vLLM/SGLang Instances** (supports all standard vLLM/SGLang arguments)
 ```bash
 literegistry vllm \

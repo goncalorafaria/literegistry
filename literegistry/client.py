@@ -29,7 +29,7 @@ class RegistryClient(ServerRegistry):
         self,
         store: KeyValueStore,
         max_history: int = 3600,
-        cache_ttl: int = 40,
+        cache_ttl: Optional[int] = None,
         service_type="model_path",
         penalty_latency=60.0,
         bandit_gamma=0.2,
@@ -47,6 +47,17 @@ class RegistryClient(ServerRegistry):
         super().__init__(store, max_history, max_heartbeat_interval)
         self._cache: Dict[str, Any] = {}
         self._cache_timestamps: Dict[str, float] = {}
+        self._models_cache_key = f"__models__:{service_type}"
+        max_cache_ttl = max(1, max_heartbeat_interval // 2)
+        if cache_ttl is None:
+            cache_ttl = max_cache_ttl
+        elif cache_ttl > max_cache_ttl:
+            cache_ttl = max_cache_ttl
+            logging.warning(
+                "cache_ttl must be no more than half of max_heartbeat_interval; "
+                "clamped cache_ttl to %s seconds",
+                cache_ttl,
+            )
         self.cache_ttl = cache_ttl
         self.telemetry = LatencyMetricAggregator()
         self.service_type = service_type
@@ -72,7 +83,7 @@ class RegistryClient(ServerRegistry):
         Returns:
             Dictionary mapping model paths to lists of server info
         """
-        cache_key = "_" + self.service_type
+        cache_key = self._models_cache_key
 
         # Fast path: check cache before acquiring lock
         if not force and self._is_cache_valid(cache_key):
@@ -150,8 +161,8 @@ class RegistryClient(ServerRegistry):
 
         return result
 
-    async def sample_servers(self, value: str, n: int):
-        servers = await self.get_all(value)
+    async def sample_servers(self, value: str, n: int, force: bool = False):
+        servers = await self.get_all(value, force=force)
         
         # Handle case when no servers are available
         if not servers:
@@ -202,6 +213,8 @@ class RegistryClient(ServerRegistry):
         else:
             self._cache.pop(model_path, None)
             self._cache_timestamps.pop(model_path, None)
+            self._cache.pop(self._models_cache_key, None)
+            self._cache_timestamps.pop(self._models_cache_key, None)
 
     async def close(self):
         """Close the registry and clean up resources"""

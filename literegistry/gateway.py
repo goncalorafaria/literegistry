@@ -119,7 +119,7 @@ class StarletteGatewayServer:
     async def health_check(self,request: Request):
         """Health check endpoint."""
         try:
-            models_data = await self.registry.models()
+            models_data = await self.registry.models(force=True)
             return JSONResponse({
                 "status": "healthy",
                 "service": "registry-gateway", 
@@ -168,7 +168,7 @@ class StarletteGatewayServer:
     async def list_models(self,request: Request):
         """List available models."""
         try:
-            models_data = await self.registry.models()
+            models_data = await self.registry.models(force=True)
             models = list(models_data.keys())
             return JSONResponse({
                 "models": models,
@@ -549,7 +549,7 @@ class StarletteGatewayServer:
             self.logger.error(f"Cleanup error: {e}")
 
 
-async def main_async(registry="redis://klone-login03.hyak.local:6379", port=8080, cache_ttl=20,timeout=15):
+async def main_async(registry="redis://klone-login03.hyak.local:6379", port=8080, cache_ttl=None,timeout=15):
     """Simple main function without restart loops."""
     
     store = get_kvstore(registry)

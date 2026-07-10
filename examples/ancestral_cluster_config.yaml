@@ -1,0 +1,15 @@
+configurations:
+  # Simple example: Run on all 8-GPU machines
+  - device_name: "*-8"
+    name: "llama3-8b"
+    target_instances: 2
+    inline_config:
+      script_type: vllm
+      args:
+        model: "meta-llama/Llama-3.1-8B-Instruct"
+        tensor_parallel_size: ${DEVICE_COUNT}
+        gpu_memory_utilization: 0.95
+        max-model-len: 4096
+        dtype: bfloat16
+      launcher: literegistry
+

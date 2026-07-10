@@ -1,0 +1,19 @@
+Traceback (most recent call last):
+  File "/gscratch/ark/graf/miniconda3/envs/multilora/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/gscratch/ark/graf/miniconda3/envs/multilora/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/gscratch/ark/graf/miniconda3/envs/multilora/lib/python3.10/site-packages/vllm/entrypoints/openai/api_server.py", line 1387, in <module>
+    uvloop.run(run_server(args))
+  File "/gscratch/ark/graf/miniconda3/envs/multilora/lib/python3.10/site-packages/uvloop/__init__.py", line 82, in run
+    return loop.run_until_complete(wrapper())
+  File "uvloop/loop.pyx", line 1518, in uvloop.loop.Loop.run_until_complete
+  File "/gscratch/ark/graf/miniconda3/envs/multilora/lib/python3.10/site-packages/uvloop/__init__.py", line 61, in wrapper
+    return await main
+  File "/gscratch/ark/graf/miniconda3/envs/multilora/lib/python3.10/site-packages/vllm/entrypoints/openai/api_server.py", line 1322, in run_server
+    listen_address, sock = setup_server(args)
+  File "/gscratch/ark/graf/miniconda3/envs/multilora/lib/python3.10/site-packages/vllm/entrypoints/openai/api_server.py", line 1299, in setup_server
+    sock = create_server_socket(sock_addr)
+  File "/gscratch/ark/graf/miniconda3/envs/multilora/lib/python3.10/site-packages/vllm/entrypoints/openai/api_server.py", line 1263, in create_server_socket
+    sock.bind(addr)
+OSError: [Errno 98] Address already in use

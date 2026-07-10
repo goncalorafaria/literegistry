@@ -324,11 +324,13 @@ def _make_restricted_import(tool_specs: dict[str, str]):
 
 
 def _validate_allowlisted_imports(
-    code: str, label: str, tool_specs: dict[str, str]
+    code: str, label: str, tool_specs: dict[str, str], *, filename: str = "<user-code>"
 ) -> None:
     """Reject imports from modules outside the server's tool_specs allowlist."""
     allowed = _allowed_import_roots(tool_specs)
-    tree = ast.parse(code, mode="exec")
+    # Parse with the submitted-code filename so a SyntaxError points at the
+    # user's code (e.g. `File "<user-code>", line 29`) rather than "<unknown>".
+    tree = ast.parse(code, filename=filename, mode="exec")
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -389,6 +391,36 @@ def _show_vars_factory(locals_dict: dict[str, Any]):
     return _show_vars
 
 
+_HARNESS_FILENAMES = ("<user-code>", "<setup-code>")
+
+
+def _format_user_error(exc: BaseException) -> str:
+    """Concise, user-facing error string for the *submitted* code.
+
+    Strips the code server's own harness frames (``_run_user_code`` / import
+    validation / ``compile``) so the model sees the usual pointer to what is
+    wrong in the code it sent:
+
+    * ``SyntaxError`` already carries the offending line and caret, so only the
+      standard ``File .../ <source> / ^ / SyntaxError: ...`` block is returned.
+    * Runtime errors keep a traceback trimmed to the frames inside the submitted
+      code (``<user-code>``/``<setup-code>``).
+    * Errors raised before any submitted-code frame runs (e.g. import-allowlist
+      rejections) are shown as just their message, with no stack.
+    """
+    if isinstance(exc, SyntaxError):
+        return "".join(traceback.format_exception_only(type(exc), exc)).strip()
+
+    tb = exc.__traceback__
+    while tb is not None and tb.tb_frame.f_code.co_filename not in _HARNESS_FILENAMES:
+        tb = tb.tb_next
+
+    if tb is not None:
+        return "".join(traceback.format_exception(type(exc), exc, tb)).strip()
+
+    return "".join(traceback.format_exception_only(type(exc), exc)).strip()
+
+
 def _run_user_code(
     code: str,
     max_runtime: float = 5.0,
@@ -415,9 +447,13 @@ def _run_user_code(
 
     try:
         resolved_tool_specs = tool_specs or DEFAULT_TOOL_SPECS
-        _validate_allowlisted_imports(code, "code", resolved_tool_specs)
+        _validate_allowlisted_imports(
+            code, "code", resolved_tool_specs, filename="<user-code>"
+        )
         if setup_code:
-            _validate_allowlisted_imports(setup_code, "setup_code", resolved_tool_specs)
+            _validate_allowlisted_imports(
+                setup_code, "setup_code", resolved_tool_specs, filename="<setup-code>"
+            )
 
         tool_names = custom_tools if custom_tools is not None else default_tools or []
         safe_builtins = _SAFE_BUILTINS.copy()
@@ -449,7 +485,7 @@ def _run_user_code(
         error = stderr.getvalue() or None
     except Exception as exc:
         success = False
-        error = f"{exc}\n{traceback.format_exc()}"
+        error = _format_user_error(exc)
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0.0)
 

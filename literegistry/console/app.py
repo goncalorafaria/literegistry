@@ -32,12 +32,19 @@ WINDOW_OPTIONS = {
     "5 min": 300,
     "15 min": 900,
     "30 min": 1800,
+    "1 hour": 3600,
+    "2 hours": 7200,
+    "6 hours": 21600,
+    "12 hours": 43200,
     "all parsed": None,
 }
 VLLM_WINDOW_OPTIONS = {
     "10 min": 600,
     "30 min": 1800,
     "1 hour": 3600,
+    "2 hours": 7200,
+    "6 hours": 21600,
+    "12 hours": 43200,
     "all parsed": None,
 }
 
@@ -51,7 +58,7 @@ def _collect_app_args(
     vllm_logs_dir=None,
     seed_recent=True,
     poll_seconds=0.5,
-    window="15 min",
+    window="1 hour",
     refresh=True,
     refresh_seconds=5,
     poll_registry=True,
@@ -59,7 +66,7 @@ def _collect_app_args(
     show_vllm=True,
     vllm_newest_files=80,
     vllm_tail_lines=1000,
-    vllm_window="30 min",
+    vllm_window="2 hours",
 ):
     log_locations = logs or [logs_path or logs_dir, vllm_logs_dir or slurm_logs_dir]
     return {
@@ -182,6 +189,20 @@ st.markdown(
     .block-container { padding-top: 1.2rem; }
     [data-testid="stMetricValue"] { font-size: 1.7rem; }
     .small-note { color: #667085; font-size: 0.9rem; }
+
+    /* Keep content fully readable during auto-refresh reruns: Streamlit dims
+       "stale" elements (and shows a fade/overlay) while it recomputes. */
+    [data-stale="true"],
+    div[data-stale="true"],
+    .element-container[data-stale="true"],
+    [data-testid="stAppViewContainer"] [data-stale="true"] {
+        opacity: 1 !important;
+        filter: none !important;
+        transition: none !important;
+    }
+    .stApp [data-stale="true"] * { opacity: 1 !important; }
+    /* Hide the top "running" indicator bar so it doesn't flash on each refresh. */
+    [data-testid="stStatusWidget"] { display: none !important; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -206,18 +227,23 @@ def rows_to_frame(rows):
 
 @st.cache_data(ttl=3, show_spinner=False)
 def load_vllm_events(logs_path, newest_files, tail_lines):
-    rows, metadata = parse_vllm_logs(
+    rows, metadata, errors = parse_vllm_logs(
         logs_path,
         newest_files=newest_files,
         tail_lines=tail_lines,
     )
     event_df = pd.DataFrame(rows)
     meta_df = pd.DataFrame(metadata_wide(metadata))
+    error_df = pd.DataFrame(errors)
     if not event_df.empty:
         event_df["datetime"] = pd.to_datetime(
             [datetime.fromtimestamp(ts) for ts in event_df["ts"]]
         )
-    return event_df, meta_df
+    if not error_df.empty:
+        error_df["datetime"] = pd.to_datetime(
+            [datetime.fromtimestamp(ts) for ts in error_df["ts"]]
+        )
+    return event_df, meta_df, error_df
 
 
 def drain_stream_queue():
@@ -411,6 +437,85 @@ def render_vllm_panel(events, metadata, selected_jobs, window_seconds):
                 y="count",
                 color="method",
             )
+
+
+def render_vllm_errors_panel(errors, selected_jobs, window_seconds):
+    st.subheader("vLLM machine errors")
+    if errors.empty:
+        st.success("No error/traceback lines found in the selected vLLM log tails.")
+        return
+
+    errors = filter_recent(errors, window_seconds)
+    if selected_jobs and "job_id" in errors.columns:
+        errors = errors[errors["job_id"].isin(selected_jobs)].copy()
+
+    if errors.empty:
+        st.success("No vLLM errors in the selected jobs/time window.")
+        return
+
+    total_errors = len(errors)
+    jobs_affected = errors["job_id"].nunique() if "job_id" in errors.columns else 0
+    oom_count = int((errors["level"] == "OOM").sum()) if "level" in errors.columns else 0
+
+    cols = st.columns(3)
+    cols[0].metric("Error lines", f"{total_errors:,}")
+    cols[1].metric("Jobs affected", f"{jobs_affected:,}")
+    cols[2].metric("OOM events", f"{oom_count:,}")
+
+    by_level = (
+        errors.groupby(["job_id", "level"]).size().reset_index(name="count")
+        if {"job_id", "level"}.issubset(errors.columns)
+        else pd.DataFrame()
+    )
+    if not by_level.empty:
+        st.caption("Error counts by job and level")
+        st.dataframe(
+            by_level.sort_values("count", ascending=False),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    recent = errors.sort_values("ts", ascending=False)
+    max_show = st.slider(
+        "Errors to show",
+        5,
+        200,
+        max(5, min(40, len(recent))),
+        step=5,
+        key="vllm_error_show",
+    )
+    show_full = st.toggle(
+        "Expand full tracebacks",
+        value=True,
+        key="vllm_error_expand",
+        help="Show the complete traceback/error text for each entry.",
+    )
+
+    st.caption("Most recent errors first")
+    for _, row in recent.head(max_show).iterrows():
+        level = row.get("level", "ERROR")
+        job_id = row.get("job_id", "?")
+        when = row.get("time", "")
+        file_name = row.get("file", "")
+        headline = str(row.get("message", "")).splitlines()[0] if row.get("message") else ""
+        line_count = int(row.get("line_count", 1) or 1)
+        suffix = f" · {line_count} lines" if line_count > 1 else ""
+        label = f"[{level}] {when} · job {job_id} · {file_name}{suffix} — {headline}"
+        detail = str(row.get("detail") or row.get("raw") or headline)
+        with st.expander(label, expanded=show_full and line_count > 1):
+            st.code(detail, language="text")
+
+    with st.expander("Error table (compact)", expanded=False):
+        error_cols = [
+            c
+            for c in ["time", "job_id", "file", "level", "line_count", "message"]
+            if c in errors.columns
+        ]
+        st.dataframe(
+            recent[error_cols],
+            use_container_width=True,
+            hide_index=True,
+        )
 
 
 def weighted_average(values, weights):
@@ -849,7 +954,7 @@ with st.sidebar:
     window_label = st.selectbox(
         "Time window",
         list(WINDOW_OPTIONS),
-        index=option_index(WINDOW_OPTIONS, app_arg("window", "15 min"), 2),
+        index=option_index(WINDOW_OPTIONS, app_arg("window", "1 hour"), 4),
     )
     refresh = st.toggle("Live refresh", value=bool_arg("refresh", True))
     refresh_seconds = st.slider(
@@ -899,7 +1004,7 @@ with st.sidebar:
     vllm_window_label = st.selectbox(
         "vLLM time window",
         list(VLLM_WINDOW_OPTIONS),
-        index=option_index(VLLM_WINDOW_OPTIONS, app_arg("vllm_window", "30 min"), 1),
+        index=option_index(VLLM_WINDOW_OPTIONS, app_arg("vllm_window", "2 hours"), 3),
     )
 
 
@@ -920,7 +1025,7 @@ registry_polled_count = poll_registry_if_due(
 )
 events = rows_to_frame(st.session_state.events)
 if show_vllm:
-    vllm_events, vllm_metadata = load_vllm_events(
+    vllm_events, vllm_metadata, vllm_errors = load_vllm_events(
         log_locations,
         vllm_newest_files,
         vllm_tail_lines,
@@ -928,16 +1033,16 @@ if show_vllm:
 else:
     vllm_events = pd.DataFrame()
     vllm_metadata = pd.DataFrame()
+    vllm_errors = pd.DataFrame()
 
+job_id_set = set()
 if not vllm_events.empty:
     vllm_metric_events = vllm_events[vllm_events["kind"] == "engine_metric"].copy()
-    vllm_jobs = (
-        sorted(vllm_metric_events["job_id"].unique())
-        if not vllm_metric_events.empty
-        else []
-    )
-else:
-    vllm_jobs = []
+    if not vllm_metric_events.empty:
+        job_id_set.update(vllm_metric_events["job_id"].unique())
+if not vllm_errors.empty and "job_id" in vllm_errors.columns:
+    job_id_set.update(vllm_errors["job_id"].unique())
+vllm_jobs = sorted(job_id_set)
 
 with st.sidebar:
     if show_vllm:
@@ -948,7 +1053,9 @@ with st.sidebar:
 if events.empty:
     st.title("literegistry console")
     st.warning("Listening for gateway metric lines. No events have arrived yet.")
-    tab_registry_empty, tab_vllm_empty = st.tabs(["Registry", "vLLM"])
+    tab_registry_empty, tab_vllm_empty, tab_vllm_errors_empty = st.tabs(
+        ["Registry", "vLLM", "vLLM errors"]
+    )
     with tab_registry_empty:
         if poll_registry:
             render_registry_panel()
@@ -965,6 +1072,15 @@ if events.empty:
             render_vllm_panel(
                 vllm_events,
                 vllm_metadata,
+                selected_vllm_jobs,
+                VLLM_WINDOW_OPTIONS[vllm_window_label],
+            )
+        else:
+            st.info("Enable vLLM Slurm telemetry in the sidebar.")
+    with tab_vllm_errors_empty:
+        if show_vllm:
+            render_vllm_errors_panel(
+                vllm_errors,
                 selected_vllm_jobs,
                 VLLM_WINDOW_OPTIONS[vllm_window_label],
             )
@@ -1003,7 +1119,9 @@ if filtered.empty:
             latest_event, now_label
         )
     )
-    tab_registry_empty_filter, tab_vllm_empty_filter = st.tabs(["Registry", "vLLM"])
+    tab_registry_empty_filter, tab_vllm_empty_filter, tab_vllm_errors_empty_filter = (
+        st.tabs(["Registry", "vLLM", "vLLM errors"])
+    )
     with tab_registry_empty_filter:
         if poll_registry:
             render_registry_panel()
@@ -1016,6 +1134,15 @@ if filtered.empty:
             render_vllm_panel(
                 vllm_events,
                 vllm_metadata,
+                selected_vllm_jobs,
+                VLLM_WINDOW_OPTIONS[vllm_window_label],
+            )
+        else:
+            st.info("Enable vLLM Slurm telemetry in the sidebar.")
+    with tab_vllm_errors_empty_filter:
+        if show_vllm:
+            render_vllm_errors_panel(
+                vllm_errors,
                 selected_vllm_jobs,
                 VLLM_WINDOW_OPTIONS[vllm_window_label],
             )
@@ -1075,8 +1202,12 @@ for column in ("requests", "completions"):
         rate_rows[column] = 0.0
 rate_rows["backlog_pressure_per_s"] = rate_rows["requests"] - rate_rows["completions"]
 
-tab_live, tab_breakdown, tab_registry, tab_vllm, tab_raw = st.tabs(
-    ["Live pressure", "Breakdowns", "Registry", "vLLM", "Raw events"]
+vllm_errors_label = "vLLM errors"
+if show_vllm and not vllm_errors.empty:
+    vllm_errors_label = f"vLLM errors ({len(vllm_errors):,})"
+
+tab_live, tab_breakdown, tab_registry, tab_vllm, tab_vllm_errors, tab_raw = st.tabs(
+    ["Live pressure", "Breakdowns", "Registry", "vLLM", vllm_errors_label, "Raw events"]
 )
 
 with tab_live:
@@ -1204,6 +1335,16 @@ with tab_vllm:
         render_vllm_panel(
             vllm_events,
             vllm_metadata,
+            selected_vllm_jobs,
+            VLLM_WINDOW_OPTIONS[vllm_window_label],
+        )
+
+with tab_vllm_errors:
+    if not show_vllm:
+        st.info("Enable vLLM Slurm telemetry in the sidebar.")
+    else:
+        render_vllm_errors_panel(
+            vllm_errors,
             selected_vllm_jobs,
             VLLM_WINDOW_OPTIONS[vllm_window_label],
         )

@@ -1,0 +1,114 @@
+l40s-1:
+  mem: 64
+  hours: 24
+  cpus: 8
+  device_count: 1
+  gpu_type: l40s
+  type: gpu
+
+a40-1:
+  mem: 64
+  hours: 24
+  cpus: 16
+  device_count: 1
+  gpu_type: a40
+  type: gpu
+
+l40-1:
+  mem: 128
+  hours: 24
+  cpus: 32
+  device_count: 1
+  gpu_type: l40
+  type: gpu
+
+
+
+l40s-2:
+  mem: 64
+  hours: 24
+  cpus: 8
+  device_count: 2
+  gpu_type: l40s
+  type: gpu
+
+a40-2:
+  mem: 64
+  hours: 24
+  cpus: 16
+  device_count: 2
+  gpu_type: a40
+  type: gpu
+
+l40-2:
+  mem: 128
+  hours: 24
+  cpus: 32
+  device_count: 2
+  gpu_type: l40
+  type: gpu
+
+l40s-2:
+  mem: 128
+  hours: 24
+  cpus: 32
+  device_count: 2
+  gpu_type: l40s
+  type: gpu
+
+a40-4:
+  mem: 128
+  hours: 24
+  cpus: 32
+  device_count: 4
+  gpu_type: a40
+  type: gpu
+
+l40-4:
+  mem: 260
+  hours: 24
+  cpus: 64
+  device_count: 4
+  gpu_type: l40
+  type: gpu
+
+l40s-4:
+  mem: 260
+  hours: 24
+  cpus: 64
+  device_count: 4
+  gpu_type: l40s
+  type: gpu
+
+
+
+a40-8:
+  mem: 128
+  hours: 24
+  cpus: 32
+  device_count: 8
+  gpu_type: a40
+  type: gpu
+
+l40-8:
+  mem: 260
+  hours: 24
+  cpus: 64
+  device_count: 8
+  gpu_type: l40
+  type: gpu
+
+l40s-8:
+  mem: 260
+  hours: 24
+  cpus: 64
+  device_count: 8
+  gpu_type: l40s
+  type: gpu
+
+
+node:
+  mem: 64
+  hours: 24
+  cpus: 16
+  type: cpu
