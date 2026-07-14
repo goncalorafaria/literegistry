@@ -9,6 +9,19 @@ Lightweight service registry and discovery system for distributed model inferenc
 pip install literegistry
 ```
 
+## Documentation
+
+Usage guides with argument reference live in [`docs/`](docs/README.md):
+
+- [CLI reference](docs/cli.md)
+- [Registry (Redis & filesystem)](docs/registry.md)
+- [Gateway](docs/gateway.md)
+- [vLLM & SGLang](docs/vllm-sglang.md)
+- [Code & Terminal](docs/code-and-terminal.md)
+- [Load balancing](docs/load-balancing.md)
+- [Runtimes](docs/runtimes.md)
+- [Console](docs/console.md)
+
 ## Quick Start
 
 Complete workflow for deploying distributed model inference:
