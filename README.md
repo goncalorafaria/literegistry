@@ -11,7 +11,8 @@ pip install literegistry
 
 ## Documentation
 
-Usage guides with argument reference live in [`docs/`](docs/README.md):
+Usage guides with argument reference live in [`docs/`](docs/README.md)
+(published at [goncalorafaria.github.io/literegistry](https://goncalorafaria.github.io/literegistry/)):
 
 - [CLI reference](docs/cli.md)
 - [Registry (Redis & filesystem)](docs/registry.md)

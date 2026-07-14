@@ -58,7 +58,8 @@ Rough gamma guidance:
 | Many similar replicas | `0.2–0.3` |
 | Highly dynamic join/leave | `0.2–0.4` |
 
-Tuning cheat sheet in-repo: [`PARAMETER_CHEATSHEET.md`](../PARAMETER_CHEATSHEET.md).
+Tuning cheat sheet in-repo:
+[`PARAMETER_CHEATSHEET.md`](https://github.com/goncalorafaria/literegistry/blob/master/PARAMETER_CHEATSHEET.md).
 
 ## Failover / rotation (`request_with_rotation`)
 
@@ -100,7 +101,7 @@ await registry.get_all("my-model", force=True)
 ## Other algorithms in the tree
 
 The package also contains `UniformBandit`, `LoadAwareExp3`, and capacity helpers
-(see [`README_BANDITS.md`](../README_BANDITS.md)). The **default production path
+(see [`README_BANDITS.md`](https://github.com/goncalorafaria/literegistry/blob/master/README_BANDITS.md)). The **default production path
 for the gateway is `Exp3Dynamic`** wired inside `RegistryClient`.
 
 Uniform behavior (equal weights, no learning) is available if you construct a

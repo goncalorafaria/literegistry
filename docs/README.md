@@ -1,8 +1,9 @@
 # LiteRegistry Docs
 
 Usage-focused guides for running and operating LiteRegistry. Start with the
-[main README](../README.md) for a full end-to-end workflow, then use these pages
-for argument details and behavior.
+[main README](https://github.com/goncalorafaria/literegistry/blob/master/README.md)
+for a full end-to-end workflow, then use these pages for argument details and
+behavior.
 
 | Guide | What it covers |
 |-------|----------------|
@@ -27,3 +28,5 @@ literegistry console        →  live ops view (optional)
 
 All CLI commands go through `literegistry <subcommand>` (Fire). Registry URLs
 are either `redis://host:port` or a filesystem path.
+
+This site is built with MkDocs and published via GitHub Pages from `master`.
