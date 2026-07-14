@@ -13,6 +13,7 @@ import socket
 import sys
 import time
 import traceback
+from collections import deque
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from contextlib import redirect_stderr, redirect_stdout
@@ -20,7 +21,7 @@ from dataclasses import dataclass, field
 from types import ModuleType
 from typing import Any
 from literegistry import get_kvstore, ServerRegistry
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, root_validator, validator
 
 logging.basicConfig(
@@ -542,6 +543,7 @@ class CodeResponse(BaseModel):
     locals: dict[str, Any] = Field(default_factory=dict)
     execution_time: float
     final_answer: str | None = None
+    retryable: bool = False
 
 
 @dataclass
@@ -569,6 +571,7 @@ class StatelessCodeExecutorConfig:
         default_factory=lambda: DEFAULT_TOOL_SPECS.copy()
     )
     pool_size: int = field(default_factory=lambda: os.cpu_count() or 1)
+    max_queue_size: int | None = None
     outer_timeout_grace_seconds: int = 1
     host: str = "0.0.0.0"
     port: int = 1212
@@ -591,6 +594,22 @@ class StatelessCodeExecutorServer:
         self.url = f"http://{socket.getfqdn()}"
         self.should_run = False
         self.heartbeat_task: asyncio.Task | None = None
+        self._queue_capacity = (
+            self.config.max_queue_size
+            if self.config.max_queue_size is not None
+            else self.config.pool_size
+        )
+        if self._queue_capacity < 0:
+            raise ValueError("max_queue_size must be non-negative")
+        self._admission = asyncio.BoundedSemaphore(
+            self.config.pool_size + self._queue_capacity
+        )
+        self._inflight_requests = 0
+        self._recovering = False
+        self._pool_restart_lock = asyncio.Lock()
+        self._execution_timeouts = 0
+        self._pool_restart_count = 0
+        self._recent_failures: deque[str] = deque(maxlen=10)
 
         _preimport_tools(self.config.preimport_tools, self.config.tool_specs)
         self.process_pool: ProcessPoolExecutor | None = self._new_pool()
@@ -616,10 +635,33 @@ class StatelessCodeExecutorServer:
                 "default_tools": self.config.default_tools,
                 "preimport_tools": self.config.preimport_tools,
                 "pool_size": self.config.pool_size,
+                "max_queue_size": self._queue_capacity,
                 "outer_timeout_grace_seconds": self.config.outer_timeout_grace_seconds,
                 "heartbeat_interval": self.config.heartbeat_interval,
             },
         }
+
+    def _executor_metrics(self) -> dict[str, Any]:
+        """Return local executor health and admission metrics."""
+        return {
+            "healthy": self.check_health(),
+            "recovering": self._recovering,
+            "inflight_requests": self._inflight_requests,
+            "active_requests_estimate": min(
+                self._inflight_requests, self.config.pool_size
+            ),
+            "queued_requests_estimate": max(
+                self._inflight_requests - self.config.pool_size, 0
+            ),
+            "queue_capacity": self._queue_capacity,
+            "admission_capacity": self.config.pool_size + self._queue_capacity,
+            "execution_timeouts": self._execution_timeouts,
+            "pool_restart_count": self._pool_restart_count,
+            "recent_failures": list(self._recent_failures),
+        }
+
+    def _record_failure(self, reason: str) -> None:
+        self._recent_failures.append(f"{time.time():.3f}: {reason}")
 
     async def register(self) -> None:
         """Register this FastAPI code executor in literegistry."""
@@ -632,14 +674,23 @@ class StatelessCodeExecutorServer:
 
     def check_health(self) -> bool:
         """Return whether this server is healthy enough to heartbeat."""
-        return self.should_run and self.process_pool is not None
+        return (
+            self.should_run
+            and self.process_pool is not None
+            and not self._recovering
+            and self._inflight_requests < self.config.pool_size + self._queue_capacity
+        )
 
     async def heartbeat_loop(self):
         """Run heartbeat in a loop."""
         while self.should_run:
             if self.check_health():
                 try:
-                    await self.registry.heartbeat(self.url, self.config.port)
+                    await self.registry.heartbeat(
+                        self.url,
+                        self.config.port,
+                        data={"executor": self._executor_metrics()},
+                    )
                 except Exception:
                     logger.exception("Heartbeat failed")
             else:
@@ -676,6 +727,37 @@ class StatelessCodeExecutorServer:
             self.process_pool = None
         print("Server stopped and deregistered")
 
+    async def _restart_process_pool(
+        self, reason: str, expected_pool: ProcessPoolExecutor | None
+    ) -> None:
+        """Terminate the entire pool after infrastructure failure.
+
+        A ProcessPoolExecutor cannot safely cancel one already-running child
+        job.  Terminating the pool is deliberate: it prevents timed-out work
+        from silently retaining all worker capacity.
+        """
+        async with self._pool_restart_lock:
+            if self._recovering or self.process_pool is not expected_pool:
+                return
+            self._recovering = True
+            self._record_failure(reason)
+            old_pool = self.process_pool
+            self.process_pool = None
+            try:
+                if old_pool is not None:
+                    processes = list(
+                        (getattr(old_pool, "_processes", None) or {}).values()
+                    )
+                    for process in processes:
+                        if process.is_alive():
+                            process.terminate()
+                    old_pool.shutdown(wait=False, cancel_futures=True)
+                self.process_pool = self._new_pool()
+                self._pool_restart_count += 1
+                logger.warning("Recreated worker pool after %s", reason)
+            finally:
+                self._recovering = False
+
     def cleanup(self) -> None:
         """Sync cleanup wrapper for non-FastAPI callers."""
         asyncio.run(self.cleanup_async())
@@ -695,8 +777,9 @@ class StatelessCodeExecutorServer:
 
         start = time.perf_counter()
         loop = asyncio.get_running_loop()
+        pool = self.process_pool
         future = loop.run_in_executor(
-            self.process_pool,
+            pool,
             _run_user_code,
             code,
             max_runtime,
@@ -715,6 +798,8 @@ class StatelessCodeExecutorServer:
             )
         except asyncio.TimeoutError:
             future.cancel()
+            self._execution_timeouts += 1
+            await self._restart_process_pool("outer execution timeout", pool)
             result = {
                 "stdout": "",
                 "stderr": f"Execution timed out after {max_runtime} seconds (outer)",
@@ -722,10 +807,10 @@ class StatelessCodeExecutorServer:
                 "locals": {},
                 "execution_time": time.perf_counter() - start,
                 "final_answer": None,
+                "retryable": True,
             }
         except BrokenProcessPool:
-            logger.error("Worker pool broken; recreating")
-            self.process_pool = self._new_pool()
+            await self._restart_process_pool("broken process pool", pool)
             result = {
                 "stdout": "",
                 "stderr": "Worker pool crashed and was restarted. Please retry.",
@@ -733,6 +818,7 @@ class StatelessCodeExecutorServer:
                 "locals": {},
                 "execution_time": time.perf_counter() - start,
                 "final_answer": None,
+                "retryable": True,
             }
 
         return CodeResponse(**result)
@@ -746,36 +832,54 @@ class StatelessCodeExecutorServer:
     def _install_routes(self) -> None:
         @self.app.post("/python", response_model=CodeResponse)
         async def execute_code(req: CodeRequest) -> CodeResponse:
+            try:
+                await asyncio.wait_for(self._admission.acquire(), timeout=0.001)
+            except asyncio.TimeoutError as exc:
+                self._record_failure("admission capacity exhausted")
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "error": "code executor is overloaded",
+                        "retryable": True,
+                        "executor": self._executor_metrics(),
+                    },
+                ) from exc
+
+            self._inflight_requests += 1
             truncated_code = (
                 (req.code[:197] + "...") if len(req.code) > 200 else req.code
             )
-            logger.info(
-                "Received execute request max_runtime=%ss tools=%s code=%r",
-                req.max_runtime,
-                (
-                    req.custom_tools
-                    if req.custom_tools is not None
-                    else self.config.default_tools
-                ),
-                truncated_code,
-            )
+            try:
+                logger.info(
+                    "Received execute request max_runtime=%ss tools=%s code=%r",
+                    req.max_runtime,
+                    (
+                        req.custom_tools
+                        if req.custom_tools is not None
+                        else self.config.default_tools
+                    ),
+                    truncated_code,
+                )
 
-            response = await self.execute_stateless_code(
-                code=req.code,
-                max_runtime=req.max_runtime,
-                context_payload=req.context_payload,
-                setup_code=req.setup_code,
-                custom_tools=req.custom_tools,
-                return_locals=req.return_locals,
-            )
-            logger.info(
-                "Responding success=%s execution_time=%.3fs stdout_len=%s stderr=%s",
-                response.success,
-                response.execution_time,
-                len(response.stdout),
-                bool(response.stderr),
-            )
-            return response
+                response = await self.execute_stateless_code(
+                    code=req.code,
+                    max_runtime=req.max_runtime,
+                    context_payload=req.context_payload,
+                    setup_code=req.setup_code,
+                    custom_tools=req.custom_tools,
+                    return_locals=req.return_locals,
+                )
+                logger.info(
+                    "Responding success=%s execution_time=%.3fs stdout_len=%s stderr=%s",
+                    response.success,
+                    response.execution_time,
+                    len(response.stdout),
+                    bool(response.stderr),
+                )
+                return response
+            finally:
+                self._inflight_requests -= 1
+                self._admission.release()
 
         @self.app.get("/")
         async def root() -> dict[str, Any]:
@@ -785,6 +889,8 @@ class StatelessCodeExecutorServer:
                 "default_tools": self.config.default_tools,
                 "preimport_tools": self.config.preimport_tools,
                 "pool_size": self.config.pool_size,
+                "max_queue_size": self._queue_capacity,
+                "executor": self._executor_metrics(),
                 "registry_url": self.url,
                 "registry_port": self.config.port,
                 "heartbeat_interval": self.config.heartbeat_interval,
@@ -808,6 +914,7 @@ def main(
     host: str = "0.0.0.0",
     port: int = 1212,
     pool_size: int | None = None,
+    max_queue_size: int | None = None,
     default_tools: str | list[str] = (
         "json,math,time,re,pandas,numpy,sympy,datetime,functools,random,typing"
     ),
@@ -827,6 +934,7 @@ def main(
         default_tools=_parse_csv(default_tools),
         preimport_tools=_parse_csv(preimport_tools),
         pool_size=pool_size or os.cpu_count() or 1,
+        max_queue_size=max_queue_size,
         outer_timeout_grace_seconds=outer_timeout_grace_seconds,
         host=host,
         port=port,

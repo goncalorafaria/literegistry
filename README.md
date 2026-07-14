@@ -94,6 +94,16 @@ service registers itself under `model_path="python"` so the gateway can route
 literegistry code --registry redis://klone-login01.hyak.local:6379
 ```
 
+**Start Terminal Pipeline Server**
+
+The terminal server runs restricted, stdin-only log-analysis pipelines. It
+accepts `rg`, `grep`, `awk`, `sed`, `jq`, `xsv`, `head`, `tail`, `wc`, and `nl`, joined by
+pipes. It does not evaluate shell syntax or permit submitted file paths.
+
+```bash
+literegistry terminal --registry redis://klone-login01.hyak.local:6379
+```
+
 **4. Interact with Gateway**
 
 The gateway provides OpenAI-compatible HTTP endpoints that work with existing tools:
@@ -119,10 +129,16 @@ curl -X POST http://localhost:8080/python \
 curl -X POST http://localhost:8080/python \
   -H "Content-Type: application/json" \
   -d '{"code": "data = json.loads(context)\nprint(data[\"name\"])\nprint(data[\"score\"] + 1)", "context_payload": "{\"name\": \"alice\", \"score\": 41}", "max_runtime": 3}'
+
+# Analyze submitted log contents through the gateway
+curl -X POST http://localhost:8080/terminal \
+  -H "Content-Type: application/json" \
+  -d '{"contents": "INFO started\nERROR disk full\nERROR retrying\n", "command": "rg ERROR | head -n 1", "max_runtime": 5}'
 ```
 
 The gateway automatically routes requests to the appropriate model server based on the `model` field.
 For code execution, it routes `/python` requests to services registered as `python`.
+For log slicing, it routes `/terminal` requests to services registered as `terminal`.
 
 **5. Monitor Cluster**
 ```bash

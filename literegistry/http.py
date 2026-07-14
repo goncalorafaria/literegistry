@@ -26,7 +26,10 @@ class RegistryHTTPClient:
         value: str,
         max_parallel_requests: int = 512,
         timeout: float = 63,
+        connect_timeout: float = 10,
         max_retries: int = 10,
+        retry_budget_seconds: float | None = None,
+        retry_backoff_seconds: float | None = None,
         use_shared_session: bool = True,
     ):
         """
@@ -43,7 +46,10 @@ class RegistryHTTPClient:
         self._owns_session = False  # Track if we created the session
         self.max_parallel_requests = max_parallel_requests
         self.timeout = timeout
+        self.connect_timeout = min(connect_timeout, timeout)
         self.max_retries = max_retries
+        self.retry_budget_seconds = retry_budget_seconds
+        self.retry_backoff_seconds = retry_backoff_seconds
         self.use_shared_session = use_shared_session
         self._connector = None
 
@@ -80,7 +86,7 @@ class RegistryHTTPClient:
         
         timeout = aiohttp.ClientTimeout(
             total=self.timeout,
-            connect=10,
+            connect=self.connect_timeout,
             sock_read=self.timeout
         )
         
@@ -130,7 +136,11 @@ class RegistryHTTPClient:
             async with self._session.post(
                 f"{server.rstrip('/')}/{endpoint}",
                 json=payload,
-                timeout=aiohttp.ClientTimeout(total=self.timeout),
+                timeout=aiohttp.ClientTimeout(
+                    total=self.timeout,
+                    connect=self.connect_timeout,
+                    sock_read=self.timeout,
+                ),
             ) as response:
                 response.raise_for_status()
                 return await response.json()
@@ -145,55 +155,85 @@ class RegistryHTTPClient:
         initial_server_idx: int = 0,
     ) -> Tuple[Dict, int]:
         """Make a request with automatic server rotation on failure."""
-        start_time = asyncio.get_event_loop().time()
+        loop = asyncio.get_running_loop()
+        request_started = loop.time()
+        deadline = (
+            request_started + self.retry_budget_seconds
+            if self.retry_budget_seconds is not None
+            else None
+        )
         servers_and_probs = await self.registry.sample_servers(
             self.value, n=self.max_retries
         )
-        total_servers = len(servers_and_probs)
 
-        if not total_servers:
+        if not servers_and_probs:
             raise RuntimeError(f"No servers available for model {self.value}")
 
         attempt = 0
         server_idx = initial_server_idx
+        failed_servers: set[str] = set()
+        is_python_request = endpoint.strip("/") == "python"
 
         while attempt < self.max_retries:
-            start_time = asyncio.get_event_loop().time()
+            if deadline is not None and loop.time() >= deadline:
+                raise RuntimeError(
+                    f"Retry budget of {self.retry_budget_seconds}s exhausted for {self.value}"
+                )
 
+            server = "<unselected>"
+            prob = 1.0
+            start_time = loop.time()
             try:
-                server_idx = server_idx % total_servers
-                
-                server, prob = servers_and_probs[server_idx]
-                server = server.rstrip("/")
-                
-                
+                selected = None
+                for offset in range(len(servers_and_probs)):
+                    idx = (server_idx + offset) % len(servers_and_probs)
+                    candidate, candidate_prob = servers_and_probs[idx]
+                    candidate = candidate.rstrip("/")
+                    if not is_python_request or candidate not in failed_servers:
+                        selected = (idx, candidate, candidate_prob)
+                        break
+
+                if selected is None:
+                    raise RuntimeError(
+                        f"No untried servers available for model {self.value}"
+                    )
+
+                server_idx, server, prob = selected
                 result = await self._make_http_request(server, endpoint, payload)
 
                 if "status" in result and result["status"] == "failed":
                     raise RuntimeError(f"Error from server: - {result} - {server}")
+                if (
+                    is_python_request
+                    and result.get("success") is False
+                    and result.get("retryable") is True
+                ):
+                    raise RuntimeError(
+                        f"Retryable code executor failure on {server}: "
+                        f"{result.get('stderr')!r}"
+                    )
 
                 # Report successful request latency
-                latency = asyncio.get_event_loop().time() - start_time
+                latency = loop.time() - start_time
                 self.registry.report_latency(server, latency, prob=prob, success=True)
-                #logging.info(f"Request successful to {server}: Latency: {latency} seconds")
-                
                 return result, server_idx
 
             except Exception as e:
-                
-                ## print traceback
-                import traceback
-                traceback.print_exc()
-                logging.error(
-                    f"Attempt {self.value}:{attempt + 1} failed on server {server}: {str(e)} - {traceback.format_exc()} - {payload}"
+                logger.warning(
+                    "Attempt %s for %s failed on %s: %s",
+                    attempt + 1,
+                    self.value,
+                    server,
+                    e,
                 )
                 attempt += 1
+                if is_python_request and server != "<unselected>":
+                    failed_servers.add(server)
 
                 # Report failed request latency
-                latency = asyncio.get_event_loop().time() - start_time
-                
-                logging.error(f"failed request timeout: {latency}- expected {self.timeout}")
-                self.registry.report_latency(server, latency, prob=prob, success=False)
+                latency = loop.time() - start_time
+                if server != "<unselected>":
+                    self.registry.report_latency(server, latency, prob=prob, success=False)
 
                 servers_and_probs = await self.registry.sample_servers(
                     self.value,
@@ -201,17 +241,40 @@ class RegistryHTTPClient:
                     force=True,
                 )
                 total_servers = len(servers_and_probs)
+                if is_python_request and not any(
+                    candidate.rstrip("/") not in failed_servers
+                    for candidate, _ in servers_and_probs
+                ):
+                    raise RuntimeError(
+                        f"No healthy untried servers remain for model {self.value}"
+                    ) from e
 
                 # Rotate to next server
-                server_idx = server_idx + 1  # % total_servers
+                server_idx += 1
 
                 if attempt >= self.max_retries:
                     raise RuntimeError(
                         f"Failed after {self.max_retries} attempts across {total_servers} servers: {str(e)}"
                     )
 
-                # Exponential backoff with max of 60 seconds
-                await asyncio.sleep(min(2**attempt, 60))
+                if deadline is not None:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        raise RuntimeError(
+                            f"Retry budget of {self.retry_budget_seconds}s exhausted for {self.value}"
+                        ) from e
+                else:
+                    remaining = None
+
+                delay = (
+                    self.retry_backoff_seconds
+                    if self.retry_backoff_seconds is not None
+                    else min(2**attempt, 60)
+                )
+                if remaining is not None:
+                    delay = min(delay, remaining)
+                if delay > 0:
+                    await asyncio.sleep(delay)
 
         raise RuntimeError("Unexpected end of retry loop")
 

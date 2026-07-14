@@ -82,13 +82,25 @@ class StarletteGatewayServer:
         host: str = "0.0.0.0",
         port: int = 8080,
         timeout: float = 62,
-        max_retries: int = 20
+        python_timeout: float = 20,
+        max_retries: int = 20,
+        python_max_retries: int = 3,
+        python_retry_budget_seconds: float = 20,
+        terminal_timeout: float = 20,
+        terminal_max_retries: int = 2,
+        terminal_retry_budget_seconds: float = 20,
     ):
         self.registry = registry
         self.host = host
         self.port = port
         self.timeout = timeout
+        self.python_timeout = python_timeout
         self.max_retries = max_retries
+        self.python_max_retries = python_max_retries
+        self.python_retry_budget_seconds = python_retry_budget_seconds
+        self.terminal_timeout = terminal_timeout
+        self.terminal_max_retries = terminal_max_retries
+        self.terminal_retry_budget_seconds = terminal_retry_budget_seconds
         self._shutdown_event = asyncio.Event()
         
         # Request tracking for statistics (sliding window of 5 seconds)
@@ -409,8 +421,11 @@ class StarletteGatewayServer:
             async with RegistryHTTPClient(
                 self.registry,
                 model,
-                timeout=self.timeout,
-                max_retries=self.max_retries,
+                timeout=self.python_timeout,
+                connect_timeout=3,
+                max_retries=self.python_max_retries,
+                retry_budget_seconds=self.python_retry_budget_seconds,
+                retry_backoff_seconds=0.1,
                 use_shared_session=True
             ) as client:
                 result, _ = await client.request_with_rotation("python", payload)
@@ -433,8 +448,64 @@ class StarletteGatewayServer:
                 "error": str(e),
                 "status": "failed"
             }, status_code=500)
-            
-            
+
+    async def handle_terminal(self, request: Request):
+        """Route restricted terminal pipelines to ``model_path="terminal"`` workers."""
+        start_time = time.time()
+        payload = None
+        model = "terminal"
+        try:
+            payload = await request.json()
+            await self._record_request_type(model)
+            if not {"contents", "command"}.issubset(payload):
+                duration = time.time() - start_time
+                await self._record_request_and_log_stats(model, duration)
+                return JSONResponse(
+                    {"error": "contents and command parameters are required"},
+                    status_code=400,
+                )
+
+            async with RegistryHTTPClient(
+                self.registry,
+                model,
+                timeout=self.terminal_timeout,
+                connect_timeout=3,
+                max_retries=self.terminal_max_retries,
+                retry_budget_seconds=self.terminal_retry_budget_seconds,
+                retry_backoff_seconds=0.1,
+                use_shared_session=True,
+            ) as client:
+                result, _ = await client.request_with_rotation("terminal", payload)
+            duration = time.time() - start_time
+            await self._record_request_and_log_stats(model, duration)
+            return JSONResponse(result)
+        except Exception as exc:
+            duration = time.time() - start_time
+            self.logger.error("Terminal pipeline error: %s - duration: %.3fs", exc, duration)
+            await self._record_request_and_log_stats(model, duration)
+            request_summary = (
+                {
+                    "command": payload.get("command"),
+                    "contents_length": (
+                        len(payload["contents"])
+                        if isinstance(payload.get("contents"), str)
+                        else None
+                    ),
+                    "max_runtime": payload.get("max_runtime"),
+                    "truncation": payload.get("truncation"),
+                }
+                if isinstance(payload, dict)
+                else None
+            )
+            return JSONResponse(
+                {
+                    "error": str(exc),
+                    "status": "failed",
+                    "request": request_summary,
+                },
+                status_code=500,
+            )
+
     def _create_app(self):
         """Create the Starlette application with lifespan management."""
         
@@ -468,7 +539,8 @@ class StarletteGatewayServer:
                 Route("/v1/models", self.list_models, methods=["GET"]),
                 Route("/v1/completions", self.handle_completions, methods=["POST"]),
                 Route("/classify", self.handle_classify, methods=["POST"]),
-                Route("/python", self.handle_python, methods=["POST"])
+                Route("/python", self.handle_python, methods=["POST"]),
+                Route("/terminal", self.handle_terminal, methods=["POST"]),
             ],
             lifespan=lifespan
         )
@@ -549,13 +621,34 @@ class StarletteGatewayServer:
             self.logger.error(f"Cleanup error: {e}")
 
 
-async def main_async(registry="redis://klone-login03.hyak.local:6379", port=8080, cache_ttl=None,timeout=15):
+async def main_async(
+    registry="redis://klone-login03.hyak.local:6379",
+    port=8080,
+    cache_ttl=None,
+    timeout=15,
+    python_timeout=20,
+    python_max_retries=3,
+    python_retry_budget_seconds=20,
+    terminal_timeout=20,
+    terminal_max_retries=2,
+    terminal_retry_budget_seconds=20,
+):
     """Simple main function without restart loops."""
     
     store = get_kvstore(registry)
     
     registry = RegistryClient(store=store, service_type="model_path", cache_ttl=cache_ttl)
-    server = StarletteGatewayServer(registry, port=port, timeout=timeout)
+    server = StarletteGatewayServer(
+        registry,
+        port=port,
+        timeout=timeout,
+        python_timeout=python_timeout,
+        python_max_retries=python_max_retries,
+        python_retry_budget_seconds=python_retry_budget_seconds,
+        terminal_timeout=terminal_timeout,
+        terminal_max_retries=terminal_max_retries,
+        terminal_retry_budget_seconds=terminal_retry_budget_seconds,
+    )
     
     gateway_url = f"http://{socket.getfqdn()}:{port}"
     
@@ -584,12 +677,27 @@ def create_app():
     """Create app for uvicorn."""
     registry_path = os.getenv("REGISTRY_PATH", "redis://klone-login01.hyak.local:6379")
     timeout = os.getenv("TIMEOUT", 59)
+    python_timeout = os.getenv("PYTHON_TIMEOUT", 20)
+    python_max_retries = os.getenv("PYTHON_MAX_RETRIES", 3)
+    python_retry_budget_seconds = os.getenv("PYTHON_RETRY_BUDGET_SECONDS", 20)
+    terminal_timeout = os.getenv("TERMINAL_TIMEOUT", 20)
+    terminal_max_retries = os.getenv("TERMINAL_MAX_RETRIES", 2)
+    terminal_retry_budget_seconds = os.getenv("TERMINAL_RETRY_BUDGET_SECONDS", 20)
     try:
         
         store=get_kvstore(registry_path)
         
         registry = RegistryClient(store=store, service_type="model_path")
-        server = StarletteGatewayServer(registry, timeout=int(timeout))
+        server = StarletteGatewayServer(
+            registry,
+            timeout=float(timeout),
+            python_timeout=float(python_timeout),
+            python_max_retries=int(python_max_retries),
+            python_retry_budget_seconds=float(python_retry_budget_seconds),
+            terminal_timeout=float(terminal_timeout),
+            terminal_max_retries=int(terminal_max_retries),
+            terminal_retry_budget_seconds=float(terminal_retry_budget_seconds),
+        )
         return server.app
         
     except Exception as e:
@@ -606,7 +714,18 @@ def create_app():
         return app
 
 
-def main(registry="redis://klone-login03.hyak.local:6379", port=8080, workers=1, timeout=61):
+def main(
+    registry="redis://klone-login03.hyak.local:6379",
+    port=8080,
+    workers=1,
+    timeout=61,
+    python_timeout=20,
+    python_max_retries=3,
+    python_retry_budget_seconds=20,
+    terminal_timeout=20,
+    terminal_max_retries=2,
+    terminal_retry_budget_seconds=20,
+):
     """Main entry point. Use workers > 1 for multi-worker mode."""
     # If multiple workers, use blocking uvicorn.run() with import string
     # Set REGISTRY_PATH env var so create_app() can use it
@@ -614,18 +733,56 @@ def main(registry="redis://klone-login03.hyak.local:6379", port=8080, workers=1,
         # Set environment variable for create_app() to use
         os.environ["REGISTRY_PATH"] = registry
         os.environ["TIMEOUT"] = str(timeout)
+        os.environ["PYTHON_TIMEOUT"] = str(python_timeout)
+        os.environ["PYTHON_MAX_RETRIES"] = str(python_max_retries)
+        os.environ["PYTHON_RETRY_BUDGET_SECONDS"] = str(python_retry_budget_seconds)
+        os.environ["TERMINAL_TIMEOUT"] = str(terminal_timeout)
+        os.environ["TERMINAL_MAX_RETRIES"] = str(terminal_max_retries)
+        os.environ["TERMINAL_RETRY_BUDGET_SECONDS"] = str(terminal_retry_budget_seconds)
         store = get_kvstore(registry)
         registry_client = RegistryClient(store=store, service_type="model_path")
-        server = StarletteGatewayServer(registry_client, port=port, timeout=timeout)
+        server = StarletteGatewayServer(
+            registry_client,
+            port=port,
+            timeout=timeout,
+            python_timeout=python_timeout,
+            python_max_retries=python_max_retries,
+            python_retry_budget_seconds=python_retry_budget_seconds,
+            terminal_timeout=terminal_timeout,
+            terminal_max_retries=terminal_max_retries,
+            terminal_retry_budget_seconds=terminal_retry_budget_seconds,
+        )
         gateway_url = f"http://{socket.getfqdn()}:{port}"
         print(f"Gateway server starting at {gateway_url} with {workers} workers")
         server.start_with_workers(workers=workers)
     else:
         # Single worker uses async mode
-        asyncio.run(main_async(registry, port, timeout=timeout))
+        asyncio.run(
+            main_async(
+                registry,
+                port,
+                timeout=timeout,
+                python_timeout=python_timeout,
+                python_max_retries=python_max_retries,
+                python_retry_budget_seconds=python_retry_budget_seconds,
+                terminal_timeout=terminal_timeout,
+                terminal_max_retries=terminal_max_retries,
+                terminal_retry_budget_seconds=terminal_retry_budget_seconds,
+            )
+        )
 
 
-def run_in_thread(registry="redis://klone-login03.hyak.local:6379", port=8080, timeout=15):
+def run_in_thread(
+    registry="redis://klone-login03.hyak.local:6379",
+    port=8080,
+    timeout=15,
+    python_timeout=20,
+    python_max_retries=3,
+    python_retry_budget_seconds=20,
+    terminal_timeout=20,
+    terminal_max_retries=2,
+    terminal_retry_budget_seconds=20,
+):
     """
     Thread-safe entry point for running the gateway in a separate thread.
     
@@ -644,7 +801,17 @@ def run_in_thread(registry="redis://klone-login03.hyak.local:6379", port=8080, t
         # Initialize registry components
         store = get_kvstore(registry)
         registry_client = RegistryClient(store=store, service_type="model_path")
-        server = StarletteGatewayServer(registry_client, port=port, timeout=timeout)
+        server = StarletteGatewayServer(
+            registry_client,
+            port=port,
+            timeout=timeout,
+            python_timeout=python_timeout,
+            python_max_retries=python_max_retries,
+            python_retry_budget_seconds=python_retry_budget_seconds,
+            terminal_timeout=terminal_timeout,
+            terminal_max_retries=terminal_max_retries,
+            terminal_retry_budget_seconds=terminal_retry_budget_seconds,
+        )
         
         # Set up uvicorn access logger to use root logger
         import logging
