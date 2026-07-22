@@ -113,3 +113,48 @@ def test_gateway_routes_terminal_pipeline_to_terminal_workers():
     assert captured["timeout"] == 9
     assert captured["max_retries"] == 2
     assert captured["retry_budget_seconds"] == 10
+
+
+def test_gateway_routes_search_to_search_workers():
+    registry = FakeRegistry()
+    server = StarletteGatewayServer(
+        registry,
+        search_timeout=70,
+        search_max_retries=3,
+        search_retry_budget_seconds=71,
+    )
+    captured = {}
+
+    class FakeClient:
+        def __init__(self, registry, model, **kwargs):
+            captured["model"] = model
+            captured.update(kwargs)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def request_with_rotation(self, endpoint, payload):
+            captured["endpoint"] = endpoint
+            captured["payload"] = payload
+            return {"success": True, "data": {"results": []}}, 0
+
+    async def receive():
+        return {
+            "type": "http.request",
+            "body": b'{"mode": "query", "query": "distributed inference"}',
+            "more_body": False,
+        }
+
+    request = Request({"type": "http", "method": "POST", "headers": []}, receive)
+    with patch("literegistry.gateway.RegistryHTTPClient", FakeClient):
+        response = asyncio.run(server.handle_search(request))
+
+    assert response.status_code == 200
+    assert captured["model"] == "search"
+    assert captured["endpoint"] == "search"
+    assert captured["timeout"] == 70
+    assert captured["max_retries"] == 3
+    assert captured["retry_budget_seconds"] == 71

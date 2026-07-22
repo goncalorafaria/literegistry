@@ -176,7 +176,7 @@ literegistry terminal --registry redis://login-node:6379 --port 1213
 | `command_path` | `None` | Extra `PATH` dir for tools |
 
 Allowed commands: `rg`, `grep`, `awk`, `sed`, `jq`, `xsv`, `head`, `tail`,
-`wc`, `cat`, `nl`. Details: [Code & Terminal](code-and-terminal.md).
+`wc`, `cat`, `nl`, `echo`. Details: [Code & Terminal](code-and-terminal.md).
 
 ---
 

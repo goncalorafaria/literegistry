@@ -25,6 +25,7 @@ ENDPOINTS:
     POST /v1/completions - Completion requests
     POST /classify       - Classification requests
     POST /python         - Python execution requests
+    POST /search         - Query search or direct URL retrieval
 
 Environment variables:
     REGISTRY_PATH: Registry connection string (default: redis://klone-login01.hyak.local:6379)
@@ -89,6 +90,9 @@ class StarletteGatewayServer:
         terminal_timeout: float = 20,
         terminal_max_retries: int = 2,
         terminal_retry_budget_seconds: float = 20,
+        search_timeout: float = 65,
+        search_max_retries: int = 2,
+        search_retry_budget_seconds: float = 65,
     ):
         self.registry = registry
         self.host = host
@@ -101,6 +105,9 @@ class StarletteGatewayServer:
         self.terminal_timeout = terminal_timeout
         self.terminal_max_retries = terminal_max_retries
         self.terminal_retry_budget_seconds = terminal_retry_budget_seconds
+        self.search_timeout = search_timeout
+        self.search_max_retries = search_max_retries
+        self.search_retry_budget_seconds = search_retry_budget_seconds
         self._shutdown_event = asyncio.Event()
         
         # Request tracking for statistics (sliding window of 5 seconds)
@@ -506,6 +513,49 @@ class StarletteGatewayServer:
                 status_code=500,
             )
 
+    async def handle_search(self, request: Request):
+        """Route query and direct-URL requests to ``model_path="search"`` workers."""
+        start_time = time.time()
+        payload = None
+        model = "search"
+        try:
+            payload = await request.json()
+            await self._record_request_type(model)
+            if payload.get("mode") not in {"query", "url"}:
+                return JSONResponse(
+                    {"error": "mode must be either 'query' or 'url'"},
+                    status_code=400,
+                )
+            required_field = "query" if payload["mode"] == "query" else "url"
+            if not payload.get(required_field):
+                return JSONResponse(
+                    {"error": f"{required_field} parameter required for {payload['mode']} mode"},
+                    status_code=400,
+                )
+
+            async with RegistryHTTPClient(
+                self.registry,
+                model,
+                timeout=self.search_timeout,
+                connect_timeout=3,
+                max_retries=self.search_max_retries,
+                retry_budget_seconds=self.search_retry_budget_seconds,
+                retry_backoff_seconds=0.1,
+                use_shared_session=True,
+            ) as client:
+                result, _ = await client.request_with_rotation("search", payload)
+            duration = time.time() - start_time
+            await self._record_request_and_log_stats(model, duration)
+            return JSONResponse(result)
+        except Exception as exc:
+            duration = time.time() - start_time
+            self.logger.error("Search error: %s - duration: %.3fs", exc, duration)
+            await self._record_request_and_log_stats(model, duration)
+            return JSONResponse(
+                {"error": str(exc), "status": "failed"},
+                status_code=500,
+            )
+
     def _create_app(self):
         """Create the Starlette application with lifespan management."""
         
@@ -541,6 +591,7 @@ class StarletteGatewayServer:
                 Route("/classify", self.handle_classify, methods=["POST"]),
                 Route("/python", self.handle_python, methods=["POST"]),
                 Route("/terminal", self.handle_terminal, methods=["POST"]),
+                Route("/search", self.handle_search, methods=["POST"]),
             ],
             lifespan=lifespan
         )
@@ -632,6 +683,9 @@ async def main_async(
     terminal_timeout=20,
     terminal_max_retries=2,
     terminal_retry_budget_seconds=20,
+    search_timeout=65,
+    search_max_retries=2,
+    search_retry_budget_seconds=65,
 ):
     """Simple main function without restart loops."""
     
@@ -648,6 +702,9 @@ async def main_async(
         terminal_timeout=terminal_timeout,
         terminal_max_retries=terminal_max_retries,
         terminal_retry_budget_seconds=terminal_retry_budget_seconds,
+        search_timeout=search_timeout,
+        search_max_retries=search_max_retries,
+        search_retry_budget_seconds=search_retry_budget_seconds,
     )
     
     gateway_url = f"http://{socket.getfqdn()}:{port}"
@@ -683,6 +740,9 @@ def create_app():
     terminal_timeout = os.getenv("TERMINAL_TIMEOUT", 20)
     terminal_max_retries = os.getenv("TERMINAL_MAX_RETRIES", 2)
     terminal_retry_budget_seconds = os.getenv("TERMINAL_RETRY_BUDGET_SECONDS", 20)
+    search_timeout = os.getenv("SEARCH_TIMEOUT", 65)
+    search_max_retries = os.getenv("SEARCH_MAX_RETRIES", 2)
+    search_retry_budget_seconds = os.getenv("SEARCH_RETRY_BUDGET_SECONDS", 65)
     try:
         
         store=get_kvstore(registry_path)
@@ -697,6 +757,9 @@ def create_app():
             terminal_timeout=float(terminal_timeout),
             terminal_max_retries=int(terminal_max_retries),
             terminal_retry_budget_seconds=float(terminal_retry_budget_seconds),
+            search_timeout=float(search_timeout),
+            search_max_retries=int(search_max_retries),
+            search_retry_budget_seconds=float(search_retry_budget_seconds),
         )
         return server.app
         
@@ -725,6 +788,9 @@ def main(
     terminal_timeout=20,
     terminal_max_retries=2,
     terminal_retry_budget_seconds=20,
+    search_timeout=65,
+    search_max_retries=2,
+    search_retry_budget_seconds=65,
 ):
     """Main entry point. Use workers > 1 for multi-worker mode."""
     # If multiple workers, use blocking uvicorn.run() with import string
@@ -739,6 +805,9 @@ def main(
         os.environ["TERMINAL_TIMEOUT"] = str(terminal_timeout)
         os.environ["TERMINAL_MAX_RETRIES"] = str(terminal_max_retries)
         os.environ["TERMINAL_RETRY_BUDGET_SECONDS"] = str(terminal_retry_budget_seconds)
+        os.environ["SEARCH_TIMEOUT"] = str(search_timeout)
+        os.environ["SEARCH_MAX_RETRIES"] = str(search_max_retries)
+        os.environ["SEARCH_RETRY_BUDGET_SECONDS"] = str(search_retry_budget_seconds)
         store = get_kvstore(registry)
         registry_client = RegistryClient(store=store, service_type="model_path")
         server = StarletteGatewayServer(
@@ -751,6 +820,9 @@ def main(
             terminal_timeout=terminal_timeout,
             terminal_max_retries=terminal_max_retries,
             terminal_retry_budget_seconds=terminal_retry_budget_seconds,
+            search_timeout=search_timeout,
+            search_max_retries=search_max_retries,
+            search_retry_budget_seconds=search_retry_budget_seconds,
         )
         gateway_url = f"http://{socket.getfqdn()}:{port}"
         print(f"Gateway server starting at {gateway_url} with {workers} workers")
@@ -768,6 +840,9 @@ def main(
                 terminal_timeout=terminal_timeout,
                 terminal_max_retries=terminal_max_retries,
                 terminal_retry_budget_seconds=terminal_retry_budget_seconds,
+                search_timeout=search_timeout,
+                search_max_retries=search_max_retries,
+                search_retry_budget_seconds=search_retry_budget_seconds,
             )
         )
 
@@ -782,6 +857,9 @@ def run_in_thread(
     terminal_timeout=20,
     terminal_max_retries=2,
     terminal_retry_budget_seconds=20,
+    search_timeout=65,
+    search_max_retries=2,
+    search_retry_budget_seconds=65,
 ):
     """
     Thread-safe entry point for running the gateway in a separate thread.
@@ -811,6 +889,9 @@ def run_in_thread(
             terminal_timeout=terminal_timeout,
             terminal_max_retries=terminal_max_retries,
             terminal_retry_budget_seconds=terminal_retry_budget_seconds,
+            search_timeout=search_timeout,
+            search_max_retries=search_max_retries,
+            search_retry_budget_seconds=search_retry_budget_seconds,
         )
         
         # Set up uvicorn access logger to use root logger

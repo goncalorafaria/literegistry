@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 
 _ALLOWED_COMMANDS = frozenset(
-    {"rg", "grep", "awk", "sed", "jq", "xsv", "head", "tail", "wc", "cat", "nl"}
+    {"rg", "grep", "awk", "sed", "jq", "xsv", "head", "tail", "wc", "cat", "nl", "echo"}
 )
 _CONTROL_TOKENS = frozenset({";", "&&", "||", "&", "(", ")", "<", ">", ">>", "2>", "2>>"})
 _MAX_STAGES = 8
@@ -245,6 +245,14 @@ def _validate_cat(args: list[str]) -> None:
         raise PipelineValidationError("cat accepts no arguments and reads stdin only")
 
 
+def _validate_echo(args: list[str]) -> None:
+    """Allow echo string args and -n/-e/-E; reject path-like operands."""
+    for arg in args:
+        if arg.startswith("-") and len(arg) > 1 and set(arg[1:]).issubset({"n", "e", "E"}):
+            continue
+        _reject_path(arg)
+
+
 def _validate_nl(args: list[str]) -> None:
     """Allow line numbering options without allowing file operands."""
     value_options = {
@@ -379,6 +387,8 @@ def parse_pipeline(pipeline: str) -> list[list[str]]:
             _validate_wc(args)
         elif command == "cat":
             _validate_cat(args)
+        elif command == "echo":
+            _validate_echo(args)
         elif command == "nl":
             _validate_nl(args)
         else:

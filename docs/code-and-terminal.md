@@ -99,7 +99,7 @@ literegistry terminal --registry redis://login-node:6379
 
 ### Allowed commands
 
-`rg`, `grep`, `awk`, `sed`, `jq`, `xsv`, `head`, `tail`, `wc`, `cat`, `nl`
+`rg`, `grep`, `awk`, `sed`, `jq`, `xsv`, `head`, `tail`, `wc`, `cat`, `nl`, `echo`
 
 Constraints:
 

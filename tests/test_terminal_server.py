@@ -45,6 +45,16 @@ def test_parse_pipeline_accepts_wc_line_count():
     assert parse_pipeline("wc -l") == [["wc", "-l"]]
 
 
+def test_parse_pipeline_accepts_echo():
+    assert parse_pipeline('echo -n "hello"') == [["echo", "-n", "hello"]]
+    assert parse_pipeline("echo hi | cat") == [["echo", "hi"], ["cat"]]
+
+
+def test_parse_pipeline_rejects_echo_paths():
+    with pytest.raises(PipelineValidationError):
+        parse_pipeline("echo /etc/passwd")
+
+
 def test_parse_pipeline_accepts_stdin_only_cat_and_awk_line_limit():
     assert parse_pipeline("cat | head -n 200") == [["cat"], ["head", "-n", "200"]]
     assert parse_pipeline("awk 'NR<=200'") == [["awk", "NR<=200"]]
@@ -146,6 +156,7 @@ def test_terminal_metadata_registers_terminal_model():
 
     assert metadata["model_path"] == "terminal"
     assert "rg" in metadata["extra_kwargs"]["commands"]
+    assert "echo" in metadata["extra_kwargs"]["commands"]
 
 
 def test_response_truncation_appends_missing_character_marker():

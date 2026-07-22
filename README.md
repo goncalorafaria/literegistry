@@ -111,12 +111,31 @@ literegistry code --registry redis://klone-login01.hyak.local:6379
 **Start Terminal Pipeline Server**
 
 The terminal server runs restricted, stdin-only log-analysis pipelines. It
-accepts `rg`, `grep`, `awk`, `sed`, `jq`, `xsv`, `head`, `tail`, `wc`, and `nl`, joined by
+accepts `rg`, `grep`, `awk`, `sed`, `jq`, `xsv`, `head`, `tail`, `wc`, `cat`, `nl`, and `echo`, joined by
 pipes. It does not evaluate shell syntax or permit submitted file paths.
 
 ```bash
 literegistry terminal --registry redis://klone-login01.hyak.local:6379
 ```
+
+**Start Search Server**
+
+The search worker uses Serper by default: Google search for query requests and
+Serper's scraper for direct URL retrieval. It registers under
+`model_path="search"` and caches successful responses in a separate logical
+database on the registry Redis instance.
+
+```bash
+export SERPER_API_KEY=...
+literegistry search \
+  --registry redis://login-node:6379 \
+  --cache-db 1 \
+  --cache-ttl 3600
+```
+
+Extra Serper fields such as `gl` and `hl` can be supplied in the request's
+`parameters` object. To use other JSON APIs, pass `--provider generic` together
+with `--search-api-url` and `--fetch-api-url`.
 
 **4. Interact with Gateway**
 
@@ -148,11 +167,22 @@ curl -X POST http://localhost:8080/python \
 curl -X POST http://localhost:8080/terminal \
   -H "Content-Type: application/json" \
   -d '{"contents": "INFO started\nERROR disk full\nERROR retrying\n", "command": "rg ERROR | head -n 1", "max_runtime": 5}'
+
+# Search through the configured query API
+curl -X POST http://localhost:8080/search \
+  -H "Content-Type: application/json" \
+  -d '{"mode": "query", "query": "distributed LLM inference", "num_results": 5}'
+
+# Retrieve one URL through the configured fetch API
+curl -X POST http://localhost:8080/search \
+  -H "Content-Type: application/json" \
+  -d '{"mode": "url", "url": "https://example.com/article"}'
 ```
 
 The gateway automatically routes requests to the appropriate model server based on the `model` field.
 For code execution, it routes `/python` requests to services registered as `python`.
 For log slicing, it routes `/terminal` requests to services registered as `terminal`.
+For search and URL retrieval, it routes `/search` requests to services registered as `search`.
 
 **5. Monitor Cluster**
 ```bash
