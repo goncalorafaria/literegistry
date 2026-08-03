@@ -12,6 +12,19 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+class HTTPResponseError(RuntimeError):
+    """An upstream HTTP error that retains its response body and status."""
+
+    def __init__(self, status: int, body, url: str):
+        self.status = status
+        self.body = body
+        self.url = url
+        message = body.get("detail") if isinstance(body, dict) else body
+        if isinstance(message, dict):
+            message = message.get("error") or message.get("message") or str(message)
+        super().__init__(f"HTTP {status} from {url}: {message}")
+
+
 class RegistryHTTPClient:
     """
     HTTP client for making requests to model servers via the registry.
@@ -133,8 +146,9 @@ class RegistryHTTPClient:
             raise RuntimeError("Client not initialized - use async with")
 
         try:
+            url = f"{server.rstrip('/')}/{endpoint}"
             async with self._session.post(
-                f"{server.rstrip('/')}/{endpoint}",
+                url,
                 json=payload,
                 timeout=aiohttp.ClientTimeout(
                     total=self.timeout,
@@ -142,7 +156,12 @@ class RegistryHTTPClient:
                     sock_read=self.timeout,
                 ),
             ) as response:
-                response.raise_for_status()
+                if response.status >= 400:
+                    try:
+                        body = await response.json()
+                    except (aiohttp.ContentTypeError, ValueError):
+                        body = await response.text()
+                    raise HTTPResponseError(response.status, body, url)
                 return await response.json()
         except Exception as e:
             logger.error(f"HTTP request failed to {server}/{endpoint}: {e}")
@@ -226,6 +245,12 @@ class RegistryHTTPClient:
                     server,
                     e,
                 )
+
+                # Invalid requests cannot be fixed by sending the same
+                # request to another replica. Preserve the worker's useful
+                # structured response instead of returning a retry summary.
+                if isinstance(e, HTTPResponseError) and e.status not in {408, 425, 429}:
+                    raise
                 attempt += 1
                 if is_python_request and server != "<unselected>":
                     failed_servers.add(server)

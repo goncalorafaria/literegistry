@@ -357,9 +357,17 @@ def parse_pipeline(pipeline: str) -> list[list[str]]:
     for stage in stages:
         command, args = stage[0], stage[1:]
         if command not in _ALLOWED_COMMANDS:
-            raise PipelineValidationError(f"command {command!r} is not allowlisted")
-        if command == "grep":
-            combined_flags = set("ivncFEGwxoqsaIzbHh")
+            raise PipelineValidationError(
+                f"command {command!r} is not allowed; supported commands are: "
+                f"{', '.join(sorted(_ALLOWED_COMMANDS))}"
+            )
+        if command in {"rg", "grep"}:
+            # Expand combined short flags (e.g. -in -> -i -n). Only include
+            # flags that do not take values so -A3 / -e PATTERN stay intact.
+            combined_flags = {
+                "rg": set("ivncFwxoaIs"),
+                "grep": set("ivncFEGwxoqsaIzbHh"),
+            }[command]
             normalized_args: list[str] = []
             for arg in args:
                 if (
@@ -373,7 +381,6 @@ def parse_pipeline(pipeline: str) -> list[list[str]]:
                     normalized_args.append(arg)
             stage[:] = [command, *normalized_args]
             args = normalized_args
-        if command in {"rg", "grep"}:
             _validate_pattern_command(command, args)
         elif command == "awk":
             _validate_awk(args)

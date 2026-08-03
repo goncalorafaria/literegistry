@@ -70,6 +70,50 @@ def test_gateway_uses_dedicated_python_retry_policy():
     assert captured["retry_backoff_seconds"] == 0.1
 
 
+def test_gateway_routes_chat_completions_to_matching_model():
+    registry = FakeRegistry()
+    server = StarletteGatewayServer(registry)
+    captured = {}
+
+    class FakeClient:
+        def __init__(self, registry, model, **kwargs):
+            captured["model"] = model
+            captured.update(kwargs)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def request_with_rotation(self, endpoint, payload):
+            captured["endpoint"] = endpoint
+            captured["payload"] = payload
+            return {"id": "chatcmpl-test", "choices": []}, 0
+
+    payload = {
+        "model": "test-chat-model",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "max_tokens": 16,
+    }
+
+    async def receive():
+        return {
+            "type": "http.request",
+            "body": json.dumps(payload).encode(),
+            "more_body": False,
+        }
+
+    request = Request({"type": "http", "method": "POST", "headers": []}, receive)
+    with patch("literegistry.gateway.RegistryHTTPClient", FakeClient):
+        response = asyncio.run(server.handle_chat_completions(request))
+
+    assert response.status_code == 200
+    assert captured["model"] == "test-chat-model"
+    assert captured["endpoint"] == "v1/chat/completions"
+    assert captured["payload"] == payload
+
+
 def test_gateway_routes_terminal_pipeline_to_terminal_workers():
     registry = FakeRegistry()
     server = StarletteGatewayServer(

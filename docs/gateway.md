@@ -56,6 +56,7 @@ processes: `REGISTRY_PATH`, `TIMEOUT`, `PYTHON_TIMEOUT`, etc.
 | `GET` | `/session-stats` | Shared aiohttp session / connector stats |
 | `GET` | `/v1/models` | Distinct `model_path` values (+ metadata) |
 | `POST` | `/v1/completions` | Replica with matching `model` |
+| `POST` | `/v1/chat/completions` | Replica with matching `model` |
 | `POST` | `/classify` | Replica with matching `model` |
 | `POST` | `/python` | Workers registered as `model_path=python` |
 | `POST` | `/terminal` | Workers registered as `model_path=terminal` |
@@ -74,6 +75,22 @@ curl -X POST http://localhost:8080/v1/completions \
 
 - **Required body field:** `model` — must match a registered `model_path`.
 - All other fields are forwarded to the backend as-is.
+
+### Chat completions
+
+~~~bash
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "meta-llama/Llama-3.1-8B-Instruct",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "max_tokens": 64
+  }'
+~~~
+
+The gateway requires model, forwards messages and all other fields unchanged,
+and sends the request to POST /v1/chat/completions on the selected replica.
+
 
 ### Classify
 

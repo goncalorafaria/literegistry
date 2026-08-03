@@ -77,6 +77,16 @@ def test_parse_pipeline_accepts_combined_grep_flags_and_stdin_sentinel():
     ]
 
 
+def test_parse_pipeline_accepts_combined_rg_flags():
+    assert parse_pipeline(
+        "rg -in -C 3 'KC8|mild|reducing agent|over-reduc|reduct' | head -n 80"
+    ) == [
+        ["rg", "-i", "-n", "-C", "3", "KC8|mild|reducing agent|over-reduc|reduct"],
+        ["head", "-n", "80"],
+    ]
+    assert parse_pipeline("rg -ivn error") == [["rg", "-i", "-v", "-n", "error"]]
+
+
 def test_parse_pipeline_accepts_trailing_or_true_as_a_noop():
     assert parse_pipeline("rg -i turnout || true") == [["rg", "-i", "turnout"]]
 
@@ -117,6 +127,11 @@ def test_parse_pipeline_accepts_safe_sed_address_with_ordinary_e_text():
 def test_parse_pipeline_rejects_shell_and_file_access(pipeline):
     with pytest.raises(PipelineValidationError):
         parse_pipeline(pipeline)
+
+
+def test_parse_pipeline_explains_unsupported_command():
+    with pytest.raises(PipelineValidationError, match="command 'which' is not allowed"):
+        parse_pipeline("which rg")
 
 
 def test_terminal_server_executes_a_safe_pipeline():

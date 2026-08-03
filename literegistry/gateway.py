@@ -65,7 +65,7 @@ import socket
 import fire
 import time
 # Use shared session via RegistryHTTPClient
-from literegistry.http import RegistryHTTPClient
+from literegistry.http import HTTPResponseError, RegistryHTTPClient
 
 class StarletteGatewayServer:
     """
@@ -285,12 +285,13 @@ class StarletteGatewayServer:
                     # Reset counts after logging
                     self._request_type_counts.clear()
             
-    async def handle_completions(self,request: Request):
-        """
-        Handle completion requests.
-        
-        Uses shared aiohttp session via RegistryHTTPClient for optimal performance.
-        """
+    async def _handle_openai_completion(
+        self,
+        request: Request,
+        endpoint: str,
+        request_type: str,
+    ):
+        """Forward an OpenAI-compatible completion request to a model replica."""
         start_time = time.time()
         payload = None
         
@@ -300,7 +301,7 @@ class StarletteGatewayServer:
             model_name = model if model else "unknown"
             
             # Record request type by model name
-            await self._record_request_type(model_name)
+            await self._record_request_type(request_type)
             
             if not model:
                 duration = time.time() - start_time
@@ -320,7 +321,7 @@ class StarletteGatewayServer:
             ) as client:
                 start_duration = time.time() - start_time
                 # self.logger.info(f"Processing [completions] request for model: {model} - duration: {start_duration:.3f}s")
-                result, _ = await client.request_with_rotation("v1/completions", payload)
+                result, _ = await client.request_with_rotation(endpoint, payload)
                 duration = time.time() - start_time
                 #self.logger.info(f"Completed [completions] request for model: {model} - duration: {duration:.3f}s")
                 await self._record_request_and_log_stats(model, duration)
@@ -349,6 +350,18 @@ class StarletteGatewayServer:
                 "status": "failed"
             }, status_code=500)
     
+    async def handle_completions(self, request: Request):
+        """Handle legacy text completion requests."""
+        return await self._handle_openai_completion(
+            request, "v1/completions", "completions"
+        )
+
+    async def handle_chat_completions(self, request: Request):
+        """Handle OpenAI-compatible chat completion requests."""
+        return await self._handle_openai_completion(
+            request, "v1/chat/completions", "chat_completions"
+        )
+
     async def handle_classify(self,request: Request):
         """
         Handle classify requests.
@@ -504,12 +517,29 @@ class StarletteGatewayServer:
                 if isinstance(payload, dict)
                 else None
             )
+            if isinstance(exc, HTTPResponseError):
+                upstream = exc.body
+                detail = upstream.get("detail") if isinstance(upstream, dict) else None
+                if isinstance(detail, dict):
+                    message = detail.get("error") or detail.get("message") or str(detail)
+                    upstream_request = detail.get("request")
+                elif isinstance(detail, str):
+                    message = detail
+                    upstream_request = None
+                else:
+                    message = upstream.get("error") if isinstance(upstream, dict) else str(upstream)
+                    upstream_request = upstream.get("request") if isinstance(upstream, dict) else None
+                return JSONResponse(
+                    {
+                        "error": "terminal request rejected",
+                        "message": message,
+                        "status": "failed",
+                        "request": upstream_request or request_summary,
+                    },
+                    status_code=exc.status,
+                )
             return JSONResponse(
-                {
-                    "error": str(exc),
-                    "status": "failed",
-                    "request": request_summary,
-                },
+                {"error": str(exc), "status": "failed", "request": request_summary},
                 status_code=500,
             )
 
@@ -588,6 +618,7 @@ class StarletteGatewayServer:
                 Route("/session-stats", self.session_stats, methods=["GET"]),
                 Route("/v1/models", self.list_models, methods=["GET"]),
                 Route("/v1/completions", self.handle_completions, methods=["POST"]),
+                Route("/v1/chat/completions", self.handle_chat_completions, methods=["POST"]),
                 Route("/classify", self.handle_classify, methods=["POST"]),
                 Route("/python", self.handle_python, methods=["POST"]),
                 Route("/terminal", self.handle_terminal, methods=["POST"]),
