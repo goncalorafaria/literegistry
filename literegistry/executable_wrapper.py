@@ -55,6 +55,8 @@ class ExecutableWrapper(ABC):
 
         self.process = None
         self.should_run = True
+        self._registered = False
+        self._registration_metadata: dict[str, object] = {}
 
     @abstractmethod
     def get_server_command(self) -> list:
@@ -156,21 +158,17 @@ class ExecutableWrapper(ABC):
         )
         print(f"Started {self.get_server_name()} server with PID {self.process.pid}")
 
-        # Register server with metadata
-        metadata = {
+        # Keep registration metadata ready, but do not publish the endpoint
+        # until the backend answers /v1/models. vLLM can take minutes to
+        # compile; advertising during that period creates dead routes.
+        self._registration_metadata = {
             "model_path": self.model,
             "host": self.host,
             "port": self.port,
             "backend": self.get_server_name().lower(),  # "vllm" or "sglang"
             "extra_kwargs": self.extra_kwargs,
         }
-        metadata.update(self.runtime.metadata())
-
-        asyncio.run(
-            self.registry.register_server(
-                url=self.url, port=self.port, metadata=metadata
-            )
-        )
+        self._registration_metadata.update(self.runtime.metadata())
 
     def check_health(self):
         """Check if server is responding"""
@@ -184,7 +182,18 @@ class ExecutableWrapper(ABC):
         """Run heartbeat in a loop"""
         while self.should_run:
             if self.check_health():
-                asyncio.run(self.registry.heartbeat(self.url, self.port))
+                if not self._registered:
+                    asyncio.run(
+                        self.registry.register_server(
+                            url=self.url,
+                            port=self.port,
+                            metadata=self._registration_metadata,
+                        )
+                    )
+                    self._registered = True
+                    print("Server healthy and registered")
+                else:
+                    asyncio.run(self.registry.heartbeat(self.url, self.port))
                 # print("Heartbeat sent. Status: healthy")
             else:
                 print("Server unhealthy!")
@@ -193,7 +202,8 @@ class ExecutableWrapper(ABC):
     def cleanup(self):
         """Clean up resources"""
         self.should_run = False
-        asyncio.run(self.registry.deregister())
+        if self._registered:
+            asyncio.run(self.registry.deregister())
         if self.process:
             self.process.terminate()
             self.process.wait()

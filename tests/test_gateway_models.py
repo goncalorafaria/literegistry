@@ -159,7 +159,7 @@ def test_gateway_routes_terminal_pipeline_to_terminal_workers():
     assert captured["retry_budget_seconds"] == 10
 
 
-def test_gateway_routes_search_to_search_workers():
+def test_gateway_routes_search_to_selected_workers_and_strips_selector():
     registry = FakeRegistry()
     server = StarletteGatewayServer(
         registry,
@@ -188,7 +188,7 @@ def test_gateway_routes_search_to_search_workers():
     async def receive():
         return {
             "type": "http.request",
-            "body": b'{"mode": "query", "query": "distributed inference"}',
+            "body": b'{"mode": "query", "query": "distributed inference", "model_path": "localsearch:bc-v2-72k"}',
             "more_body": False,
         }
 
@@ -197,8 +197,48 @@ def test_gateway_routes_search_to_search_workers():
         response = asyncio.run(server.handle_search(request))
 
     assert response.status_code == 200
-    assert captured["model"] == "search"
+    assert captured["model"] == "localsearch:bc-v2-72k"
     assert captured["endpoint"] == "search"
+    assert captured["payload"] == {"mode": "query", "query": "distributed inference"}
     assert captured["timeout"] == 70
     assert captured["max_retries"] == 3
     assert captured["retry_budget_seconds"] == 71
+
+
+def test_gateway_routes_search_to_hosted_pool_without_selector():
+    registry = FakeRegistry()
+    server = StarletteGatewayServer(registry)
+    captured = {}
+
+    class FakeClient:
+        def __init__(self, registry, model, **kwargs):
+            captured["model"] = model
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def request_with_rotation(self, endpoint, payload):
+            captured["endpoint"] = endpoint
+            captured["payload"] = payload
+            return {"success": True, "data": {"results": []}}, 0
+
+    async def receive():
+        return {
+            "type": "http.request",
+            "body": b'{"mode": "query", "query": "hosted search"}',
+            "more_body": False,
+        }
+
+    request = Request({"type": "http", "method": "POST", "headers": []}, receive)
+    with patch("literegistry.gateway.RegistryHTTPClient", FakeClient):
+        response = asyncio.run(server.handle_search(request))
+
+    assert response.status_code == 200
+    assert captured == {
+        "model": "search",
+        "endpoint": "search",
+        "payload": {"mode": "query", "query": "hosted search"},
+    }

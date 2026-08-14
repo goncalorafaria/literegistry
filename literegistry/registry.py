@@ -1,6 +1,7 @@
 import json
 import socket
 import time
+from uuid import uuid4
 from collections import deque
 from typing import Optional, Dict, List, Any
 import asyncio
@@ -19,7 +20,11 @@ class ServerRegistry:
             max_history: Maximum number of requests to keep in history
         """
         self.store = store
-        self.server_id = f"{socket.gethostname()}-{time.time()}"[:20]
+        # This value is the key used for registration and deregistration.  Do
+        # not truncate a hostname/time string: co-located Beaker replicas have
+        # the same hostname, so truncation discarded the distinguishing time
+        # suffix and made replicas overwrite/deregister each other.
+        self.server_id = f"{socket.gethostname()}-{uuid4().hex}"
         self.request_timestamps = deque(maxlen=max_history)
         self._metadata = {}  # Store metadata for re-registration if needed
         self.max_heartbeat_interval = max_heartbeat_interval

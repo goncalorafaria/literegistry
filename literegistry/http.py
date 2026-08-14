@@ -19,7 +19,15 @@ class HTTPResponseError(RuntimeError):
         self.status = status
         self.body = body
         self.url = url
-        message = body.get("detail") if isinstance(body, dict) else body
+        if isinstance(body, dict):
+            message = (
+                body.get("detail")
+                or body.get("error")
+                or body.get("message")
+                or body
+            )
+        else:
+            message = body
         if isinstance(message, dict):
             message = message.get("error") or message.get("message") or str(message)
         super().__init__(f"HTTP {status} from {url}: {message}")

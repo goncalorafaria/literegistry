@@ -342,8 +342,14 @@ class StarletteGatewayServer:
                 self.logger.error(f"Completion error: {e} : {json.dumps(payload, indent=4)} - duration: {duration:.3f}s")
             else:
                 self.logger.error(f"Completion error: {e} - duration: {duration:.3f}s")
-                
-                
+
+            if isinstance(e, HTTPResponseError):
+                await self._record_request_and_log_stats(model_name, duration)
+                upstream_body = e.body
+                if not isinstance(upstream_body, (dict, list)):
+                    upstream_body = {"error": str(upstream_body)}
+                return JSONResponse(upstream_body, status_code=e.status)
+
             await self._record_request_and_log_stats(model_name, duration)
             return JSONResponse({
                 "error": str(e),
@@ -544,12 +550,26 @@ class StarletteGatewayServer:
             )
 
     async def handle_search(self, request: Request):
-        """Route query and direct-URL requests to ``model_path="search"`` workers."""
+        """Route search requests to a selected search-worker pool.
+
+        ``model_path`` is an optional gateway-only selector. Omit it to keep
+        the historical hosted ``search`` pool; set it to a local pool such as
+        ``localsearch:bc-v2-72k`` to query that corpus instead. The selector
+        is removed before forwarding the request to the search worker.
+        """
         start_time = time.time()
         payload = None
         model = "search"
         try:
             payload = await request.json()
+            if not isinstance(payload, dict):
+                return JSONResponse({"error": "JSON object required"}, status_code=400)
+            model = payload.pop("model_path", "search")
+            if not isinstance(model, str) or not model:
+                return JSONResponse(
+                    {"error": "model_path must be a non-empty string"},
+                    status_code=400,
+                )
             await self._record_request_type(model)
             if payload.get("mode") not in {"query", "url"}:
                 return JSONResponse(
@@ -798,12 +818,12 @@ def create_app():
         # Fallback error app
         app = Starlette()
         
-        @app.route("/{path:path}")
         async def error_handler(request):
             return JSONResponse({
                 "error": f"App creation failed: {e}",
                 "status": "failed"
             }, status_code=500)
+        app.add_route("/{path:path}", error_handler)
         
         return app
 

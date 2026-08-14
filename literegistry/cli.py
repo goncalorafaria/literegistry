@@ -6,6 +6,7 @@ from literegistry import RegistryClient, get_kvstore
 import fire
 import literegistry.redis as redis
 import literegistry.gateway as gateway
+import literegistry.openai_proxy as openai_proxy
 import literegistry.vllm_wrapper as vllm
 import literegistry.sglang_wrapper as sglang
 import literegistry.code_server as code_server
@@ -64,6 +65,7 @@ def main():
         "summary": check_summary,
         "redis": redis.main,
         "gateway": gateway.main,
+        "openai-proxy": openai_proxy.main,
         "vllm": vllm.main,
         "sglang": sglang.main,
         "detail": check_detail,
