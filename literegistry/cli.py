@@ -6,12 +6,16 @@ from literegistry import RegistryClient, get_kvstore
 import fire
 import literegistry.redis as redis
 import literegistry.gateway as gateway
-import literegistry.openai_proxy as openai_proxy
-import literegistry.vllm_wrapper as vllm
-import literegistry.sglang_wrapper as sglang
-import literegistry.code_server as code_server
-import literegistry.terminal_server as terminal_server
-import literegistry.search_server as search_server
+import literegistry.gateway.legacy as old_gateway
+import literegistry.services.openai_proxy as openai_proxy
+import literegistry.services.vllm_wrapper as vllm
+import literegistry.services.sglang_wrapper as sglang
+import literegistry.services.code_server as code_server
+import literegistry.services.terminal_server as terminal_server
+import literegistry.services.search_server as search_server
+import literegistry.services.bm25_server as bm25_server
+import literegistry.services.podman_server as podman_server
+import literegistry.services.docker_mirror_server as docker_mirror_server
 import literegistry.console.launcher as console_launcher
     
 def check_registry(verbose=False, registry_dir="/gscratch/ark/graf/registry"):
@@ -65,6 +69,9 @@ def main():
         "summary": check_summary,
         "redis": redis.main,
         "gateway": gateway.main,
+        "old-gateway": old_gateway.main,
+        "podman": podman_server.main,
+        "docker-mirror": docker_mirror_server.main,
         "openai-proxy": openai_proxy.main,
         "vllm": vllm.main,
         "sglang": sglang.main,
@@ -72,6 +79,7 @@ def main():
         "code": code_server.main,
         "terminal": terminal_server.main,
         "search": search_server.main,
+        "bm25": bm25_server.main,
         "console": console_launcher.main,
     })
 

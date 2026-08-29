@@ -1,0 +1,35 @@
+FROM rust:1.83-bookworm AS xsv-builder
+
+RUN cargo install xsv --version 0.13.0 --locked --root /opt/xsv
+
+FROM python:3.12-slim-bookworm
+
+ARG PIP_INDEX_URL
+ARG PIP_FIND_LINKS
+ARG PIP_TRUSTED_HOST
+
+ENV VIRTUAL_ENV=/opt/literegistry-terminal-venv \
+    PATH=/opt/literegistry-terminal-venv/bin:/opt/terminal-tools:$PATH \
+    PYTHONUNBUFFERED=1 \
+    OTEL_TRACES_EXPORTER=none
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        ca-certificates coreutils gawk grep jq pandoc ripgrep sed \
+    && rm -rf /var/lib/apt/lists/* \
+    && python -m venv "$VIRTUAL_ENV" \
+    && pip install --no-cache-dir --upgrade pip setuptools wheel \
+    && useradd --create-home --uid 10001 terminal \
+    && install -d -o terminal -g terminal /opt/terminal-tools
+
+COPY --from=xsv-builder /opt/xsv/bin/xsv /opt/terminal-tools/xsv
+COPY . /opt/literegistry-base-deployment
+RUN pip install --no-cache-dir /opt/literegistry-base-deployment \
+    && rm -rf /opt/literegistry-base-deployment \
+    && command -v rg grep awk sed jq xsv pandoc sort uniq head tail wc cat nl echo tr cut
+
+USER terminal
+EXPOSE 1213
+
+ENTRYPOINT ["literegistry", "terminal"]
+CMD ["--host=0.0.0.0", "--port=1213"]

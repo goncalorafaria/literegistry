@@ -60,8 +60,11 @@ nav:
   - CLI: cli.md
   - Registry: registry.md
   - Gateway: gateway.md
+  - Package layout: package-layout.md
   - vLLM & SGLang: vllm-sglang.md
   - Code & Terminal: code-and-terminal.md
+  - Podman: podman.md
+  - Docker mirror: docker-mirror.md
   - Load balancing: load-balancing.md
   - Runtimes: runtimes.md
   - Console: console.md

@@ -1,0 +1,17 @@
+ARG VLLM_BASE_IMAGE=vllm/vllm-openai:latest
+FROM ${VLLM_BASE_IMAGE}
+
+ARG PIP_INDEX_URL
+ARG PIP_FIND_LINKS
+ARG PIP_TRUSTED_HOST
+
+ENV PYTHONUNBUFFERED=1 \
+    OTEL_TRACES_EXPORTER=none
+
+USER root
+COPY . /opt/literegistry-base-deployment
+RUN python3 -m pip install --no-cache-dir /opt/literegistry-base-deployment \
+    && rm -rf /opt/literegistry-base-deployment
+
+ENTRYPOINT ["literegistry", "vllm"]
+CMD ["--runtime=local", "--help"]

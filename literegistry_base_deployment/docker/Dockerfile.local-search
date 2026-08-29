@@ -1,0 +1,43 @@
+# Lucene image using the canonical JTC index assets and LiteRegistry BM25 service.
+#
+# Build context: the root of a JTC checkout containing search/.
+# Example:
+#   docker build -f literegistry_base_deployment/docker/Dockerfile.local-search \
+#     -t goncalof/jtc-local-search-lucene-bm25 /weka/gfaria/jtc
+
+# Pyserini 2.3.0 targets Python 3.12 and Java 21.
+FROM eclipse-temurin:21-jdk-jammy AS java
+
+FROM python:3.12-slim-bookworm
+
+ARG PIP_INDEX_URL
+ARG PIP_FIND_LINKS
+ARG PIP_TRUSTED_HOST
+ARG LITEREGISTRY_VERSION=1.0.36
+
+COPY --from=java /opt/java/openjdk /opt/java/openjdk
+ENV JAVA_HOME=/opt/java/openjdk \
+    PATH=/opt/java/openjdk/bin:$PATH \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir \
+    "fastapi" \
+    "uvicorn[standard]" \
+    "pyserini==2.3.0"
+
+# Install the first LiteRegistry release that owns the BM25 service. Install it
+# without dependency pins because FastAPI, Redis, Fire, and Pyserini are explicit.
+RUN pip install --no-cache-dir redis fire \
+    && pip install --no-cache-dir --no-deps "literegistry==${LITEREGISTRY_VERSION}"
+
+WORKDIR /app
+COPY search /app/search
+
+EXPOSE 8000 1214
+CMD ["python", "-m", "literegistry.services.bm25_server", "--port", "8000"]

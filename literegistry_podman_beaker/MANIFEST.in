@@ -1,0 +1,5 @@
+include LICENSE
+include README.md
+recursive-include docker Dockerfile.* *.sh *.txt
+recursive-include src/literegistry_podman_beaker/assets *.txt
+recursive-include scripts *.sh

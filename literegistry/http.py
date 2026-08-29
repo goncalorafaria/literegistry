@@ -175,6 +175,16 @@ class RegistryHTTPClient:
             logger.error(f"HTTP request failed to {server}/{endpoint}: {e}")
             raise
 
+    async def request_server(
+        self,
+        server: str,
+        endpoint: str,
+        payload: Dict,
+    ) -> Dict:
+        """Send one request to an exact server, bypassing discovery and rotation."""
+        return await self._make_http_request(server, endpoint, payload)
+
+
     async def request_with_rotation(
         self,
         endpoint: str,
@@ -257,10 +267,15 @@ class RegistryHTTPClient:
                 # Invalid requests cannot be fixed by sending the same
                 # request to another replica. Preserve the worker's useful
                 # structured response instead of returning a retry summary.
-                if isinstance(e, HTTPResponseError) and e.status not in {408, 425, 429}:
+                backend_model_not_found = (
+                    isinstance(e, HTTPResponseError)
+                    and e.status == 404
+                    and "does not exist" in str(e).lower()
+                )
+                if isinstance(e, HTTPResponseError) and e.status not in {408, 425, 429} and not backend_model_not_found:
                     raise
                 attempt += 1
-                if is_python_request and server != "<unselected>":
+                if (is_python_request or backend_model_not_found) and server != "<unselected>":
                     failed_servers.add(server)
 
                 # Report failed request latency

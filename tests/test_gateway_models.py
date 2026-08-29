@@ -3,7 +3,7 @@ import json
 from unittest.mock import patch
 
 from starlette.requests import Request
-from literegistry.gateway import StarletteGatewayServer
+from literegistry.gateway.legacy import StarletteGatewayServer
 
 
 class FakeRegistry:
@@ -59,7 +59,7 @@ def test_gateway_uses_dedicated_python_retry_policy():
         }
 
     request = Request({"type": "http", "method": "POST", "headers": []}, receive)
-    with patch("literegistry.gateway.RegistryHTTPClient", FakeClient):
+    with patch("literegistry.gateway.legacy.RegistryHTTPClient", FakeClient):
         response = asyncio.run(server.handle_python(request))
 
     assert response.status_code == 200
@@ -105,7 +105,7 @@ def test_gateway_routes_chat_completions_to_matching_model():
         }
 
     request = Request({"type": "http", "method": "POST", "headers": []}, receive)
-    with patch("literegistry.gateway.RegistryHTTPClient", FakeClient):
+    with patch("literegistry.gateway.legacy.RegistryHTTPClient", FakeClient):
         response = asyncio.run(server.handle_chat_completions(request))
 
     assert response.status_code == 200
@@ -148,7 +148,7 @@ def test_gateway_routes_terminal_pipeline_to_terminal_workers():
         }
 
     request = Request({"type": "http", "method": "POST", "headers": []}, receive)
-    with patch("literegistry.gateway.RegistryHTTPClient", FakeClient):
+    with patch("literegistry.gateway.legacy.RegistryHTTPClient", FakeClient):
         response = asyncio.run(server.handle_terminal(request))
 
     assert response.status_code == 200
@@ -193,7 +193,7 @@ def test_gateway_routes_search_to_selected_workers_and_strips_selector():
         }
 
     request = Request({"type": "http", "method": "POST", "headers": []}, receive)
-    with patch("literegistry.gateway.RegistryHTTPClient", FakeClient):
+    with patch("literegistry.gateway.legacy.RegistryHTTPClient", FakeClient):
         response = asyncio.run(server.handle_search(request))
 
     assert response.status_code == 200
@@ -233,7 +233,7 @@ def test_gateway_routes_search_to_hosted_pool_without_selector():
         }
 
     request = Request({"type": "http", "method": "POST", "headers": []}, receive)
-    with patch("literegistry.gateway.RegistryHTTPClient", FakeClient):
+    with patch("literegistry.gateway.legacy.RegistryHTTPClient", FakeClient):
         response = asyncio.run(server.handle_search(request))
 
     assert response.status_code == 200

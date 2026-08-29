@@ -1,0 +1,281 @@
+import asyncio
+import json
+
+import os
+from unittest.mock import patch
+from starlette.requests import Request
+
+from literegistry.gateway import (
+    GatewayConfig,
+    Gateway,
+    LoadBalancedRouting,
+    ProxyRoute,
+    RetryConfig,
+    RoutingResponse,
+    fixed_service,
+    main,
+)
+
+
+class FakeRegistry:
+    store = object()
+
+    def __init__(self):
+        self.calls = []
+
+    async def models(self, force=False):
+        self.calls.append(force)
+        return {"model-a": [{"uri": "http://worker-a"}]}
+
+
+class RecordingRouting:
+    def __init__(self, body=None):
+        self.requests = []
+        self.body = body or {"success": True}
+
+    async def forward(self, request):
+        self.requests.append(request)
+        return RoutingResponse(self.body, server_index=0)
+
+
+def make_request(payload):
+    body = json.dumps(payload).encode("utf-8")
+
+    async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/",
+            "headers": [(b"x-request-id", b"request-1")],
+        },
+        receive,
+    )
+
+
+def test_proxy_route_runs_shared_forwarding_pipeline():
+    routing = RecordingRouting({"answer": 42})
+    config = GatewayConfig(
+        retry={"default": RetryConfig(timeout=7, max_retries=4)}
+    )
+    route = ProxyRoute(
+        path="/tools/execute",
+        upstream_endpoint="execute",
+        prepare=fixed_service("tool-server", "input"),
+        name="tool_execute",
+    )
+    gateway = Gateway(
+        FakeRegistry(),
+        config=config,
+        routes=[route],
+        routing=routing,
+    )
+
+    response = asyncio.run(
+        gateway.handle_proxy(make_request({"input": "hello"}), route)
+    )
+
+    assert response.status_code == 200
+    assert json.loads(response.body) == {"answer": 42}
+    assert len(routing.requests) == 1
+    forwarded = routing.requests[0]
+    assert forwarded.service == "tool-server"
+    assert forwarded.endpoint == "execute"
+    assert forwarded.payload == {"input": "hello"}
+    assert forwarded.retry.timeout == 7
+    assert forwarded.retry.max_retries == 4
+    assert forwarded.headers["x-request-id"] == "request-1"
+
+
+def test_default_search_route_strips_gateway_pool_selector():
+    routing = RecordingRouting()
+    gateway = Gateway(FakeRegistry(), routing=routing)
+    route = next(route for route in gateway.proxy_routes if route.path == "/search")
+
+    response = asyncio.run(
+        gateway.handle_proxy(
+            make_request(
+                {
+                    "mode": "query",
+                    "query": "affinity routing",
+                    "model_path": "localsearch:docs",
+                }
+            ),
+            route,
+        )
+    )
+
+    assert response.status_code == 200
+    forwarded = routing.requests[0]
+    assert forwarded.service == "localsearch:docs"
+    assert forwarded.endpoint == "search"
+    assert forwarded.payload == {
+        "mode": "query",
+        "query": "affinity routing",
+    }
+    assert forwarded.retry.timeout == 65
+    assert forwarded.retry.max_retries == 2
+
+
+def test_load_balanced_routing_adapts_registry_http_client():
+    captured = {}
+
+    class FakeClient:
+        def __init__(self, registry, service, **kwargs):
+            captured["registry"] = registry
+            captured["service"] = service
+            captured["kwargs"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def request_with_rotation(self, endpoint, payload):
+            captured["endpoint"] = endpoint
+            captured["payload"] = payload
+            return {"ok": True}, 3
+
+    registry = FakeRegistry()
+    routing = LoadBalancedRouting(registry, client_factory=FakeClient)
+    config = GatewayConfig().retry_config("python")
+
+    from literegistry.gateway import RoutingRequest
+
+    result = asyncio.run(
+        routing.forward(
+            RoutingRequest(
+                service="python",
+                endpoint="python",
+                payload={"code": "1 + 1"},
+                retry=config,
+            )
+        )
+    )
+
+    assert result.body == {"ok": True}
+    assert result.server_index == 3
+    assert captured["registry"] is registry
+    assert captured["service"] == "python"
+    assert captured["endpoint"] == "python"
+    assert captured["payload"] == {"code": "1 + 1"}
+    assert captured["kwargs"] == {
+        "timeout": 20,
+        "connect_timeout": 3,
+        "max_retries": 3,
+        "retry_budget_seconds": 20,
+        "retry_backoff_seconds": 0.1,
+        "use_shared_session": True,
+    }
+
+
+def test_gateway_exposes_management_and_declarative_proxy_routes():
+    gateway = Gateway(FakeRegistry(), routing=RecordingRouting())
+    paths = {route.path for route in gateway.app.routes}
+
+    assert {
+        "/health",
+        "/session-stats",
+        "/gateway-stats",
+        "/v1/models",
+        "/v1/completions",
+        "/v1/chat/completions",
+        "/classify",
+        "/python",
+        "/terminal",
+        "/search",
+        "/affinity/handshake",
+        "/affinity/kv/put",
+        "/affinity/kv/get",
+        "/affinity/podman",
+        "/affinity/close",
+    } == paths
+
+
+def test_gateway_model_list_still_forces_registry_refresh():
+    registry = FakeRegistry()
+    gateway = Gateway(registry, routing=RecordingRouting())
+
+    response = asyncio.run(gateway.list_models(None))
+
+    assert registry.calls == [True]
+    assert json.loads(response.body)["models"] == ["model-a"]
+
+
+def test_duplicate_or_unknown_route_configuration_fails_at_startup():
+    duplicate = ProxyRoute("/health", "health", fixed_service("service"))
+    try:
+        Gateway(FakeRegistry(), routes=[duplicate], routing=RecordingRouting())
+    except ValueError as exc:
+        assert "duplicate gateway route" in str(exc)
+    else:
+        raise AssertionError("management route collision should fail")
+
+    unknown_retry = ProxyRoute(
+        "/custom",
+        "custom",
+        fixed_service("service"),
+        retry="missing",
+    )
+    try:
+        Gateway(FakeRegistry(), routes=[unknown_retry], routing=RecordingRouting())
+    except ValueError as exc:
+        assert "unknown retry configuration" in str(exc)
+    else:
+        raise AssertionError("unknown retry configuration should fail")
+
+
+def test_main_runs_single_worker_with_an_app_object():
+    app = object()
+    with patch("literegistry.gateway.create_app", return_value=app) as create:
+        with patch("literegistry.gateway.uvicorn.run") as run:
+            main(
+                registry="redis://registry.example:6379",
+                host="127.0.0.1",
+                port=9090,
+                access_log=True,
+            )
+
+    create.assert_called_once()
+    args, kwargs = run.call_args
+    assert args == (app,)
+    assert kwargs == {
+        "host": "127.0.0.1",
+        "port": 9090,
+        "workers": 1,
+        "factory": False,
+        "log_level": "info",
+        "access_log": True,
+        "reload": False,
+    }
+
+
+def test_main_uses_uvicorn_factory_for_multiple_workers():
+    with patch("literegistry.gateway.create_app") as create:
+        with patch("literegistry.gateway.uvicorn.run") as run:
+            main(
+                registry="redis://registry.example:6380",
+                host="0.0.0.0",
+                port=8081,
+                workers=3,
+                log_level="warning",
+            )
+
+    create.assert_not_called()
+    args, kwargs = run.call_args
+    assert args == ("literegistry.gateway:create_app",)
+    assert kwargs == {
+        "host": "0.0.0.0",
+        "port": 8081,
+        "workers": 3,
+        "factory": True,
+        "log_level": "warning",
+        "access_log": False,
+        "reload": False,
+    }
+    assert os.environ["REGISTRY_PATH"] == "redis://registry.example:6380"
+    assert os.environ["HOST"] == "0.0.0.0"
+    assert os.environ["PORT"] == "8081"

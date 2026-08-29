@@ -4,7 +4,7 @@ from unittest.mock import patch
 import pytest
 from pydantic import ValidationError
 
-from literegistry.search_server import (
+from literegistry.services.search_server import (
     SearchRequest,
     SearchServer,
     SearchServerConfig,
@@ -39,10 +39,12 @@ class FakeCache:
 
 
 class FakeResponse:
-    status = 200
+    def __init__(self, body='{"results": [{"title": "result"}]}', status=200):
+        self.body = body
+        self.status = status
 
     async def text(self):
-        return '{"results": [{"title": "result"}]}'
+        return self.body
 
     async def __aenter__(self):
         return self
@@ -52,12 +54,13 @@ class FakeResponse:
 
 
 class FakeSession:
-    def __init__(self):
+    def __init__(self, response=None):
         self.calls = []
+        self.response = response or FakeResponse()
 
     def post(self, endpoint, **kwargs):
         self.calls.append((endpoint, kwargs))
-        return FakeResponse()
+        return self.response
 
 
 def make_server():
@@ -66,11 +69,12 @@ def make_server():
         provider="generic",
         search_api_url="http://search.example/api",
         fetch_api_url="http://fetch.example/api",
+        jina_api_key="jina-test-key",
     )
     with (
-        patch("literegistry.search_server.get_kvstore"),
-        patch("literegistry.search_server.ServerRegistry", return_value=FakeRegistry()),
-        patch("literegistry.search_server.redis.from_url", return_value=FakeCache()),
+        patch("literegistry.services.search_server.get_kvstore"),
+        patch("literegistry.services.search_server.ServerRegistry", return_value=FakeRegistry()),
+        patch("literegistry.services.search_server.redis.from_url", return_value=FakeCache()),
     ):
         return SearchServer(config)
 
@@ -111,9 +115,11 @@ def test_query_requests_are_cached():
     }
 
 
-def test_url_mode_posts_url_to_fetch_endpoint():
+def test_url_mode_posts_url_to_jina_and_normalizes_response():
     server = make_server()
-    server.session = FakeSession()
+    server.session = FakeSession(
+        FakeResponse('{"data": {"title": "Example", "content": "Page text"}}')
+    )
 
     response = asyncio.run(
         server.execute(SearchRequest(mode="url", url="https://example.com/page"))
@@ -123,6 +129,16 @@ def test_url_mode_posts_url_to_fetch_endpoint():
     endpoint, kwargs = server.session.calls[0]
     assert endpoint == "http://fetch.example/api"
     assert kwargs["json"] == {"url": "https://example.com/page"}
+    assert kwargs["headers"] == {
+        "Accept": "application/json",
+        "Authorization": "Bearer jina-test-key",
+        "X-Return-Format": "markdown",
+    }
+    assert response.data == {
+        "title": "Example",
+        "content": "Page text",
+        "url": "https://example.com/page",
+    }
 
 
 def test_serper_mode_uses_serper_request_fields():

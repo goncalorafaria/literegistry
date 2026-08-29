@@ -1,3 +1,5 @@
+"""Core launch-runtime abstractions for LiteRegistry."""
+
 import os
 import subprocess
 from abc import ABC, abstractmethod

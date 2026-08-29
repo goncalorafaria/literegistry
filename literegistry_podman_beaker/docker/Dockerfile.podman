@@ -1,0 +1,46 @@
+ARG PODMAN_VERSION=v5.8.2
+FROM quay.io/podman/stable:${PODMAN_VERSION}
+
+ARG PIP_INDEX_URL
+ARG PIP_FIND_LINKS
+ARG PIP_TRUSTED_HOST
+
+USER root
+RUN dnf --assumeyes install ca-certificates python3-pip \
+    && dnf clean all \
+    && usermod --uid 10001 podman \
+    && chown -R podman:podman /home/podman \
+    && python3 -m venv /opt/literegistry-podman-venv \
+    && /opt/literegistry-podman-venv/bin/pip install \
+        --no-cache-dir --upgrade pip setuptools wheel
+
+RUN sed -i 's/^podman:.*/podman:100000:65536/' /etc/subuid /etc/subgid
+
+COPY . /opt/literegistry-podman-beaker
+RUN /opt/literegistry-podman-venv/bin/pip install \
+        --no-cache-dir /opt/literegistry-podman-beaker \
+    && rm -rf /opt/literegistry-podman-beaker
+
+COPY docker/rootless-entrypoint.sh /usr/local/bin/literegistry-podman-entrypoint
+RUN chmod 0755 /usr/local/bin/literegistry-podman-entrypoint \
+    && install -d -o podman -g podman \
+        /home/podman/.local/share/containers \
+        /tmp/podman-run-10001
+
+ENV PATH=/opt/literegistry-podman-venv/bin:$PATH \
+    PYTHONUNBUFFERED=1 \
+    HOME=/home/podman \
+    XDG_RUNTIME_DIR=/tmp/podman-run-10001 \
+    PODMAN_AFFINITY_HOST=127.0.0.1 \
+    PODMAN_AFFINITY_PORT=8091 \
+    PODMAN_STORAGE_DRIVER=vfs \
+    OTEL_TRACES_EXPORTER=none
+
+EXPOSE 8091
+RUN sed -i '/^podman:/d' /etc/subuid /etc/subgid \
+    && printf 'podman:100000:65536\n' >> /etc/subuid \
+    && printf 'podman:100000:65536\n' >> /etc/subgid
+
+USER podman
+
+ENTRYPOINT ["/usr/local/bin/literegistry-podman-entrypoint"]

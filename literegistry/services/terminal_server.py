@@ -1,0 +1,1150 @@
+"""Restricted, stdin-only terminal pipelines for local log analysis.
+
+This service deliberately does not implement a shell.  It accepts a sequence
+of allowlisted commands joined by ``|`` and executes every stage directly with
+stdin from the preceding stage.  Submitted contents are never written to a
+user-named path and commands cannot access host paths through this API.
+"""
+
+import asyncio
+import logging
+import os
+import re
+import shlex
+import shutil
+import signal
+import socket
+import tempfile
+import time
+from dataclasses import dataclass
+from typing import Any
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from literegistry import ServerRegistry, get_kvstore
+from pydantic import BaseModel, Field
+from starlette.responses import JSONResponse
+
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+_ALLOWED_COMMANDS = frozenset(
+    {
+        "rg", "grep", "awk", "sed", "jq", "xsv", "pandoc", "sort", "uniq",
+        "head", "tail", "wc", "cat", "nl", "echo", "tr", "cut",
+    }
+)
+_CONTROL_TOKENS = frozenset({";", "&&", "||", "&", "(", ")", "<", ">", ">>", "2>", "2>>"})
+_MAX_STAGES = 8
+_QUOTED_PIPE_SENTINEL = "\ue000"
+_QUOTED_LESS_THAN_SENTINEL = "\ue001"
+_QUOTED_GREATER_THAN_SENTINEL = "\ue002"
+_QUOTED_SEMICOLON_SENTINEL = "\ue003"
+
+
+class PipelineValidationError(ValueError):
+    """Raised when a submitted pipeline falls outside the supported language."""
+
+
+class PipelineLimitError(RuntimeError):
+    """Raised when a pipeline exceeds its configured resource limit."""
+
+
+class TerminalRequest(BaseModel):
+    contents: str = Field(..., max_length=2 * 1024 * 1024)
+    command: str = Field(..., min_length=1, max_length=16 * 1024)
+    max_runtime: float = Field(default=5.0, ge=0.01, le=60)
+    truncation: int | None = Field(default=None, ge=1)
+
+
+class TerminalResponse(BaseModel):
+    stdout: str
+    stderr: str = ""
+    success: bool
+    exit_code: int | None = None
+    execution_time: float
+    truncated: bool = False
+    truncated_characters: int = 0
+
+
+@dataclass
+class TerminalServerConfig:
+    host: str = "0.0.0.0"
+    port: int = 1213
+    registry: str = "redis://klone-login01.hyak.local:6379"
+    heartbeat_interval: int = 30
+    max_output_bytes: int = 1024 * 1024
+    max_stderr_bytes: int = 64 * 1024
+    max_response_chars: int | None = None
+    command_path: str | None = None
+
+
+def _reject_path(value: str) -> None:
+    if value.startswith("/") or value.startswith("~") or ".." in value:
+        raise PipelineValidationError("file paths are not permitted; all commands read stdin")
+
+
+def _validate_pattern_command(command: str, args: list[str]) -> None:
+    allowed = {
+        "rg": {
+            "-i", "--ignore-case", "-v", "--invert-match", "-n", "--line-number",
+            "-c", "--count", "-F", "--fixed-strings", "-e", "--regexp",
+            "-m", "--max-count", "-A", "--after-context", "-B", "--before-context",
+            "-C", "--context", "-w", "--word-regexp", "-x", "--line-regexp",
+            "-o", "--only-matching", "-a", "--text", "-I", "--binary",
+            "-s", "--no-messages", "--color", "-P", "--pcre2", "-U",
+            "--multiline",
+        },
+        "grep": {
+            "-i", "--ignore-case", "-v", "--invert-match", "-n", "--line-number",
+            "-c", "--count", "-F", "--fixed-strings", "-E", "-G", "-e",
+            "--regexp", "-m", "--max-count", "-A", "--after-context", "-B",
+            "--before-context", "-C", "--context", "-w", "--word-regexp", "-x",
+            "--line-regexp", "-o", "--only-matching", "-q", "--quiet", "-s",
+            "--no-messages", "-a", "--text", "-I", "-z", "--null-data", "-b",
+            "--byte-offset", "-H", "--with-filename", "-h", "--no-filename",
+            "--color", "-P", "--perl-regexp",
+        },
+    }[command]
+    takes_value = {
+        "-e", "--regexp", "-m", "--max-count", "-A", "--after-context", "-B",
+        "--before-context", "-C", "--context", "--color",
+    }
+    attached_value_prefixes = {"-m", "-A", "-B", "-C"}
+    pattern_count = 0
+    index = 0
+    options_ended = False
+    while index < len(args):
+        arg = args[index]
+        if arg == "-":
+            index += 1
+            continue
+        if arg == "--" and not options_ended:
+            options_ended = True
+        elif arg.startswith("-") and not options_ended:
+            if (
+                len(arg) > 2
+                and arg[:2] in attached_value_prefixes
+                and arg[2:].isdigit()
+            ):
+                index += 1
+                continue
+            if any(arg.startswith(f"{option}=") for option in takes_value if option.startswith("--")):
+                index += 1
+                continue
+            if arg not in allowed:
+                raise PipelineValidationError(f"{command} option {arg!r} is not permitted")
+            if arg in takes_value:
+                index += 1
+                if index >= len(args):
+                    raise PipelineValidationError(f"{command} option {arg!r} needs a value")
+        else:
+            _reject_path(arg)
+            pattern_count += 1
+        index += 1
+    if pattern_count > 1:
+        raise PipelineValidationError(f"{command} accepts a pattern but no file paths")
+
+
+def _normalize_pattern_args(command: str, args: list[str]) -> list[str]:
+    """Expand safe short-option bundles without consuming pattern operands."""
+    value_free_flags = {
+        "rg": set("ivncFwxoaIsPU"),
+        "grep": set("ivncFEGwxoqsaIzbHhP"),
+    }[command]
+    value_flags = set("mABC")
+    normalized: list[str] = []
+    for arg in args:
+        if not arg.startswith("-") or arg.startswith("--") or len(arg) <= 2:
+            normalized.append(arg)
+            continue
+        body = arg[1:]
+        parts: list[str] = []
+        index = 0
+        valid_bundle = True
+        while index < len(body):
+            flag = body[index]
+            if flag in value_free_flags:
+                parts.append(f"-{flag}")
+                index += 1
+                continue
+            if flag in value_flags:
+                attached_value = body[index + 1 :]
+                if attached_value and not attached_value.isdigit():
+                    valid_bundle = False
+                    break
+                parts.append(f"-{flag}{attached_value}")
+                index = len(body)
+                continue
+            valid_bundle = False
+            break
+        if valid_bundle and len(parts) > 1:
+            normalized.extend(parts)
+        else:
+            normalized.append(arg)
+    return normalized
+
+
+def _mask_awk_string_literals(program: str) -> str:
+    """Mask string contents so literal pipes are not mistaken for redirection."""
+    result: list[str] = []
+    in_string = False
+    escaped = False
+    for character in program:
+        if escaped:
+            result.append(" " if in_string else character)
+            escaped = False
+        elif in_string and character == "\\":
+            result.append(" ")
+            escaped = True
+        elif character == '"':
+            in_string = not in_string
+            result.append(character)
+        elif in_string:
+            result.append(" ")
+        else:
+            result.append(character)
+    return "".join(result)
+
+
+def _validate_awk(args: list[str]) -> None:
+    program: str | None = None
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in {"-F", "-v"}:
+            index += 1
+            if index >= len(args):
+                raise PipelineValidationError(f"awk option {arg!r} needs a value")
+        elif arg.startswith("-F") and len(arg) > 2:
+            pass
+        elif arg.startswith("-"):
+            raise PipelineValidationError(f"awk option {arg!r} is not permitted")
+        elif program is None:
+            program = arg
+        else:
+            raise PipelineValidationError("awk accepts a program but no input file paths")
+        index += 1
+    if not program:
+        raise PipelineValidationError("awk requires a program")
+    masked_program = _mask_awk_string_literals(program)
+    lowered = masked_program.lower()
+    if any(token in lowered for token in ("system(", "getline", "@include")):
+        raise PipelineValidationError("awk program uses unsupported process or file I/O")
+    if re.search(r"\b(?:print|printf)\b[^;\n]*(?:\||>>?)", masked_program):
+        raise PipelineValidationError("awk program uses unsupported process or file I/O")
+
+
+def _validate_sed(args: list[str]) -> None:
+    scripts: list[str] = []
+    positional_script_seen = False
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in {"-n", "-E", "-r"} or (
+            arg.startswith("-")
+            and len(arg) > 2
+            and set(arg[1:]).issubset({"n", "E", "r"})
+        ):
+            index += 1
+            continue
+        if arg == "-e":
+            index += 1
+            if index >= len(args):
+                raise PipelineValidationError("sed option '-e' needs a script")
+            scripts.append(args[index])
+            index += 1
+            continue
+        if arg == "-" and scripts:
+            index += 1
+            continue
+        if arg.startswith("-"):
+            raise PipelineValidationError(f"sed option {arg!r} is not permitted")
+        if positional_script_seen or scripts:
+            raise PipelineValidationError("sed requires scripts but no input file paths")
+        scripts.append(arg)
+        positional_script_seen = True
+        index += 1
+    if not scripts:
+        raise PipelineValidationError("sed requires a script and does not accept file paths")
+    for script in scripts:
+        if re.search(r"(?:^|;|/|[0-9$])\s*[erw](?:\s|$)", script) or re.search(
+            r"/[ew](?:\s|$)", script
+        ):
+            raise PipelineValidationError("sed execution and file read/write commands are not permitted")
+
+
+def _validate_jq(args: list[str]) -> None:
+    flags = {"-r", "-c", "-s", "-e", "-R", "--raw-input"}
+    filters = []
+    for arg in args:
+        if arg in flags:
+            continue
+        if arg.startswith("-"):
+            raise PipelineValidationError(f"jq option {arg!r} is not permitted")
+        filters.append(arg)
+    if len(filters) != 1:
+        raise PipelineValidationError("jq requires one filter and does not accept file paths")
+    if any(token in filters[0] for token in ("include", "import", "module")):
+        raise PipelineValidationError("jq module loading is not permitted")
+
+
+def _validate_xsv(args: list[str]) -> None:
+    allowed_subcommands = {"headers", "count", "select", "search", "slice", "stats", "frequency"}
+    if not args or args[0] not in allowed_subcommands:
+        raise PipelineValidationError(
+            "xsv supports only headers, count, select, search, slice, stats, and frequency"
+        )
+    if any(arg.startswith(("--input", "--output", "-o")) for arg in args[1:]):
+        raise PipelineValidationError("xsv file input/output options are not permitted")
+    for arg in args[1:]:
+        _reject_path(arg)
+
+
+def _validate_pandoc(args: list[str]) -> None:
+    """Allow only stdin-to-stdout structural parsing with fixed formats."""
+    allowed_readers = {"markdown", "commonmark", "commonmark_x", "gfm", "html"}
+    allowed_writers = {"json", "native", "plain"}
+    reader: str | None = None
+    writer: str | None = None
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in {"--sandbox", "--strip-comments"}:
+            index += 1
+            continue
+        if arg in {"-f", "--from", "-t", "--to"}:
+            index += 1
+            if index >= len(args):
+                raise PipelineValidationError(f"pandoc option {arg!r} needs a value")
+            value = args[index]
+            if arg in {"-f", "--from"}:
+                if reader is not None:
+                    raise PipelineValidationError("pandoc accepts exactly one input format")
+                reader = value
+            else:
+                if writer is not None:
+                    raise PipelineValidationError("pandoc accepts exactly one output format")
+                writer = value
+            index += 1
+            continue
+        if arg.startswith("--from="):
+            if reader is not None:
+                raise PipelineValidationError("pandoc accepts exactly one input format")
+            reader = arg.split("=", 1)[1]
+            index += 1
+            continue
+        if arg.startswith("--to="):
+            if writer is not None:
+                raise PipelineValidationError("pandoc accepts exactly one output format")
+            writer = arg.split("=", 1)[1]
+            index += 1
+            continue
+        raise PipelineValidationError(
+            f"pandoc option or operand {arg!r} is not permitted; pandoc reads stdin only"
+        )
+    if reader not in allowed_readers:
+        raise PipelineValidationError(
+            f"pandoc input format must be one of {sorted(allowed_readers)}"
+        )
+    if writer not in allowed_writers:
+        raise PipelineValidationError(
+            f"pandoc output format must be one of {sorted(allowed_writers)}"
+        )
+
+
+def _validate_sort(args: list[str]) -> None:
+    """Allow deterministic stdin-only sorting without file or temp-path options."""
+    simple_short_options = set("bdfghMnrsuVz")
+    simple_long_options = {
+        "--ignore-leading-blanks",
+        "--dictionary-order",
+        "--ignore-case",
+        "--general-numeric-sort",
+        "--human-numeric-sort",
+        "--month-sort",
+        "--numeric-sort",
+        "--reverse",
+        "--stable",
+        "--unique",
+        "--version-sort",
+        "--zero-terminated",
+    }
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "-":
+            index += 1
+            continue
+        if arg in simple_long_options:
+            index += 1
+            continue
+        if arg in {"-k", "--key"}:
+            index += 1
+            if index >= len(args) or not re.fullmatch(
+                r"[1-9][0-9]*(?:\.[1-9][0-9]*)?[bdfghinr]*"
+                r"(?:,[1-9][0-9]*(?:\.[1-9][0-9]*)?[bdfghinr]*)?",
+                args[index],
+            ):
+                raise PipelineValidationError("sort key must be a safe field specification")
+            index += 1
+            continue
+        if arg.startswith("--key="):
+            key = arg.split("=", 1)[1]
+            if not re.fullmatch(
+                r"[1-9][0-9]*(?:\.[1-9][0-9]*)?[bdfghinr]*"
+                r"(?:,[1-9][0-9]*(?:\.[1-9][0-9]*)?[bdfghinr]*)?",
+                key,
+            ):
+                raise PipelineValidationError("sort key must be a safe field specification")
+            index += 1
+            continue
+        if arg in {"-t", "--field-separator"}:
+            index += 1
+            if index >= len(args) or len(args[index]) != 1:
+                raise PipelineValidationError("sort field separator must be one character")
+            index += 1
+            continue
+        if arg.startswith("--field-separator="):
+            separator = arg.split("=", 1)[1]
+            if len(separator) != 1:
+                raise PipelineValidationError("sort field separator must be one character")
+            index += 1
+            continue
+        if arg.startswith("-k") and len(arg) > 2:
+            key = arg[2:]
+            if not re.fullmatch(
+                r"[1-9][0-9]*(?:\.[1-9][0-9]*)?[bdfghinr]*"
+                r"(?:,[1-9][0-9]*(?:\.[1-9][0-9]*)?[bdfghinr]*)?",
+                key,
+            ):
+                raise PipelineValidationError("sort key must be a safe field specification")
+            index += 1
+            continue
+        if arg.startswith("-t") and len(arg) == 3:
+            index += 1
+            continue
+        if (
+            arg.startswith("-")
+            and len(arg) > 1
+            and set(arg[1:]).issubset(simple_short_options)
+        ):
+            index += 1
+            continue
+        raise PipelineValidationError(
+            "sort accepts only safe ordering options and stdin; file/output/temp options are not permitted"
+        )
+
+
+def _validate_uniq(args: list[str]) -> None:
+    """Allow stdin-only adjacent duplicate counting and filtering."""
+    simple_short_options = set("cdiuDz")
+    simple_long_options = {
+        "--count",
+        "--repeated",
+        "--all-repeated",
+        "--ignore-case",
+        "--unique",
+        "--zero-terminated",
+    }
+    value_options = {
+        "-f": "--skip-fields",
+        "-s": "--skip-chars",
+        "-w": "--check-chars",
+    }
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "-":
+            index += 1
+            continue
+        if arg in simple_long_options:
+            index += 1
+            continue
+        if arg in value_options or arg in value_options.values():
+            index += 1
+            if index >= len(args) or not args[index].isdigit():
+                raise PipelineValidationError(f"uniq option {arg!r} needs a non-negative integer")
+            index += 1
+            continue
+        if any(arg.startswith(f"{option}=") for option in value_options.values()):
+            value = arg.split("=", 1)[1]
+            if not value.isdigit():
+                raise PipelineValidationError("uniq skip/check counts must be non-negative integers")
+            index += 1
+            continue
+        if (
+            len(arg) > 2
+            and arg[:2] in value_options
+            and arg[2:].isdigit()
+        ):
+            index += 1
+            continue
+        if (
+            arg.startswith("-")
+            and len(arg) > 1
+            and set(arg[1:]).issubset(simple_short_options)
+        ):
+            index += 1
+            continue
+        raise PipelineValidationError(
+            "uniq accepts only safe count/filter options and stdin; file operands are not permitted"
+        )
+
+
+def _validate_head_tail(command: str, args: list[str]) -> None:
+    if not args:
+        return
+    if len(args) == 1 and args[0].startswith("-") and args[0][1:].isdigit():
+        return
+    if (
+        len(args) == 2
+        and args[0] in {"-n", "--lines", "-c", "--bytes"}
+        and args[1].lstrip("+-").isdigit()
+    ):
+        return
+    if (
+        len(args) == 1
+        and args[0].startswith("-c")
+        and args[2:].lstrip("+-").isdigit()
+    ):
+        return
+    raise PipelineValidationError(
+        f"{command} only supports -n/--lines or -c/--bytes with stdin"
+    )
+
+
+def _validate_wc(args: list[str]) -> None:
+    allowed = {
+        "-l", "--lines", "-w", "--words", "-c", "--bytes", "-m", "--chars",
+        "-L", "--max-line-length",
+    }
+    if any(arg not in allowed for arg in args):
+        raise PipelineValidationError("wc supports only count options with stdin")
+
+
+def _validate_cat(args: list[str]) -> None:
+    if args:
+        raise PipelineValidationError("cat accepts no arguments and reads stdin only")
+
+
+def _validate_tr(args: list[str]) -> None:
+    """Allow stdin-to-stdout character translation, deletion, and squeezing."""
+    allowed_short_options = set("cCdst")
+    allowed_long_options = {
+        "--complement",
+        "--delete",
+        "--squeeze-repeats",
+        "--truncate-set1",
+    }
+    sets: list[str] = []
+    delete = False
+    squeeze = False
+    options_ended = False
+    for arg in args:
+        if arg == "--" and not options_ended:
+            options_ended = True
+            continue
+        if not options_ended and arg in allowed_long_options:
+            delete = delete or arg == "--delete"
+            squeeze = squeeze or arg == "--squeeze-repeats"
+            continue
+        if not options_ended and arg.startswith("-") and len(arg) > 1:
+            flags = arg[1:]
+            if not flags or not set(flags).issubset(allowed_short_options):
+                raise PipelineValidationError(f"tr option {arg!r} is not permitted")
+            delete = delete or "d" in flags
+            squeeze = squeeze or "s" in flags
+            continue
+        sets.append(arg)
+
+    if not 1 <= len(sets) <= 2:
+        raise PipelineValidationError("tr requires one or two character sets and reads stdin only")
+    if delete and not squeeze and len(sets) != 1:
+        raise PipelineValidationError("tr --delete requires exactly one character set")
+    if not delete and not squeeze and len(sets) != 2:
+        raise PipelineValidationError("tr translation requires exactly two character sets")
+
+
+def _validate_cut(args: list[str]) -> None:
+    """Allow stdin-only byte, character, or field selection."""
+    selector: str | None = None
+    delimiter_seen = False
+    only_delimited = False
+    stdin_seen = False
+    index = 0
+
+    def validate_list(value: str) -> None:
+        item_pattern = r"(?:[1-9][0-9]*(?:-[1-9][0-9]*)?|[1-9][0-9]*-|-[1-9][0-9]*)"
+        if not value or not re.fullmatch(rf"{item_pattern}(?:,{item_pattern})*", value):
+            raise PipelineValidationError("cut list must contain positive positions or ranges")
+        for item in value.split(","):
+            if item.startswith("-") or item.endswith("-") or "-" not in item:
+                continue
+            start, end = (int(part) for part in item.split("-", 1))
+            if start > end:
+                raise PipelineValidationError("cut range start cannot exceed its end")
+
+    def set_selector(mode: str, value: str) -> None:
+        nonlocal selector
+        if selector is not None:
+            raise PipelineValidationError("cut requires exactly one of bytes, characters, or fields")
+        validate_list(value)
+        selector = mode
+
+    while index < len(args):
+        arg = args[index]
+        if arg == "-":
+            if stdin_seen:
+                raise PipelineValidationError("cut accepts at most one stdin operand")
+            stdin_seen = True
+            index += 1
+            continue
+        if arg in {"-b", "--bytes", "-c", "--characters", "-f", "--fields"}:
+            index += 1
+            if index >= len(args):
+                raise PipelineValidationError(f"cut option {arg!r} needs a list")
+            mode = {
+                "-b": "bytes",
+                "--bytes": "bytes",
+                "-c": "characters",
+                "--characters": "characters",
+                "-f": "fields",
+                "--fields": "fields",
+            }[arg]
+            set_selector(mode, args[index])
+            index += 1
+            continue
+        matched_selector = False
+        for short, long_name in (("-b", "bytes"), ("-c", "characters"), ("-f", "fields")):
+            if arg.startswith(short) and len(arg) > 2:
+                set_selector(long_name, arg[2:])
+                matched_selector = True
+                break
+            long_prefix = f"--{long_name}="
+            if arg.startswith(long_prefix):
+                set_selector(long_name, arg.split("=", 1)[1])
+                matched_selector = True
+                break
+        if matched_selector:
+            index += 1
+            continue
+        if arg in {"-d", "--delimiter"}:
+            index += 1
+            if index >= len(args):
+                raise PipelineValidationError(f"cut option {arg!r} needs a delimiter")
+            delimiter = args[index]
+            if len(delimiter.encode()) != 1:
+                raise PipelineValidationError("cut delimiter must be exactly one byte")
+            delimiter_seen = True
+            index += 1
+            continue
+        if arg.startswith("-d") and len(arg) > 2:
+            delimiter = arg[2:]
+            if len(delimiter.encode()) != 1:
+                raise PipelineValidationError("cut delimiter must be exactly one byte")
+            delimiter_seen = True
+            index += 1
+            continue
+        if arg.startswith("--delimiter="):
+            delimiter = arg.split("=", 1)[1]
+            if len(delimiter.encode()) != 1:
+                raise PipelineValidationError("cut delimiter must be exactly one byte")
+            delimiter_seen = True
+            index += 1
+            continue
+        if arg in {"-s", "--only-delimited"}:
+            only_delimited = True
+            index += 1
+            continue
+        if arg in {"--complement", "-z", "--zero-terminated", "-n"}:
+            index += 1
+            continue
+        if arg == "--output-delimiter":
+            index += 1
+            if index >= len(args):
+                raise PipelineValidationError("cut option '--output-delimiter' needs a value")
+            index += 1
+            continue
+        if arg.startswith("--output-delimiter="):
+            index += 1
+            continue
+        raise PipelineValidationError(
+            "cut accepts only safe selection options and stdin; file operands are not permitted"
+        )
+
+    if selector is None:
+        raise PipelineValidationError("cut requires exactly one of bytes, characters, or fields")
+    if (delimiter_seen or only_delimited) and selector != "fields":
+        raise PipelineValidationError("cut delimiter options require field selection")
+
+
+def _validate_echo(args: list[str]) -> None:
+    """Allow echo string args and -n/-e/-E; reject path-like operands."""
+    for arg in args:
+        if arg.startswith("-") and len(arg) > 1 and set(arg[1:]).issubset({"n", "e", "E"}):
+            continue
+        _reject_path(arg)
+
+
+def _validate_nl(args: list[str]) -> None:
+    """Allow line numbering options without allowing file operands."""
+    value_options = {
+        "-b", "--body-numbering", "-f", "--footer-numbering", "-h",
+        "--header-numbering", "-n", "--number-format", "-w", "--number-width",
+        "-s", "--number-separator", "-v", "--starting-line-number", "-i",
+        "--line-increment", "-l", "--join-blank-lines",
+    }
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "-p":
+            index += 1
+            continue
+        if arg == "-ba":
+            index += 1
+            continue
+        if arg in value_options:
+            index += 1
+            if index >= len(args):
+                raise PipelineValidationError(f"nl option {arg!r} needs a value")
+            index += 1
+            continue
+        raise PipelineValidationError("nl accepts only numbering options and stdin")
+
+
+def _protect_quoted_metacharacters(pipeline: str) -> str:
+    """Hide shell metacharacters inside quoted arguments before tokenization."""
+    sentinels = {
+        "|": _QUOTED_PIPE_SENTINEL,
+        "<": _QUOTED_LESS_THAN_SENTINEL,
+        ">": _QUOTED_GREATER_THAN_SENTINEL,
+        ";": _QUOTED_SEMICOLON_SENTINEL,
+    }
+    if any(sentinel in pipeline for sentinel in sentinels.values()):
+        raise PipelineValidationError("pipeline contains a reserved character")
+    result: list[str] = []
+    quote: str | None = None
+    escaped = False
+    for character in pipeline:
+        if escaped:
+            result.append(character)
+            escaped = False
+            continue
+        if quote == '"' and character == "\\":
+            result.append(character)
+            escaped = True
+            continue
+        if character in {"'", '"'}:
+            if quote is None:
+                quote = character
+            elif quote == character:
+                quote = None
+            result.append(character)
+        elif character in sentinels and quote is not None:
+            result.append(sentinels[character])
+        else:
+            result.append(character)
+    return "".join(result)
+
+
+def parse_pipeline(pipeline: str) -> list[list[str]]:
+    """Parse and validate a limited stdin-only pipeline."""
+    if "\n" in pipeline or "\r" in pipeline:
+        raise PipelineValidationError("newlines are not permitted in a pipeline")
+    try:
+        tokens = shlex.split(_protect_quoted_metacharacters(pipeline), posix=True)
+    except ValueError as exc:
+        raise PipelineValidationError(f"invalid quoting: {exc}") from exc
+    # ``rg``/``grep`` return 1 for no matches. The service already treats that
+    # as a successful empty result, but accept the common shell idiom without
+    # evaluating a shell or accepting arbitrary ``||`` expressions.
+    if len(tokens) >= 2 and tokens[-2:] == ["||", "true"]:
+        tokens = tokens[:-2]
+    if not tokens:
+        raise PipelineValidationError("pipeline is empty")
+    if any(
+        token in _CONTROL_TOKENS
+        or ";" in token
+        or "$(" in token
+        or "`" in token
+        or token.startswith((">", "<"))
+        for token in tokens
+    ):
+        raise PipelineValidationError("shell syntax is not permitted")
+
+    stages: list[list[str]] = [[]]
+    for token in tokens:
+        if token == "|":
+            if not stages[-1]:
+                raise PipelineValidationError("pipeline contains an empty stage")
+            stages.append([])
+        elif "|" in token:
+            raise PipelineValidationError("pipes must be separated by spaces")
+        else:
+            stages[-1].append(
+                token.replace(_QUOTED_PIPE_SENTINEL, "|")
+                .replace(_QUOTED_LESS_THAN_SENTINEL, "<")
+                .replace(_QUOTED_GREATER_THAN_SENTINEL, ">")
+                .replace(_QUOTED_SEMICOLON_SENTINEL, ";")
+            )
+    if not stages[-1] or len(stages) > _MAX_STAGES:
+        raise PipelineValidationError("pipeline has an empty stage or too many stages")
+
+    for stage in stages:
+        command, args = stage[0], stage[1:]
+        if command not in _ALLOWED_COMMANDS:
+            raise PipelineValidationError(
+                f"command {command!r} is not allowed; supported commands are: "
+                f"{', '.join(sorted(_ALLOWED_COMMANDS))}"
+            )
+        if command in {"rg", "grep"}:
+            normalized_args = _normalize_pattern_args(command, args)
+            stage[:] = [command, *normalized_args]
+            args = normalized_args
+            _validate_pattern_command(command, args)
+        elif command == "awk":
+            _validate_awk(args)
+        elif command == "sed":
+            _validate_sed(args)
+        elif command == "jq":
+            _validate_jq(args)
+        elif command == "xsv":
+            _validate_xsv(args)
+        elif command == "pandoc":
+            _validate_pandoc(args)
+            if "--sandbox" not in args:
+                stage.append("--sandbox")
+        elif command == "sort":
+            _validate_sort(args)
+        elif command == "uniq":
+            _validate_uniq(args)
+        elif command == "wc":
+            _validate_wc(args)
+        elif command == "cat":
+            _validate_cat(args)
+        elif command == "tr":
+            _validate_tr(args)
+        elif command == "cut":
+            _validate_cut(args)
+        elif command == "echo":
+            _validate_echo(args)
+        elif command == "nl":
+            _validate_nl(args)
+        else:
+            _validate_head_tail(command, args)
+    return stages
+
+
+def _request_summary(payload: Any) -> dict[str, Any]:
+    """Return debuggable request fields without echoing submitted file contents."""
+    if not isinstance(payload, dict):
+        return {"payload_type": type(payload).__name__}
+    contents = payload.get("contents")
+    return {
+        "command": payload.get("command"),
+        "contents_length": len(contents) if isinstance(contents, str) else None,
+        "max_runtime": payload.get("max_runtime"),
+        "truncation": payload.get("truncation"),
+    }
+
+
+class TerminalPipelineServer:
+    """FastAPI and LiteRegistry wrapper for restricted terminal pipelines."""
+
+    def __init__(self, config: TerminalServerConfig | None = None):
+        self.config = config or TerminalServerConfig()
+        # Snapshot the launch environment rather than consulting PATH per
+        # request. This admits Conda-installed log tools while keeping command
+        # resolution fixed for the lifetime of this service.
+        self._command_path = self.config.command_path or os.environ.get(
+            "PATH", "/usr/local/bin:/usr/bin:/bin"
+        )
+        self._max_response_chars = (
+            self.config.max_response_chars
+            if self.config.max_response_chars is not None
+            else self.config.max_output_bytes
+        )
+        self.registry = ServerRegistry(store=get_kvstore(self.config.registry))
+        self.url = f"http://{socket.getfqdn()}"
+        self.should_run = False
+        self.heartbeat_task: asyncio.Task | None = None
+        self.app = FastAPI(title="Restricted Terminal Pipeline Server")
+        self._install_routes()
+
+    def _metadata(self) -> dict[str, Any]:
+        return {
+            "model_path": "terminal",
+            "host": self.config.host,
+            "port": self.config.port,
+            "backend": "restricted-pipeline",
+            "extra_kwargs": {
+                "commands": sorted(_ALLOWED_COMMANDS),
+                "max_output_bytes": self.config.max_output_bytes,
+                "max_stderr_bytes": self.config.max_stderr_bytes,
+                "max_response_chars": self._max_response_chars,
+                "command_path": self._command_path,
+            },
+        }
+
+    async def _terminate(self, process: asyncio.subprocess.Process) -> None:
+        if process.returncode is not None:
+            return
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        await process.wait()
+
+    async def _read_limited(
+        self, stream: asyncio.StreamReader, limit: int, stream_name: str
+    ) -> bytes:
+        """Read a subprocess stream without allowing unbounded buffering."""
+        chunks: list[bytes] = []
+        total = 0
+        while chunk := await stream.read(64 * 1024):
+            total += len(chunk)
+            if total > limit:
+                raise PipelineLimitError(
+                    f"pipeline {stream_name} exceeded the configured limit"
+                )
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    def _truncate_stdout(
+        self, stdout: str, truncation: int | None
+    ) -> tuple[str, bool, int]:
+        if truncation is None:
+            return stdout, False, 0
+        if truncation > self._max_response_chars:
+            raise PipelineValidationError(
+                f"truncation cannot exceed the server maximum of "
+                f"{self._max_response_chars} characters"
+            )
+        missing = len(stdout) - truncation
+        if missing <= 0:
+            return stdout, False, 0
+        marker = f"\n[ truncated ({missing} characters missing) ]"
+        return stdout[:truncation] + marker, True, missing
+
+    async def execute(self, request: TerminalRequest) -> TerminalResponse:
+        started = time.perf_counter()
+        stages = parse_pipeline(request.command)
+        data = request.contents.encode()
+        stderr_parts: list[bytes] = []
+        deadline = asyncio.get_running_loop().time() + request.max_runtime
+
+        with tempfile.TemporaryDirectory(prefix="literegistry-terminal-") as working_directory:
+            for stage in stages:
+                executable = shutil.which(stage[0], path=self._command_path)
+                if executable is None:
+                    stdout, truncated, missing = self._truncate_stdout(
+                        data.decode(errors="replace"), request.truncation
+                    )
+                    return TerminalResponse(
+                        stdout=stdout,
+                        stderr=f"Required command is unavailable: {stage[0]}",
+                        success=False,
+                        exit_code=None,
+                        execution_time=time.perf_counter() - started,
+                        truncated=truncated,
+                        truncated_characters=missing,
+                    )
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                process = await asyncio.create_subprocess_exec(
+                    executable,
+                    *stage[1:],
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=working_directory,
+                    env={"PATH": self._command_path, "LC_ALL": "C"},
+                    start_new_session=True,
+                )
+                assert process.stdin is not None
+                assert process.stdout is not None
+                assert process.stderr is not None
+                try:
+                    process.stdin.write(data)
+                    await asyncio.wait_for(process.stdin.drain(), timeout=remaining)
+                except (BrokenPipeError, ConnectionResetError):
+                    # Commands such as ``head`` may intentionally exit before
+                    # consuming all input.
+                    pass
+                except asyncio.TimeoutError:
+                    await self._terminate(process)
+                    raise
+                finally:
+                    process.stdin.close()
+                stdout_task = asyncio.create_task(
+                    self._read_limited(
+                        process.stdout, self.config.max_output_bytes, "output"
+                    )
+                )
+                stderr_task = asyncio.create_task(
+                    self._read_limited(
+                        process.stderr, self.config.max_stderr_bytes, "stderr"
+                    )
+                )
+                try:
+                    stdout, stderr, _ = await asyncio.wait_for(
+                        asyncio.gather(stdout_task, stderr_task, process.wait()),
+                        timeout=remaining,
+                    )
+                except (asyncio.TimeoutError, PipelineLimitError):
+                    await self._terminate(process)
+                    await asyncio.gather(
+                        stdout_task, stderr_task, return_exceptions=True
+                    )
+                    raise
+                if len(stdout) > self.config.max_output_bytes:
+                    raise PipelineLimitError("pipeline output exceeded the configured limit")
+                if len(stderr) > self.config.max_stderr_bytes:
+                    raise PipelineLimitError("pipeline stderr exceeded the configured limit")
+                stderr_parts.append(stderr)
+                if process.returncode not in ({0, 1} if stage[0] in {"rg", "grep"} else {0}):
+                    response_stdout, truncated, missing = self._truncate_stdout(
+                        stdout.decode(errors="replace"), request.truncation
+                    )
+                    return TerminalResponse(
+                        stdout=response_stdout,
+                        stderr=b"".join(stderr_parts).decode(errors="replace"),
+                        success=False,
+                        exit_code=process.returncode,
+                        execution_time=time.perf_counter() - started,
+                        truncated=truncated,
+                        truncated_characters=missing,
+                    )
+                data = stdout
+
+        response_stdout, truncated, missing = self._truncate_stdout(
+            data.decode(errors="replace"), request.truncation
+        )
+        return TerminalResponse(
+            stdout=response_stdout,
+            stderr=b"".join(stderr_parts).decode(errors="replace"),
+            success=True,
+            exit_code=0,
+            execution_time=time.perf_counter() - started,
+            truncated=truncated,
+            truncated_characters=missing,
+        )
+
+    async def start(self) -> None:
+        await self.registry.register_server(self.url, self.config.port, self._metadata())
+        self.should_run = True
+        self.heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
+    async def _heartbeat_loop(self) -> None:
+        while self.should_run:
+            try:
+                await self.registry.heartbeat(self.url, self.config.port)
+            except Exception:
+                pass
+            await asyncio.sleep(self.config.heartbeat_interval)
+
+    async def cleanup_async(self) -> None:
+        self.should_run = False
+        if self.heartbeat_task:
+            self.heartbeat_task.cancel()
+            try:
+                await self.heartbeat_task
+            except asyncio.CancelledError:
+                pass
+        await self.registry.deregister()
+
+    def _install_routes(self) -> None:
+        @self.app.exception_handler(RequestValidationError)
+        async def validation_error_handler(
+            request: Request, exc: RequestValidationError
+        ) -> JSONResponse:
+            summary = _request_summary(getattr(exc, "body", None))
+            logger.info("Invalid terminal request: %s", summary)
+            return JSONResponse(
+                {
+                    "error": "invalid terminal request",
+                    "details": exc.errors(),
+                    "request": summary,
+                },
+                status_code=400,
+            )
+
+        @self.app.post("/terminal", response_model=TerminalResponse)
+        async def terminal(request: TerminalRequest) -> TerminalResponse:
+            summary = _request_summary(request.dict())
+            try:
+                response = await self.execute(request)
+                logger.info(
+                    "Completed terminal request success=%s exit_code=%s execution_time=%.3fs",
+                    response.success,
+                    response.exit_code,
+                    response.execution_time,
+                )
+                return response
+            except PipelineValidationError as exc:
+                logger.info("Rejected terminal request: %s; reason=%s", summary, exc)
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": str(exc),
+                        "request": _request_summary(request.dict()),
+                    },
+                ) from exc
+            except PipelineLimitError as exc:
+                logger.info("Limited terminal request: %s; reason=%s", summary, exc)
+                raise HTTPException(status_code=413, detail=str(exc)) from exc
+            except asyncio.TimeoutError as exc:
+                logger.info("Timed out terminal request: %s", summary)
+                raise HTTPException(status_code=408, detail="pipeline timed out") from exc
+
+        @self.app.get("/")
+        async def root() -> dict[str, Any]:
+            return {
+                "message": "POST /terminal with contents and command",
+                "commands": sorted(_ALLOWED_COMMANDS),
+                "max_output_bytes": self.config.max_output_bytes,
+                "max_stderr_bytes": self.config.max_stderr_bytes,
+                "max_response_chars": self._max_response_chars,
+            }
+
+        @self.app.on_event("startup")
+        async def startup() -> None:
+            await self.start()
+
+        @self.app.on_event("shutdown")
+        async def shutdown() -> None:
+            await self.cleanup_async()
+
+
+def main(
+    host: str = "0.0.0.0",
+    port: int = 1213,
+    registry: str = "redis://klone-login01.hyak.local:6379",
+    heartbeat_interval: int = 30,
+    max_output_bytes: int = 1024 * 1024,
+    max_response_chars: int | None = None,
+    command_path: str | None = None,
+) -> None:
+    """Run the restricted terminal pipeline server with uvicorn."""
+    import uvicorn
+
+    config = TerminalServerConfig(
+        host=host,
+        port=port,
+        registry=registry,
+        heartbeat_interval=heartbeat_interval,
+        max_output_bytes=max_output_bytes,
+        max_response_chars=max_response_chars,
+        command_path=command_path,
+    )
+    uvicorn.run(TerminalPipelineServer(config).app, host=host, port=port)
+
+
+if __name__ == "__main__":
+    import fire
+
+    fire.Fire(main)

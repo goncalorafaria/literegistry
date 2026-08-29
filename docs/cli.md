@@ -21,7 +21,9 @@ literegistry <subcommand> [--arg=value ...]
 | `redis` | Start Redis (registry backend) | [Registry](registry.md), [Runtimes](runtimes.md) |
 | `vllm` | Launch vLLM + register | [vLLM & SGLang](vllm-sglang.md) |
 | `sglang` | Launch SGLang + register | [vLLM & SGLang](vllm-sglang.md) |
-| `gateway` | HTTP front door / load balancer | [Gateway](gateway.md) |
+| `gateway` | Canonical composable gateway with strict affinity | [Gateway](gateway.md), [Podman](podman.md) |
+| `old-gateway` | Legacy gateway retained for compatibility | [Gateway](gateway.md) |
+| `podman` | Rootless stateful container server registered in Redis | [Podman](podman.md) |
 | `code` | Stateless Python workers | [Code & Terminal](code-and-terminal.md) |
 | `terminal` | Restricted log pipelines | [Code & Terminal](code-and-terminal.md) |
 | `console` | Streamlit ops dashboard | [Console](console.md) |
@@ -131,6 +133,34 @@ Endpoints: `/health`, `/session-stats`, `/v1/models`, `/v1/completions`,
 
 ---
 
+## `literegistry gateway` / `literegistry podman`
+
+The gateway owns the strict-affinity lifecycle used by Podman: handshake,
+terminal commands, and close/delete. The Podman server registers as
+`model_path=podman`.
+
+```bash
+literegistry gateway \
+  --registry redis://registry:6379 \
+  --port 8080 \
+  --workers 8
+
+literegistry podman \
+  --registry redis://registry:6379 \
+  --host 0.0.0.0 \
+  --port 8091 \
+  --allow-non-loopback=True \
+  --advertise-host podman-node \
+  --advertise-port 8091 \
+  --image python:3.12-slim
+```
+
+The gateway prints `GATEWAY_URL=...`. For managed host-network deployments,
+the Podman server requires the explicit `--allow-non-loopback=True` flag. See
+[Podman](podman.md) for the request lifecycle and rootless requirements.
+
+---
+
 ## `literegistry code`
 
 Stateless Python executor; registers as `model_path=python`.
@@ -175,8 +205,40 @@ literegistry terminal --registry redis://login-node:6379 --port 1213
 | `max_response_chars` | `None` | Optional response truncate |
 | `command_path` | `None` | Extra `PATH` dir for tools |
 
-Allowed commands: `rg`, `grep`, `awk`, `sed`, `jq`, `xsv`, `head`, `tail`,
-`wc`, `cat`, `nl`, `echo`. Details: [Code & Terminal](code-and-terminal.md).
+Allowed commands: `rg`, `grep`, `awk`, `sed`, `jq`, `xsv`, `pandoc`, `sort`,
+`uniq`, `tr`, `cut`, `head`, `tail`, `wc`, `cat`, `nl`, `echo`. Details:
+[Code & Terminal](code-and-terminal.md).
+
+---
+
+## `literegistry bm25`
+
+Local Lucene BM25 search over a JSONL corpus. It registers under
+`model_path=localsearch:<corpus stem>` when `registry` is provided.
+
+```bash
+python -m pip install 'literegistry[bm25]'
+literegistry bm25 \
+  --corpus_jsonl=/data/corpus.jsonl \
+  --lucene_index_dir=/data/lucene-index \
+  --registry=redis://login-node:6379 \
+  --service_name=localsearch:corpus \
+  --port=1214
+```
+
+| Argument | Default | Meaning |
+|----------|---------|---------|
+| `corpus_jsonl` | environment | Source JSONL corpus |
+| `lucene_index_dir` | environment | Existing Pyserini/Lucene index |
+| `registry` | optional | Registration target |
+| `service_name` | corpus stem | Registered `model_path` |
+| `advertised_host` | FQDN | Host published to the registry |
+| `host` | `0.0.0.0` | Bind host |
+| `port` | `8000` | Listen port |
+| `workers` | `1` | Uvicorn workers; registered mode requires one |
+
+The service accepts direct `query`/`topn` requests and gateway-compatible
+`mode="query"` or `mode="url"` requests.
 
 ---
 
@@ -266,9 +328,9 @@ literegistry vllm --tensor_parallel_size=4   # → --tensor-parallel-size 4
 Equivalent module forms (same Fire mains):
 
 ```bash
-python -m literegistry.cli gateway --registry redis://… --port 8080
+literegistry gateway --registry redis://… --port 8080
 python -m literegistry.gateway --registry redis://… --port 8080
-python -m literegistry.vllm_wrapper --model … --registry redis://…
+python -m literegistry.services.vllm_wrapper --model … --registry redis://…
 ```
 
 ## Minimal cluster recipe

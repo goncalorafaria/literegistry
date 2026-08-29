@@ -1,5 +1,6 @@
 import abc
 import asyncio
+import math
 from typing import Optional, Union, List
 import redis.asyncio as redis
 from literegistry.kvstore import KeyValueStore
@@ -49,13 +50,27 @@ class RedisKVStore(KeyValueStore):
         except Exception:
             return None
 
-    async def set(self, key: str, value: Union[bytes, str]) -> bool:
-        """Set value for a key in Redis"""
+    async def set(
+        self,
+        key: str,
+        value: Union[bytes, str],
+        ttl_seconds: Optional[float] = None,
+    ) -> bool:
+        """Set value for a key in Redis."""
+        if ttl_seconds is not None:
+            ttl_seconds = float(ttl_seconds)
+            if not math.isfinite(ttl_seconds) or ttl_seconds <= 0:
+                raise ValueError(
+                    "ttl_seconds must be a finite value greater than zero"
+                )
         redis_client = await self._get_redis()
         try:
             if isinstance(value, str):
                 value = value.encode("utf-8")
-            await redis_client.set(key, value)
+            options = {}
+            if ttl_seconds is not None:
+                options["px"] = max(1, math.ceil(ttl_seconds * 1000))
+            await redis_client.set(key, value, **options)
             return True
         except Exception:
             return False
@@ -78,12 +93,15 @@ class RedisKVStore(KeyValueStore):
         except Exception:
             return False
 
-    async def keys(self) -> List[str]:
-        """Get a list of all keys in Redis"""
+    async def keys(self, prefix: Optional[str] = None) -> List[str]:
+        """Get keys from Redis using a non-blocking scan."""
         redis_client = await self._get_redis()
         try:
-            keys = await redis_client.keys("*")
-            return [key.decode('utf-8') if isinstance(key, bytes) else key for key in keys]
+            pattern = f"{prefix}*" if prefix is not None else "*"
+            keys = []
+            async for key in redis_client.scan_iter(match=pattern):
+                keys.append(key.decode("utf-8") if isinstance(key, bytes) else key)
+            return keys
         except Exception:
             return []
 

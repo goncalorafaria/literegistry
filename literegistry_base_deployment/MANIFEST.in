@@ -1,0 +1,5 @@
+include LICENSE
+include README.md
+recursive-include src *.typed
+recursive-include docker *
+recursive-include scripts *.sh

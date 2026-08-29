@@ -11,10 +11,10 @@ from literegistry.runtime import (
     default_apptainer_image_dir,
     resolve_apptainer_image,
 )
-import literegistry.sglang_wrapper as sglang_wrapper
-from literegistry.sglang_wrapper import SGLangServerManager
-import literegistry.vllm_wrapper as vllm_wrapper
-from literegistry.vllm_wrapper import VLLMServerManager
+import literegistry.services.sglang_wrapper as sglang_wrapper
+from literegistry.services.sglang_wrapper import SGLangServerManager
+import literegistry.services.vllm_wrapper as vllm_wrapper
+from literegistry.services.vllm_wrapper import VLLMServerManager
 import literegistry.redis as redis_wrapper
 
 
@@ -389,7 +389,7 @@ class RuntimeCommandTest(unittest.TestCase):
         ), patch.object(
             VLLMServerManager, "run"
         ), patch(
-            "literegistry.vllm_wrapper.build_runtime",
+            "literegistry.services.vllm_wrapper.build_runtime",
             wraps=build_runtime,
         ) as runtime_builder:
             vllm_wrapper.main(runtime="apptainer", port=8000)
@@ -453,7 +453,7 @@ class RuntimeCommandTest(unittest.TestCase):
         ), patch.object(
             SGLangServerManager, "run"
         ), patch(
-            "literegistry.sglang_wrapper.build_runtime",
+            "literegistry.services.sglang_wrapper.build_runtime",
             wraps=build_runtime,
         ) as runtime_builder:
             sglang_wrapper.main(runtime="apptainer", port=8000)
@@ -511,7 +511,7 @@ class RuntimeCommandTest(unittest.TestCase):
             "os.path.exists",
             side_effect=exists,
         ), patch.object(VLLMServerManager, "run"), patch(
-            "literegistry.vllm_wrapper.build_runtime"
+            "literegistry.services.vllm_wrapper.build_runtime"
         ) as runtime_builder:
             runtime_builder.return_value = build_runtime("local")
             vllm_wrapper.main(
@@ -560,7 +560,7 @@ class RuntimeCommandTest(unittest.TestCase):
             "os.path.exists",
             side_effect=exists,
         ), patch.object(VLLMServerManager, "run"), patch(
-            "literegistry.vllm_wrapper.build_runtime"
+            "literegistry.services.vllm_wrapper.build_runtime"
         ) as runtime_builder:
             runtime_builder.return_value = build_runtime("local")
             vllm_wrapper.main(port=8000)

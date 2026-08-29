@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 import pytest
 
-from literegistry.terminal_server import (
+from literegistry.services.terminal_server import (
     PipelineLimitError,
     PipelineValidationError,
     TerminalPipelineServer,
@@ -14,7 +14,7 @@ from literegistry.terminal_server import (
 
 
 def _server():
-    with patch("literegistry.terminal_server.get_kvstore", return_value=object()):
+    with patch("literegistry.services.terminal_server.get_kvstore", return_value=object()):
         return TerminalPipelineServer(TerminalServerConfig())
 
 
@@ -43,6 +43,116 @@ def test_parse_pipeline_accepts_head_byte_count():
 
 def test_parse_pipeline_accepts_wc_line_count():
     assert parse_pipeline("wc -l") == [["wc", "-l"]]
+    assert parse_pipeline("wc -l -c") == [["wc", "-l", "-c"]]
+
+
+def test_parse_pipeline_rejects_semicolon_separated_wc_commands_as_shell_syntax():
+    with pytest.raises(PipelineValidationError, match="shell syntax is not permitted"):
+        parse_pipeline("wc -l; wc -c")
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("sort | uniq -c", [["sort"], ["uniq", "-c"]]),
+        ("sort -rn | head -n 10", [["sort", "-rn"], ["head", "-n", "10"]]),
+        ("sort -u", [["sort", "-u"]]),
+        (
+            "sort -t , -k 2,2nr | uniq -ic",
+            [["sort", "-t", ",", "-k", "2,2nr"], ["uniq", "-ic"]],
+        ),
+        ("uniq -f2 -s 3 -w 8", [["uniq", "-f2", "-s", "3", "-w", "8"]]),
+    ],
+)
+def test_parse_pipeline_accepts_stdin_only_sort_and_uniq(command, expected):
+    assert parse_pipeline(command) == expected
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("tr '[:upper:]' '[:lower:]'", [["tr", "[:upper:]", "[:lower:]"]]),
+        ("tr -d '\\r'", [["tr", "-d", "\\r"]]),
+        ("tr -s '[:space:]' ' '", [["tr", "-s", "[:space:]", " "]]),
+        ("tr -cd '[:print:]'", [["tr", "-cd", "[:print:]"]]),
+        ("tr --delete -- '\\000-\\010'", [["tr", "--delete", "--", "\\000-\\010"]]),
+    ],
+)
+def test_parse_pipeline_accepts_stdin_only_tr(command, expected):
+    assert parse_pipeline(command) == expected
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "tr",
+        "tr a",
+        "tr a b c",
+        "tr -d a b",
+        "tr --output result.txt",
+        "tr -f patterns.txt a",
+    ],
+)
+def test_parse_pipeline_rejects_invalid_tr_forms(command):
+    with pytest.raises(PipelineValidationError):
+        parse_pipeline(command)
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("cut -d, -f1,3", [["cut", "-d,", "-f1,3"]]),
+        ("cut -d , -f 1", [["cut", "-d", ",", "-f", "1"]]),
+        (
+            "cut --delimiter=: --fields=1-2 --only-delimited",
+            [["cut", "--delimiter=:", "--fields=1-2", "--only-delimited"]],
+        ),
+        ("cut -c 1-20", [["cut", "-c", "1-20"]]),
+        ("cut -b1,4-6 --complement", [["cut", "-b1,4-6", "--complement"]]),
+        ("cut -f2 - | sort -u", [["cut", "-f2", "-"], ["sort", "-u"]]),
+    ],
+)
+def test_parse_pipeline_accepts_stdin_only_cut(command, expected):
+    assert parse_pipeline(command) == expected
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cut",
+        "cut -f0",
+        "cut -f3-1",
+        "cut -f1 /etc/passwd",
+        "cut -f1 input.txt",
+        "cut -d:: -f1",
+        "cut -d, -c1",
+        "cut -f1 -c1",
+        "cut --files0-from=input.txt -f1",
+        "cut -f1 - -",
+    ],
+)
+def test_parse_pipeline_rejects_invalid_or_file_reading_cut_forms(command):
+    with pytest.raises(PipelineValidationError):
+        parse_pipeline(command)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "sort /etc/passwd",
+        "sort input.txt",
+        "sort -o output.txt",
+        "sort --output=output.txt",
+        "sort -T /tmp",
+        "sort --random-source=/dev/urandom",
+        "uniq input.txt",
+        "uniq -c input.txt",
+        "uniq input.txt output.txt",
+    ],
+)
+def test_parse_pipeline_rejects_sort_and_uniq_file_access(command):
+    with pytest.raises(PipelineValidationError):
+        parse_pipeline(command)
 
 
 def test_parse_pipeline_accepts_echo():
@@ -67,6 +177,52 @@ def test_parse_pipeline_accepts_stdin_only_cat_and_awk_line_limit():
     ]
 
 
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        (
+            "pandoc -f markdown -t json",
+            [["pandoc", "-f", "markdown", "-t", "json", "--sandbox"]],
+        ),
+        (
+            "pandoc --from=gfm --to=native --strip-comments",
+            [["pandoc", "--from=gfm", "--to=native", "--strip-comments", "--sandbox"]],
+        ),
+        (
+            "pandoc --sandbox --from html --to plain | head -n 20",
+            [
+                ["pandoc", "--sandbox", "--from", "html", "--to", "plain"],
+                ["head", "-n", "20"],
+            ],
+        ),
+    ],
+)
+def test_parse_pipeline_accepts_stdin_only_pandoc_structure_commands(command, expected):
+    assert parse_pipeline(command) == expected
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "pandoc -f markdown -t html",
+        "pandoc -f docx -t json",
+        "pandoc -f markdown -t json /etc/passwd",
+        "pandoc -f markdown -t json --output=result.json",
+        "pandoc -f markdown -t json --lua-filter=filter.lua",
+        "pandoc -f markdown -t json --filter helper",
+        "pandoc -f markdown -t json --defaults config",
+        "pandoc -f markdown -t json --template template.html",
+        "pandoc -f markdown",
+        "pandoc -t json",
+        "pandoc -f markdown -f gfm -t json",
+        "pandoc -f markdown -t json -t native",
+    ],
+)
+def test_parse_pipeline_rejects_pandoc_file_write_filter_and_ambiguous_formats(command):
+    with pytest.raises(PipelineValidationError):
+        parse_pipeline(command)
+
+
 def test_parse_pipeline_accepts_combined_grep_flags_and_stdin_sentinel():
     assert parse_pipeline('grep -iE "January|February"') == [
         ["grep", "-i", "-E", "January|February"]
@@ -85,6 +241,63 @@ def test_parse_pipeline_accepts_combined_rg_flags():
         ["head", "-n", "80"],
     ]
     assert parse_pipeline("rg -ivn error") == [["rg", "-i", "-v", "-n", "error"]]
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("rg -oP 'item: \\K.*'", [["rg", "-o", "-P", "item: \\K.*"]]),
+        ("rg --pcre2 '(?<=item: ).*'", [["rg", "--pcre2", "(?<=item: ).*"]]),
+        ("rg -U 'first\\nsecond'", [["rg", "-U", "first\\nsecond"]]),
+        ("grep -iA 2 error", [["grep", "-i", "-A", "2", "error"]]),
+        ("grep -inB2 error", [["grep", "-i", "-n", "-B2", "error"]]),
+        ("grep -oP '(?<=item: ).*'", [["grep", "-o", "-P", "(?<=item: ).*"]]),
+        ("grep -- -heading", [["grep", "--", "-heading"]]),
+    ],
+)
+def test_parse_pipeline_accepts_safe_pattern_engine_and_option_forms(command, expected):
+    assert parse_pipeline(command) == expected
+
+
+@pytest.mark.parametrize("command", ["rg -f patterns.txt", "grep -f patterns.txt", "rg -E utf-16 x"])
+def test_parse_pipeline_keeps_pattern_files_and_rg_encoding_forbidden(command):
+    with pytest.raises(PipelineValidationError):
+        parse_pipeline(command)
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("awk -F: '{print $1}'", [["awk", "-F:", "{print $1}"]]),
+        ("awk -F'|' '{print $2}'", [["awk", "-F|", "{print $2}"]]),
+        (
+            "awk 'NF {print \"words=\" NF \" | \" $0}'",
+            [["awk", 'NF {print "words=" NF " | " $0}']],
+        ),
+        ("jq -R -r 'select(length > 0)'", [["jq", "-R", "-r", "select(length > 0)"]]),
+        ("sed -nE '/error|warning/p'", [["sed", "-nE", "/error|warning/p"]]),
+        ("sed -e 's/foo/bar/g' -e '/bar/p'", [["sed", "-e", "s/foo/bar/g", "-e", "/bar/p"]]),
+        ("sed -n '1,5p' -", [["sed", "-n", "1,5p", "-"]]),
+    ],
+)
+def test_parse_pipeline_accepts_safe_awk_jq_and_sed_forms(command, expected):
+    assert parse_pipeline(command) == expected
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "awk '{print $0 | \"sort\"}'",
+        "awk '{print $0 > \"output.txt\"}'",
+        "sed -i 's/foo/bar/' file.txt",
+        "sed -in 's/foo/bar/' file.txt",
+        "sed -e '1w output.txt'",
+        "sed -e '1p' input.txt",
+    ],
+)
+def test_parse_pipeline_still_rejects_awk_processes_and_sed_file_io(command):
+    with pytest.raises(PipelineValidationError):
+        parse_pipeline(command)
 
 
 def test_parse_pipeline_accepts_trailing_or_true_as_a_noop():
@@ -150,8 +363,56 @@ def test_terminal_server_executes_a_safe_pipeline():
     assert response.exit_code == 0
 
 
+def test_terminal_server_executes_sort_and_uniq_count_pipeline():
+    server = _server()
+    response = asyncio.run(
+        server.execute(
+            TerminalRequest(
+                contents="pear\napple\npear\nbanana\napple\npear\n",
+                command="sort | uniq -c",
+            )
+        )
+    )
+
+    assert response.success is True
+    assert response.stdout == "      2 apple\n      1 banana\n      3 pear\n"
+    assert response.exit_code == 0
+
+
+def test_terminal_server_executes_tr_normalization_pipeline():
+    server = _server()
+    response = asyncio.run(
+        server.execute(
+            TerminalRequest(
+                contents="FIRST   LINE\r\nSECOND\tLINE\r\n",
+                command="tr -d '\\r' | tr '[:upper:]' '[:lower:]' | tr -s '[:space:]' ' '",
+            )
+        )
+    )
+
+    assert response.success is True
+    assert response.stdout == "first line second line "
+    assert response.exit_code == 0
+
+
+def test_terminal_server_executes_cut_field_selection_pipeline():
+    server = _server()
+    response = asyncio.run(
+        server.execute(
+            TerminalRequest(
+                contents="alice,admin,active\nbob,user,inactive\n",
+                command="cut -d, -f1,3",
+            )
+        )
+    )
+
+    assert response.success is True
+    assert response.stdout == "alice,active\nbob,inactive\n"
+    assert response.exit_code == 0
+
+
 def test_terminal_server_enforces_output_limit():
-    with patch("literegistry.terminal_server.get_kvstore", return_value=object()):
+    with patch("literegistry.services.terminal_server.get_kvstore", return_value=object()):
         server = TerminalPipelineServer(
             TerminalServerConfig(max_output_bytes=4, max_stderr_bytes=1024)
         )
@@ -172,6 +433,11 @@ def test_terminal_metadata_registers_terminal_model():
     assert metadata["model_path"] == "terminal"
     assert "rg" in metadata["extra_kwargs"]["commands"]
     assert "echo" in metadata["extra_kwargs"]["commands"]
+    assert "pandoc" in metadata["extra_kwargs"]["commands"]
+    assert "sort" in metadata["extra_kwargs"]["commands"]
+    assert "uniq" in metadata["extra_kwargs"]["commands"]
+    assert "tr" in metadata["extra_kwargs"]["commands"]
+    assert "cut" in metadata["extra_kwargs"]["commands"]
 
 
 def test_response_truncation_appends_missing_character_marker():
@@ -185,7 +451,7 @@ def test_response_truncation_appends_missing_character_marker():
 
 
 def test_response_truncation_cannot_exceed_server_limit():
-    with patch("literegistry.terminal_server.get_kvstore", return_value=object()):
+    with patch("literegistry.services.terminal_server.get_kvstore", return_value=object()):
         server = TerminalPipelineServer(TerminalServerConfig(max_response_chars=3))
 
     with pytest.raises(PipelineValidationError, match="server maximum"):

@@ -27,7 +27,7 @@ Or via uvicorn directly:
 
 ```bash
 REGISTRY_PATH=redis://login-node:6379 \
-  uvicorn literegistry.gateway:app --host 0.0.0.0 --port 8080 --workers 4
+  uvicorn literegistry.gateway:create_app --factory --host 0.0.0.0 --port 8080 --workers 4
 ```
 
 ## CLI arguments
@@ -35,18 +35,24 @@ REGISTRY_PATH=redis://login-node:6379 \
 | Argument | Default | Meaning |
 |----------|---------|---------|
 | `registry` | cluster Redis URL | `redis://…` or filesystem path |
+| `host` | `0.0.0.0` | Listen address |
 | `port` | `8080` | Listen port |
-| `workers` | `1` | Uvicorn workers (`>1` switches to multi-process mode) |
-| `timeout` | `61` | Seconds for model completion / classify requests |
-| `python_timeout` | `20` | Timeout for `/python` proxied calls |
-| `python_max_retries` | `3` | Max replica attempts for `/python` |
-| `python_retry_budget_seconds` | `20` | Wall-clock budget for `/python` retries |
-| `terminal_timeout` | `20` | Timeout for `/terminal` |
-| `terminal_max_retries` | `2` | Max replica attempts for `/terminal` |
-| `terminal_retry_budget_seconds` | `20` | Wall-clock budget for `/terminal` retries |
+| `advertise_host` | node FQDN | Host used in the printed `GATEWAY_URL` |
+| `workers` | `1` | Uvicorn workers (`>1` uses factory mode) |
+| `registry_cache_ttl_seconds` | `5` | Registry roster cache lifetime |
+| `timeout` | `300` | Default and Podman affinity request timeout |
+| `docker_mirror_service` | `docker-mirror` | Registry service used for mirror discovery |
+| `docker_mirror_connect_timeout` | `3` | Mirror connection timeout |
+| `docker_mirror_read_timeout` | `300` | Mirror streaming read timeout |
+| `docker_mirror_max_retries` | `3` | Replicas tried before streaming starts |
+| `docker_mirror_soft_affinity` | `True` | Enable experimental repository-derived soft affinity |
+| `affinity_ttl_seconds` | `900` | Sliding lifetime of strict and mirror soft-affinity bindings |
+| `log_level` | `info` | Uvicorn log level |
+| `access_log` | `False` | Enable Uvicorn access logs |
+| `reload` | `False` | Development reload mode; requires one worker |
 
-When `workers > 1`, the same values are exported as env vars for child
-processes: `REGISTRY_PATH`, `TIMEOUT`, `PYTHON_TIMEOUT`, etc.
+When `workers > 1`, registry and affinity settings are exported for each
+factory-created worker process.
 
 ## Endpoints
 
@@ -60,6 +66,17 @@ processes: `REGISTRY_PATH`, `TIMEOUT`, `PYTHON_TIMEOUT`, etc.
 | `POST` | `/classify` | Replica with matching `model` |
 | `POST` | `/python` | Workers registered as `model_path=python` |
 | `POST` | `/terminal` | Workers registered as `model_path=terminal` |
+| `POST` | `/affinity/handshake` | Select a stateful replica and create a binding |
+| `POST` | `/affinity/podman` | Run a command on the bound Podman container |
+| `POST` | `/affinity/close` | Delete the container and release its binding |
+| `GET/HEAD` | `/v2` | Docker Registry V2 mirror root |
+| `GET/HEAD` | `/v2/` | Docker Registry V2 mirror root |
+| `GET/HEAD` | `/v2/{path}` | A discovered `model_path=docker-mirror` replica |
+
+Podman routes are stateful: handshake creates an affinity binding and every
+command/close request carries that ID. Mirror soft affinity is experimental, optional, and enabled by default. Disable it to use normal mirror
+load balancing. When enabled, affinity is inferred from the repository path
+without a handshake.
 
 ### Completions
 

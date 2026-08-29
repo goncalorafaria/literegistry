@@ -2,7 +2,7 @@ import asyncio
 from unittest.mock import patch
 
 from fastapi import HTTPException
-from literegistry.code_server import (
+from literegistry.services.code_server import (
     CodeRequest,
     CodeResponse,
     StatelessCodeExecutorConfig,
@@ -18,7 +18,7 @@ def _server(*, pool_size=1, max_queue_size=1):
         default_tools=[],
         tool_specs={"math": "math"},
     )
-    with patch("literegistry.code_server.get_kvstore", return_value=object()):
+    with patch("literegistry.services.code_server.get_kvstore", return_value=object()):
         return StatelessCodeExecutorServer(config)
 
 

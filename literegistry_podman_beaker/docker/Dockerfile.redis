@@ -1,0 +1,27 @@
+FROM redis:7-bookworm
+
+ARG PIP_INDEX_URL
+ARG PIP_FIND_LINKS
+ARG PIP_TRUSTED_HOST
+
+ENV VIRTUAL_ENV=/opt/literegistry-redis-venv \
+    PATH=/opt/literegistry-redis-venv/bin:$PATH \
+    PYTHONUNBUFFERED=1 \
+    OTEL_TRACES_EXPORTER=none
+
+USER root
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ca-certificates python3 python3-venv \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -m venv "$VIRTUAL_ENV" \
+    && pip install --no-cache-dir --upgrade pip setuptools wheel
+
+COPY . /opt/literegistry-podman-beaker
+RUN pip install --no-cache-dir /opt/literegistry-podman-beaker \
+    && rm -rf /opt/literegistry-podman-beaker
+
+USER redis
+EXPOSE 6379
+
+ENTRYPOINT ["literegistry", "redis"]
+CMD ["--runtime=local", "--foreground=True", "--port=6379"]

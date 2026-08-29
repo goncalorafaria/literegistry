@@ -8,7 +8,7 @@ with open("requirements.txt", "r") as fr:
 
 setuptools.setup(
     name="literegistry",
-    version="1.0.30",
+    version="1.0.39",
     author="Goncalo Faria",
     author_email="gfaria@cs.washington.edu",
     description="Package for implementing service discovery in a really lite way.",
@@ -17,6 +17,18 @@ setuptools.setup(
     url="https://github.com/goncalorafaria/lightregistry",
     packages=setuptools.find_packages(),
     install_requires=installation_requirements,
+    extras_require={
+        "podman_client": ["literegistry-podman-client>=0.1.2"],
+        "podman_beaker": ["literegistry-podman-beaker>=0.2.8"],
+        "base_deployment": ["literegistry-base-deployment>=0.1.0"],
+        "bm25": ["pyserini==2.3.0"],
+        "all": [
+            "literegistry-podman-client>=0.1.2",
+            "literegistry-podman-beaker>=0.2.8",
+            "literegistry-base-deployment>=0.1.0",
+            "pyserini==2.3.0",
+        ],
+    },
     python_requires=">=3.6.0",
     classifiers=[
         "Programming Language :: Python :: 3",

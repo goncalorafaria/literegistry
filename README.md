@@ -9,6 +9,17 @@ Lightweight service registry and discovery system for distributed model inferenc
 pip install literegistry
 ```
 
+Install optional sibling packages through LiteRegistry extras:
+
+```bash
+pip install "literegistry[podman_client]"
+pip install "literegistry[podman_beaker]"
+pip install "literegistry[all]"
+```
+
+These are convenience dependencies; the client and Beaker deployment code
+remain separately versioned distributions.
+
 ## Documentation
 
 Usage guides with argument reference live in [`docs/`](docs/README.md)
@@ -17,8 +28,11 @@ Usage guides with argument reference live in [`docs/`](docs/README.md)
 - [CLI reference](docs/cli.md)
 - [Registry (Redis & filesystem)](docs/registry.md)
 - [Gateway](docs/gateway.md)
+- [Package layout](docs/package-layout.md)
 - [vLLM & SGLang](docs/vllm-sglang.md)
 - [Code & Terminal](docs/code-and-terminal.md)
+- [Podman affinity containers](docs/podman.md)
+- [Standalone Podman gateway client](PODMAN_GATEWAY_README.md)
 - [Load balancing](docs/load-balancing.md)
 - [Runtimes](docs/runtimes.md)
 - [Console](docs/console.md)
@@ -111,31 +125,73 @@ literegistry code --registry redis://klone-login01.hyak.local:6379
 **Start Terminal Pipeline Server**
 
 The terminal server runs restricted, stdin-only log-analysis pipelines. It
-accepts `rg`, `grep`, `awk`, `sed`, `jq`, `xsv`, `head`, `tail`, `wc`, `cat`, `nl`, and `echo`, joined by
+accepts `rg`, `grep`, `awk`, `sed`, `jq`, `xsv`, `pandoc`, `sort`, `uniq`, `tr`,
+`cut`, `head`, `tail`, `wc`, `cat`, `nl`, and `echo`, joined by
 pipes. It does not evaluate shell syntax or permit submitted file paths.
 
 ```bash
 literegistry terminal --registry redis://klone-login01.hyak.local:6379
 ```
 
+**Start Rootless Podman Affinity Server**
+
+Podman is a first-class stateful LiteRegistry service. `gateway` exposes
+the handshake, terminal, and close lifecycle; `podman` creates and owns the
+rootless containers and registers itself under `model_path="podman"`.
+
+```bash
+literegistry gateway --registry redis://login-node:6379 --port 8080 --workers 8
+literegistry podman \
+  --registry redis://login-node:6379 \
+  --host 0.0.0.0 \
+  --port 8091 \
+  --allow-non-loopback=True \
+  --advertise-host podman-node \
+  --advertise-port 8091 \
+  --image python:3.12-slim
+```
+
+See [Podman affinity containers](docs/podman.md) for rootless and host-network
+deployment details plus the handshake/command/close API.
+
 **Start Search Server**
 
-The search worker uses Serper by default: Google search for query requests and
-Serper's scraper for direct URL retrieval. It registers under
-`model_path="search"` and caches successful responses in a separate logical
-database on the registry Redis instance.
+The search worker combines the live-web providers behind one registered
+`model_path="search"`: Serper handles `mode="query"`, while Jina Reader handles
+`mode="url"`. Successful responses are cached in a separate logical database
+on the registry Redis instance.
 
 ```bash
 export SERPER_API_KEY=...
+export JINA_API_KEY=...
 literegistry search \
   --registry redis://login-node:6379 \
   --cache-db 1 \
   --cache-ttl 3600
 ```
 
-Extra Serper fields such as `gl` and `hl` can be supplied in the request's
-`parameters` object. To use other JSON APIs, pass `--provider generic` together
-with `--search-api-url` and `--fetch-api-url`.
+Extra Serper fields such as `gl` and `hl` can be supplied in a query request's
+`parameters` object. For URL visits, `parameters` become Jina request headers;
+the returned `data` is normalized to `{ "title", "content", "url" }`. To use
+another query JSON API, pass `--provider generic` together with
+`--search-api-url`; URL visits remain Jina Reader (override its endpoint with
+`--fetch-api-url` or `JINA_READER_URL`).
+
+**Start Local Lucene BM25 Server**
+
+The BM25 service is implemented directly in LiteRegistry and uses Pyserini for
+Lucene retrieval. Point it at an existing corpus and index, and optionally
+register it as a named local-search pool:
+
+```bash
+python -m pip install 'literegistry[bm25]'
+literegistry bm25 \
+  --corpus_jsonl=/data/corpus.jsonl \
+  --lucene_index_dir=/data/lucene-index \
+  --registry=redis://login-node:6379 \
+  --service_name=localsearch:corpus \
+  --port=1214
+```
 
 **4. Interact with Gateway**
 

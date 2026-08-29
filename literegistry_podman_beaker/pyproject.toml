@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "literegistry-podman-beaker"
+version = "0.2.11"
+description = "Deploy a LiteRegistry Podman, Docker mirror, gateway, and Redis stack on Beaker."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+  { name = "Goncalo Faria" },
+]
+keywords = ["podman", "docker", "registry-mirror", "literegistry", "beaker"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Typing :: Typed",
+]
+dependencies = [
+  "literegistry>=1.0.35",
+  "fire>=0.7,<1",
+  "tqdm>=4.66,<5",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8",
+  "pytest-asyncio>=0.23",
+]
+publish = [
+  "build>=1.2",
+  "twine>=5",
+]
+
+[project.scripts]
+literegistry-podman-beaker = "literegistry_podman_beaker.cli:main"
+literegistry-podman-warm-gateway = "literegistry_podman_beaker.warm_gateway:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+literegistry_podman_beaker = ["py.typed", "assets/*.txt"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["src", ".."]

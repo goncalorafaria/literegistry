@@ -35,7 +35,15 @@ class ServerRegistry:
         now = time.time()
 
         # Get all server keys
-        server_keys = await self.store.keys()
+        try:
+            server_keys = await self.store.keys(prefix="server_")
+        except TypeError:
+            # Compatibility with third-party stores implementing the original
+            # no-argument keys() contract.
+            server_keys = [
+                key for key in await self.store.keys()
+                if key.startswith("server_")
+            ]
 
         for key in server_keys:
             try:

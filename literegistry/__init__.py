@@ -4,6 +4,18 @@ from .kvstore import FileSystemKVStore
 from .redis import RedisKVStore, start_redis_server
 from .http import RegistryHTTPClient
 from .api import ServiceAPI
+from .affinity import (
+    AffinityBinding,
+    AffinityBindingConflict,
+    AffinityBindingError,
+    AffinityBindingStore,
+    AffinityBindingTypeMismatch,
+    InvalidAffinityBinding,
+    SoftAffinityBinding,
+    SoftAffinityBindingStore,
+    StrictAffinityBinding,
+    StrictAffinityBindingStore,
+)
 
 __all__ = [
     "RegistryClient",
@@ -13,6 +25,16 @@ __all__ = [
     "RegistryHTTPClient",
     "ServiceAPI",
     "start_redis_server",
+    "AffinityBinding",
+    "AffinityBindingConflict",
+    "AffinityBindingError",
+    "AffinityBindingStore",
+    "AffinityBindingTypeMismatch",
+    "InvalidAffinityBinding",
+    "SoftAffinityBinding",
+    "SoftAffinityBindingStore",
+    "StrictAffinityBinding",
+    "StrictAffinityBindingStore",
 ]
 
 def get_kvstore(registry):

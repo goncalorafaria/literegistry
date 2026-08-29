@@ -1,0 +1,29 @@
+FROM python:3.12-slim-bookworm
+
+ARG PIP_INDEX_URL
+ARG PIP_FIND_LINKS
+ARG PIP_TRUSTED_HOST
+ARG LITEREGISTRY_VERSION=1.0.39
+
+ENV VIRTUAL_ENV=/opt/literegistry-gateway-venv \
+    PATH=/opt/literegistry-gateway-venv/bin:$PATH \
+    PYTHONUNBUFFERED=1 \
+    OTEL_TRACES_EXPORTER=none
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && python -m venv "$VIRTUAL_ENV" \
+    && pip install --no-cache-dir --upgrade pip setuptools wheel \
+    && pip install --no-cache-dir "literegistry==${LITEREGISTRY_VERSION}" \
+    && useradd --create-home --uid 10001 gateway
+
+COPY . /opt/literegistry-podman-beaker
+RUN pip install --no-cache-dir --no-deps /opt/literegistry-podman-beaker \
+    && rm -rf /opt/literegistry-podman-beaker
+
+USER gateway
+EXPOSE 8080
+
+ENTRYPOINT ["python", "-m", "literegistry.gateway"]
+CMD ["--host=0.0.0.0", "--port=8080"]

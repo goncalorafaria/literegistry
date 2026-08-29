@@ -99,7 +99,8 @@ literegistry terminal --registry redis://login-node:6379
 
 ### Allowed commands
 
-`rg`, `grep`, `awk`, `sed`, `jq`, `xsv`, `head`, `tail`, `wc`, `cat`, `nl`, `echo`
+`rg`, `grep`, `awk`, `sed`, `jq`, `xsv`, `pandoc`, `sort`, `uniq`, `tr`, `cut`,
+`head`, `tail`, `wc`, `cat`, `nl`, `echo`
 
 Constraints:
 
@@ -107,6 +108,20 @@ Constraints:
 - No `;`, `&&`, `||`, redirects, subshells.
 - Arguments that look like paths (`/…`, `~`, `..`) are rejected.
 - Dangerous awk/sed/jq features (e.g. `system(`, sed `e`/`w`, jq `include`) rejected.
+- Pandoc accepts only stdin readers `markdown`, `commonmark`, `commonmark_x`, `gfm`, or `html` and writers `json`, `native`, or `plain`; `--sandbox` is added automatically. Filters, Lua, templates, defaults, output files, resource paths, and file operands are rejected.
+- `sort` and `uniq` accept stdin-only ordering, deduplication, and counting options; file operands and sort output/temp/random-source options are rejected.
+- `tr` performs stdin-only translation, deletion, and character squeezing.
+- `cut` accepts byte, character, or field ranges from stdin. File operands are rejected; delimiters are limited to one byte.
+
+Pandoc can expose document structure directly or feed its JSON AST into `jq`:
+
+```bash
+pandoc -f markdown -t native
+pandoc -f markdown -t json | jq '[.blocks[] | {type: .t}]'
+rg -o 'https?://[^) ]+' | sort | uniq -c
+grep -o -E '20[0-9]{2}' | sort | uniq -c
+cut -d, -f1,3
+```
 
 ### Request body (`POST /terminal`)
 
