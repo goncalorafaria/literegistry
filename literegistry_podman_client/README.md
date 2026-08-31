@@ -11,7 +11,13 @@ passes a normal image such as `docker.io/library/ubuntu:24.04`.
 
 ## Install
 
-From PyPI after publication:
+Install through the LiteRegistry extra:
+
+```bash
+pip install "literegistry[podman_client]"
+```
+
+The standalone distribution is also available directly:
 
 ```bash
 pip install literegistry-podman-client

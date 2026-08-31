@@ -205,9 +205,9 @@ class DockerMirrorProxy:
         affinity_id: str | None,
         binding: SoftAffinityBinding | None,
         selected: _MirrorServer,
-    ) -> None:
+    ) -> str:
         if self.bindings is None or affinity_id is None:
-            return
+            return "disabled"
         if binding is None:
             try:
                 await self.bindings.bind(
@@ -219,13 +219,14 @@ class DockerMirrorProxy:
             except AffinityBindingConflict:
                 # Another gateway worker won the first-request race. Keep its
                 # valid choice so later requests converge on one mirror.
-                pass
-            return
+                return "race"
+            return "new"
         if (
             binding.server_id == selected.server_id
             and binding.server_uri.rstrip("/") == selected.server_uri
         ):
             await self.bindings.touch(self.binding_service, affinity_id)
+            return "hit"
         else:
             await self.bindings.handoff(
                 self.binding_service,
@@ -233,6 +234,7 @@ class DockerMirrorProxy:
                 selected.server_id,
                 selected.server_uri,
             )
+            return "handoff"
 
     @staticmethod
     def _forward_request_headers(request: Request) -> list[tuple[str, str]]:
@@ -368,14 +370,31 @@ class DockerMirrorProxy:
                     request=request,
                 )
                 healthy_response = response.status < 500
+                upstream_ready_seconds = time.monotonic() - started
                 self._report(
                     server,
-                    time.monotonic() - started,
+                    upstream_ready_seconds,
                     selected.probability,
                     healthy_response,
                 )
                 if healthy_response:
-                    await self._remember(affinity_id, binding, selected)
+                    affinity_result = await self._remember(
+                        affinity_id,
+                        binding,
+                        selected,
+                    )
+                    logger.info(
+                        "Docker mirror route affinity=%s object=%s "
+                        "server_id=%s server_uri=%s attempt=%d "
+                        "upstream_ready_ms=%.3f status=%d",
+                        affinity_result,
+                        affinity_id or "-",
+                        selected.server_id,
+                        selected.server_uri,
+                        attempts,
+                        upstream_ready_seconds * 1000.0,
+                        response.status,
+                    )
                 if request.method == "HEAD":
                     status = response.status
                     response.release()
@@ -425,5 +444,4 @@ class DockerMirrorProxy:
                 raise ValueError(f"duplicate gateway route: {route.path}")
             app.router.routes.append(route)
             existing.add(route.path)
-
 

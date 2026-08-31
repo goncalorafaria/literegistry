@@ -6,7 +6,7 @@ Tests the fixed models endpoint.
 
 import asyncio
 import aiohttp
-from literegistry.gateway import RegistryGatewayServer
+from literegistry.gateway.legacy import RegistryGatewayServer
 from literegistry.client import RegistryClient
 from literegistry.kvstore import FileSystemKVStore
 

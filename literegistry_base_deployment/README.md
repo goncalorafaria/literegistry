@@ -55,10 +55,16 @@ beaker account whoami
 beaker workspace get ai2/oe-agents
 ```
 
-A published install is simply:
+A published install through the LiteRegistry extra is:
 
 ```bash
-python -m pip install 'literegistry-base-deployment==0.1.0'
+pip install "literegistry[base_deployment]"
+```
+
+The standalone distribution can also be installed directly:
+
+```bash
+pip install literegistry-base-deployment
 ```
 
 ### 2. Make LiteRegistry available to Docker

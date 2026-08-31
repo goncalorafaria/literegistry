@@ -47,8 +47,19 @@ python -m pip install -e '.[test,publish]'
 literegistry-podman-beaker --help
 ```
 
-For a published release, install `literegistry-podman-beaker==0.2.11` instead.
-It installs LiteRegistry as a required dependency and does not depend on
+For a published release, install through the LiteRegistry extra:
+
+```bash
+pip install "literegistry[podman_beaker]"
+```
+
+The standalone distribution can also be installed directly:
+
+```bash
+pip install literegistry-podman-beaker
+```
+
+Both forms install LiteRegistry as a required dependency and do not depend on
 Datadev.
 
 ### 3. Make LiteRegistry available to Docker builds

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import tempfile
 
 import aiohttp
@@ -310,6 +311,51 @@ def test_object_affinity_reuses_live_mirror_without_handshake() -> None:
 
     with tempfile.TemporaryDirectory() as root:
         asyncio.run(check(root))
+
+
+def test_affinity_routing_logs_new_hit_and_handoff(caplog) -> None:
+    async def check(root: str) -> None:
+        records = [
+            _mirror_record("server-a", "http://mirror-a:5000"),
+            _mirror_record("server-b", "http://mirror-b:5000"),
+        ]
+        registry = _AffinityRegistry(records)
+        bindings = SoftAffinityBindingStore(FileSystemKVStore(root))
+        session = _Session(
+            [
+                _Response(200, [b"new"]),
+                _Response(200, [b"hit"]),
+                _Response(200, [b"handoff"]),
+            ]
+        )
+        proxy = DockerMirrorProxy(registry, _Sessions(session), bindings=bindings)
+        request = _request(path="/v2/library/alpine/manifests/3.20")
+
+        first = await proxy.forward(request)
+        assert b"".join([chunk async for chunk in first.body_iterator]) == b"new"
+        second = await proxy.forward(request)
+        assert b"".join([chunk async for chunk in second.body_iterator]) == b"hit"
+        registry.records = [records[1]]
+        third = await proxy.forward(request)
+        assert b"".join([chunk async for chunk in third.body_iterator]) == b"handoff"
+
+    with tempfile.TemporaryDirectory() as root:
+        with caplog.at_level(logging.INFO, logger="literegistry.gateway.mirror"):
+            asyncio.run(check(root))
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "affinity=new" in message and "server_id=server-a" in message
+        for message in messages
+    )
+    assert any(
+        "affinity=hit" in message and "server_id=server-a" in message
+        for message in messages
+    )
+    assert any(
+        "affinity=handoff" in message and "server_id=server-b" in message
+        for message in messages
+    )
 
 
 def test_distinct_registry_objects_can_spread_across_mirrors() -> None:
