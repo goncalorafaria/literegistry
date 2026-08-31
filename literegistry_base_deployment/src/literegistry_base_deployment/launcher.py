@@ -16,6 +16,13 @@ from uuid import uuid4
 
 
 RESULT = {"path": "/tmp/result"}
+RESTORE_VENV_PATH = (
+    'for LR_VENV in "${VIRTUAL_ENV:-}" /opt/literegistry-services-venv '
+    '/opt/literegistry-terminal-venv /opt/literegistry-redis-venv; do '
+    'if [[ -n "$LR_VENV" && -x "$LR_VENV/bin/python3" ]]; then '
+    'export VIRTUAL_ENV="$LR_VENV" PATH="$LR_VENV/bin:$PATH"; break; fi; done; '
+    'unset LR_VENV; '
+)
 PORT_BLOCK_START = 20000
 PORTS_PER_SERVICE = 128
 SERVICE_SLOTS = {
@@ -105,7 +112,6 @@ class BaseDeploymentConfig:
     service_priority: str = "normal"
     model_priority: str = "high"
     min_runtime_hours: int = 0
-    service_cpu_count: int = 1
     omit_service_resources: bool = False
     name_prefix: str = "literegistry-base"
     services_image: str = "goncalof/literegistry-base-services"
@@ -175,8 +181,8 @@ class BaseDeploymentConfig:
                 raise ValueError(f"{name} must be between 0 and {PORTS_PER_SERVICE}")
         if self.gateway_workers < 1 or self.python_pool_size < 1:
             raise ValueError("gateway_workers and python_pool_size must be positive")
-        if self.service_cpu_count < 1 or self.min_runtime_hours < 0:
-            raise ValueError("service_cpu_count must be positive and runtime non-negative")
+        if self.min_runtime_hours < 0:
+            raise ValueError("min_runtime_hours must be non-negative")
         if self.gateway_timeout <= 0 or self.registry_cache_ttl_seconds < 1:
             raise ValueError("gateway timeout and registry cache TTL must be positive")
         if self.service_priority not in {"normal", "high", "urgent"}:
@@ -248,7 +254,9 @@ def _dynamic_port_command(
     rank_offset: int = 0,
 ) -> str:
     preferred = _service_port(experiment_name, service)
-    command_json = json.dumps(["bash", "-lc", child_command], separators=(",", ":"))
+    command_json = json.dumps(
+        ["bash", "-lc", RESTORE_VENV_PATH + child_command], separators=(",", ":")
+    )
     return (
         f"LR_GLOBAL_RANK=$(({rank_offset} + ${{BEAKER_REPLICA_RANK:-0}})); "
         f"LR_PREFERRED_PORT=$(({preferred} + LR_GLOBAL_RANK)); "
@@ -258,6 +266,7 @@ def _dynamic_port_command(
         f' --identity "{experiment_name}:{service}:${{LR_GLOBAL_RANK}}"'
         ' --host-id "${BEAKER_NODE_HOSTNAME:-unknown-node}"'
         f" --command-json={shlex.quote(command_json)}"
+        " --lock_dir=/tmp/literegistry-port-locks"
     )
 
 
@@ -293,7 +302,7 @@ class BaseDeploymentLauncher:
         task: dict[str, Any] = {
             "name": name,
             "image": {"beaker": image},
-            "command": ["bash", "-lc", command],
+            "command": ["bash", "-lc", RESTORE_VENV_PATH + command],
             "hostNetworking": True,
             "propagateFailure": critical,
             "propagatePreemption": critical,
@@ -313,7 +322,9 @@ class BaseDeploymentLauncher:
         if model_task:
             task["resources"] = {"gpuCount": gpu_count}
         elif not self.config.omit_service_resources:
-            task["resources"] = {"gpuCount": 0, "cpuCount": self.config.service_cpu_count}
+            # Never set cpuCount: on GPU-shaped Beaker clusters a CPU request
+            # can select a GPU worker even when gpuCount is zero.
+            task["resources"] = {"gpuCount": 0}
         if env_vars:
             task["envVars"] = list(env_vars)
         return task

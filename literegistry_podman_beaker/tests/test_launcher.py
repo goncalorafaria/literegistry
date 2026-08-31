@@ -33,7 +33,7 @@ def test_single_cluster_stack_is_self_contained() -> None:
     assert all(task["context"]["autoResume"] is True for task in tasks.values())
     assert tasks["gateway"]["constraints"] == {"cluster": ["ai2/phobos"]}
     assert all(task["hostNetworking"] for task in tasks.values())
-    assert all("resources" not in task for task in tasks.values())
+    assert all(task["resources"] == {"gpuCount": 0} for task in tasks.values())
     assert all("datadev" not in " ".join(task["command"]) for task in tasks.values())
     assert "literegistry.gateway" in tasks["gateway"]["command"][2]
     assert "literegistry.services.docker_mirror_server" in tasks["docker-mirror"]["command"][2]

@@ -50,6 +50,13 @@ def test_local_search_image_uses_literegistry_service_and_jtc_index_assets() -> 
     assert "literegistry_base_deployment.local_search" not in contents
 
 
+def test_redis_uses_shared_service_uid() -> None:
+    contents = (DOCKER_ROOT / "Dockerfile.redis").read_text(encoding="utf-8")
+    assert "groupmod --gid 10001 redis" in contents
+    assert "usermod --uid 10001 --gid 10001 redis" in contents
+    assert "chown -R redis:redis /data" in contents
+
+
 def test_terminal_image_contains_every_allowlisted_external_tool() -> None:
     contents = (DOCKER_ROOT / "Dockerfile.terminal").read_text(encoding="utf-8")
     for command in ("ripgrep", "jq", "pandoc", "xsv", "coreutils", "gawk"):

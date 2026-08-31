@@ -51,9 +51,9 @@ class PodmanStackConfig:
     budget: str = "ai2/oe-omai"
     priority: str = "normal"
     min_runtime_hours: int = 0
-    # On GPU-shaped Beaker clusters, requesting CPU resources can select a GPU worker.
-    # Leave resources unallocated by default so CPU services receive zero GPUs.
-    cpu_count: int | None = None
+    # Never request cpuCount: on GPU-shaped Beaker clusters that constraint can
+    # select a GPU worker. Explicitly request zero GPUs and leave CPU allocation
+    # unconstrained.
     omit_resources: bool = False
     name_prefix: str = "literegistry-podman"
     podman_image: str = "goncalof/literegistry-podman-immediate-rm-20260819"
@@ -92,8 +92,6 @@ class PodmanStackConfig:
                 raise ValueError(f"{name} must be between 1 and {PORTS_PER_SERVICE}")
         if self.gateway_workers < 1:
             raise ValueError("gateway_workers must be positive")
-        if self.cpu_count is not None and self.cpu_count < 1:
-            raise ValueError("cpu_count must be positive when supplied")
         if self.min_runtime_hours < 0:
             raise ValueError("min_runtime_hours must be non-negative")
         if self.priority not in {"normal", "high", "urgent"}:
@@ -228,8 +226,8 @@ class PodmanStackLauncher:
         }
         if replicas != 1:
             task["replicas"] = replicas
-        if not self.config.omit_resources and self.config.cpu_count is not None:
-            task["resources"] = {"gpuCount": 0, "cpuCount": self.config.cpu_count}
+        if not self.config.omit_resources:
+            task["resources"] = {"gpuCount": 0}
         if env_vars:
             task["envVars"] = list(env_vars)
         return task
