@@ -44,6 +44,8 @@ class PodmanStackConfig:
     podman_replicas: int = 4
     docker_mirror_replicas: int = 2
     gateway_workers: int = 8
+    gateway_tls: bool = False
+    gateway_tls_workers: int = 2
     docker_mirror_soft_affinity: bool = True
     service_clusters: tuple[str, ...] | str = ("ai2/jupiter",)
     gateway_cluster: str | None = None
@@ -92,6 +94,8 @@ class PodmanStackConfig:
                 raise ValueError(f"{name} must be between 1 and {PORTS_PER_SERVICE}")
         if self.gateway_workers < 1:
             raise ValueError("gateway_workers must be positive")
+        if self.gateway_tls_workers < 1:
+            raise ValueError("gateway_tls_workers must be positive")
         if self.min_runtime_hours < 0:
             raise ValueError("min_runtime_hours must be non-negative")
         if self.priority not in {"normal", "high", "urgent"}:
@@ -166,15 +170,21 @@ def _dynamic_port_command(
     experiment_name: str,
     service: str,
     child_command: str,
+    extra_assignments: Mapping[str, int] | None = None,
 ) -> str:
     preferred = _service_port(experiment_name, service)
     command_json = json.dumps(["bash", "-lc", RESTORE_VENV_PATH + child_command], separators=(",", ":"))
+    extra = "".join(
+        f' --assignment "{variable}=$(({port} + ${{BEAKER_REPLICA_RANK:-0}}))"'
+        for variable, port in (extra_assignments or {}).items()
+    )
     return (
         f"LR_PREFERRED_PORT=$(({preferred} + ${{BEAKER_REPLICA_RANK:-0}})); "
         "export LR_PREFERRED_PORT; "
         "exec python3 -m literegistry.coop.ports run "
         ' --assignment "PORT=${LR_PREFERRED_PORT}"'
-        f' --identity "{experiment_name}:{service}:${{BEAKER_REPLICA_RANK:-0}}"'
+        + extra
+        + f' --identity "{experiment_name}:{service}:${{BEAKER_REPLICA_RANK:-0}}"'
         ' --host-id "${BEAKER_NODE_HOSTNAME:-unknown-node}"'
         " --lock_dir=/tmp/literegistry-port-locks"
         f" --command-json={shlex.quote(command_json)}"
@@ -356,11 +366,30 @@ class PodmanStackLauncher:
             f"--timeout={self.config.gateway_timeout:g} "
             f"--docker_mirror_soft_affinity={self.config.docker_mirror_soft_affinity}"
         )
+        gateway_extra_ports: dict[str, int] = {}
+        if self.config.gateway_tls:
+            # Second listener in the gateway's port block: Docker/Podman mirror
+            # clients probe HTTPS before falling back to HTTP, so serving TLS
+            # (self-signed) lets MIRROR_URL point at this port and keeps the
+            # invalid-TLS noise out of the plaintext listener's logs.
+            gateway_extra_ports["TLS_PORT"] = (
+                _service_port(name, "gateway") + PORTS_PER_SERVICE // 2
+            )
+            gateway_child += (
+                ' --tls_port="$TLS_PORT"'
+                f" --tls_workers={self.config.gateway_tls_workers}"
+            )
         tasks.append(
             self._task(
                 "gateway",
                 self.config.gateway_image,
-                wait + _dynamic_port_command(name, "gateway", gateway_child),
+                wait
+                + _dynamic_port_command(
+                    name,
+                    "gateway",
+                    gateway_child,
+                    extra_assignments=gateway_extra_ports or None,
+                ),
                 cluster=self.config.resolved_gateway_cluster(),
             )
         )
