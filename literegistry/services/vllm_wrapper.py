@@ -1,6 +1,8 @@
 import fire
+import os
 import random
 import sys
+import tempfile
 
 from literegistry.services.executable_wrapper import ExecutableWrapper
 from literegistry.runtime import (
@@ -38,7 +40,10 @@ class VLLMServerManager(ExecutableWrapper):
 def main(
     model: str = "meta-llama/Llama-3.1-8B-Instruct",
     host: str = "0.0.0.0",
-    registry: str = "/gscratch/ark/graf/registry",
+    registry: str = os.environ.get(
+        "LITEREGISTRY_REGISTRY",
+        os.path.join(tempfile.gettempdir(), "literegistry-registry"),
+    ),
     port: int = None,
     runtime: str = "apptainer",
     image: str = "vllm-openai_latest-cu129-ubuntu2404.sif",

@@ -1,5 +1,7 @@
 import fire
+import os
 import random
+import tempfile
 
 from literegistry.services.executable_wrapper import ExecutableWrapper
 from literegistry.runtime import (
@@ -8,7 +10,6 @@ from literegistry.runtime import (
     with_default_binds,
     with_default_env,
 )
-import os
 # python3 -m sglang.launch_server 
 class SGLangServerManager(ExecutableWrapper):
     """SGLang server manager implementation"""
@@ -29,7 +30,10 @@ class SGLangServerManager(ExecutableWrapper):
 def main(
     model: str = "meta-llama/Llama-3.1-8B-Instruct",
     host: str = "0.0.0.0", 
-    registry: str = "/mmfs1/home/gfaria/registry",
+    registry: str = os.environ.get(
+        "LITEREGISTRY_REGISTRY",
+        os.path.join(tempfile.gettempdir(), "literegistry-registry"),
+    ),
     port: int = None,
     runtime: str = "apptainer",
     image: str = "sglang_latest.sif",

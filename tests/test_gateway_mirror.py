@@ -345,15 +345,25 @@ def test_affinity_routing_logs_new_hit_and_handoff(caplog) -> None:
 
     messages = [record.getMessage() for record in caplog.records]
     assert any(
-        "affinity=new" in message and "server_id=server-a" in message
+        "mode=soft event=resolve" in message and "binding=miss" in message
         for message in messages
     )
     assert any(
-        "affinity=hit" in message and "server_id=server-a" in message
+        "mode=soft event=route_complete" in message
+        and "decision=new" in message
+        and "server_id='server-a'" in message
         for message in messages
     )
     assert any(
-        "affinity=handoff" in message and "server_id=server-b" in message
+        "mode=soft event=route_complete" in message
+        and "decision=hit" in message
+        and "server_id='server-a'" in message
+        for message in messages
+    )
+    assert any(
+        "mode=soft event=route_complete" in message
+        and "decision=handoff" in message
+        and "server_id='server-b'" in message
         for message in messages
     )
 
@@ -491,3 +501,90 @@ def test_proxy_returns_final_upstream_5xx_when_no_replacement_exists() -> None:
         assert len(session.calls) == 1
 
     asyncio.run(check())
+
+
+def test_blob_download_redirects_to_affinity_mirror_without_relay() -> None:
+    async def check(root: str) -> None:
+        records = [
+            _mirror_record("server-a", "http://mirror-a:5000"),
+            _mirror_record("server-b", "http://mirror-b:5000"),
+        ]
+        registry = _AffinityRegistry(records)
+        bindings = SoftAffinityBindingStore(FileSystemKVStore(root))
+        session = _Session([])
+        proxy = DockerMirrorProxy(
+            registry,
+            _Sessions(session),
+            bindings=bindings,
+        )
+        request = _request(
+            path="/v2/library/alpine/blobs/sha256:abc",
+            query=b"ns=registry-1.docker.io",
+        )
+
+        first = await proxy.forward(request)
+        assert first.status_code == 307
+        assert first.headers["location"] == (
+            "http://mirror-a:5000/v2/library/alpine/blobs/sha256:abc"
+            "?ns=registry-1.docker.io"
+        )
+        assert first.headers["docker-content-digest"] == "sha256:abc"
+        assert first.headers["docker-distribution-api-version"] == "registry/2.0"
+        assert first.headers["cache-control"] == "no-store"
+        assert first.headers["content-length"] == "0"
+        assert session.calls == []
+
+        registry.records.reverse()
+        second = await proxy.forward(request)
+        assert second.headers["location"].startswith("http://mirror-a:5000/")
+        assert session.calls == []
+
+        binding = await bindings.resolve(
+            "docker-mirror:image",
+            "library/alpine/blobs/sha256:abc",
+        )
+        assert binding is not None
+        assert binding.server_id == "server-a"
+        assert binding.handoff_count == 0
+
+    with tempfile.TemporaryDirectory() as root:
+        asyncio.run(check(root))
+
+
+def test_blob_head_redirects_but_manifest_get_remains_proxied() -> None:
+    async def check() -> None:
+        response = _Response(200, [b"manifest"])
+        session = _Session([response])
+        registry = _Registry([("http://mirror-a:5000", 1.0)])
+        proxy = DockerMirrorProxy(registry, _Sessions(session))
+
+        blob = await proxy.forward(
+            _request(
+                method="HEAD",
+                path="/v2/library/alpine/blobs/sha256:abc",
+            )
+        )
+        assert blob.status_code == 307
+        assert session.calls == []
+
+        manifest = await proxy.forward(
+            _request(path="/v2/library/alpine/manifests/3.20")
+        )
+        assert b"".join(
+            [chunk async for chunk in manifest.body_iterator]
+        ) == b"manifest"
+        assert len(session.calls) == 1
+
+    asyncio.run(check())
+
+
+def test_blob_redirect_requires_an_exact_safe_digest_path() -> None:
+    assert DockerMirrorProxy._blob_digest(
+        _request(path="/v2/library/alpine/blobs/not-a-digest")
+    ) is None
+    assert DockerMirrorProxy._blob_digest(
+        _request(path="/v2/library/alpine/blobs/uploads/sha256:abc")
+    ) is None
+    assert DockerMirrorProxy._blob_digest(
+        _request(path="/v2/library/alpine/blobs/sha256:abc")
+    ) == "sha256:abc"

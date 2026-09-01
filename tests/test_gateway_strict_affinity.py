@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import tempfile
 
 from literegistry.affinity import StrictAffinityBindingStore
@@ -337,7 +338,7 @@ def test_gateway_demonstrates_two_independent_affinity_bindings():
         asyncio.run(check(root))
 
 
-def test_gateway_owns_podman_handshake_podman_and_close_routes():
+def test_gateway_owns_podman_handshake_podman_and_close_routes(caplog):
     affinity_id = "a" * 64
 
     async def check(root):
@@ -429,7 +430,29 @@ def test_gateway_owns_podman_handshake_podman_and_close_routes():
         ]
 
     with tempfile.TemporaryDirectory() as root:
-        asyncio.run(check(root))
+        with caplog.at_level(logging.INFO, logger="literegistry.gateway.affinity"):
+            asyncio.run(check(root))
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "mode=strict event=bound" in message
+        and "service='podman'" in message
+        and "server_id='podman-a'" in message
+        for message in messages
+    )
+    assert any(
+        "mode=strict event=route_complete" in message
+        and "endpoint='podman'" in message
+        and "binding=hit action=touch" in message
+        for message in messages
+    )
+    assert any(
+        "mode=strict event=route_complete" in message
+        and "endpoint='close'" in message
+        and "binding=hit action=release" in message
+        for message in messages
+    )
+    assert all("echo ai2 hello" not in message for message in messages)
 
 
 def test_unknown_affinity_id_never_falls_back_to_load_balancing():

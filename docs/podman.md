@@ -45,6 +45,13 @@ The standalone LiteRegistry Podman Beaker stack can launch `docker_mirror_replic
 gateway itself. It publishes the gateway's actual host and dynamically
 allocated port, then supplies that URL to every Podman replica automatically.
 
+> **Optional companions:** Applications can install the async gateway client
+> with `pip install "literegistry[podman_client]"`. Operators who want the
+> complete rootless Podman, Docker mirror, gateway, and Redis Beaker stack can
+> use `pip install "literegistry[podman_beaker]"`. These packages are
+> convenience extensions; neither is required to run the core server and HTTP
+> API documented below.
+
 ## Session lifecycle
 
 Create a container and affinity binding:

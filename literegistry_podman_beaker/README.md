@@ -64,9 +64,9 @@ Datadev.
 
 ### 3. Make LiteRegistry available to Docker builds
 
-The gateway image pins `literegistry==1.0.39`; the other images install the
+The gateway image pins `literegistry==1.0.40`; the other images install the
 Beaker package, whose dependency requires `literegistry>=1.0.35`. Make version
-1.0.35 available on the Python index used by Docker, or expose it through a
+1.0.40 available on the Python index used by Docker, or expose it through a
 wheelhouse URL reachable from the Docker builder:
 
 ```bash
@@ -74,7 +74,7 @@ cd /weka/gfaria/literegistry
 python -m build
 python -m twine check dist/*
 # Publish to your configured index when appropriate:
-# python -m twine upload dist/literegistry-1.0.39*
+# python -m twine upload dist/literegistry-1.0.40*
 ```
 
 For a private index or HTTP wheelhouse:
@@ -511,7 +511,7 @@ PODMAN_IMAGE=YOUR_REGISTRY/literegistry-podman-server:0.2.11
 DOCKER_MIRROR_IMAGE=YOUR_REGISTRY/literegistry-docker-mirror:0.2.11
 ```
 
-Publish `literegistry==1.0.39` to the
+Publish `literegistry==1.0.40` to the
 selected Python index before building the runtime images.
 
 If LiteRegistry is served by an internal Python index, export

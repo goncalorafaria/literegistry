@@ -19,6 +19,16 @@ behavior.
 | [Runtimes](runtimes.md) | `local` vs `apptainer`, binds, env, image pull |
 | [Console](console.md) | Streamlit dashboard for gateway / vLLM / registry |
 
+> **Optional companions:** The core package does not require the separately
+> versioned Podman client or Beaker launchers. Add only the extension you need:
+> `literegistry[podman_client]` for the async `PodmanClient`,
+> `literegistry[podman_beaker]` for a Podman/mirror Beaker stack, or
+> `literegistry[base_deployment]` for the broader tools and model-serving
+> stack. `literegistry[all]` installs all three. See their repository guides:
+> [Podman client](https://github.com/goncalorafaria/literegistry/tree/master/literegistry_podman_client),
+> [Podman Beaker](https://github.com/goncalorafaria/literegistry/tree/master/literegistry_podman_beaker), and
+> [base deployment](https://github.com/goncalorafaria/literegistry/tree/master/literegistry_base_deployment).
+
 ## Typical flow
 
 ```text

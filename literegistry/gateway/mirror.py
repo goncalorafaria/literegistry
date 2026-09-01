@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 import logging
+import re
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -24,6 +26,17 @@ from literegistry.gateway import GatewayRequestError
 
 
 logger = logging.getLogger(__name__)
+_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+_DIGEST_RE = re.compile(r"^[A-Za-z0-9_+.-]+:[A-Za-z0-9=_-]+$")
+
+
+def _request_id(request: Request) -> str:
+    """Return a log-safe request correlation ID without exposing headers."""
+    supplied = request.headers.get("x-request-id", "")
+    if _REQUEST_ID_RE.fullmatch(supplied):
+        return supplied
+    return uuid.uuid4().hex[:16]
+
 _HOP_BY_HOP_HEADERS = {
     "connection",
     "keep-alive",
@@ -103,6 +116,20 @@ class DockerMirrorProxy:
         if namespace in _DOCKER_HUB_NAMESPACES:
             namespace = ""
         return f"{namespace}/{object_key}" if namespace else object_key
+
+    @staticmethod
+    def _blob_digest(request: Request) -> str | None:
+        """Return the digest for an exact Registry V2 blob download path."""
+        if request.method not in {"GET", "HEAD"}:
+            return None
+        path = request.scope.get("path") or request.url.path
+        if not path.startswith("/v2/"):
+            return None
+        segments = [segment for segment in path[4:].split("/") if segment]
+        if len(segments) < 3 or segments[-2] != "blobs":
+            return None
+        digest = segments[-1]
+        return digest if _DIGEST_RE.fullmatch(digest) else None
 
     async def _live_servers(
         self,
@@ -301,13 +328,55 @@ class DockerMirrorProxy:
             report(server, latency, prob=probability, success=success)
 
     async def forward(self, request: Request) -> Response:
+        request_id = _request_id(request)
+        request_started = time.monotonic()
         affinity_id = self._image_affinity_id(request)
         binding, candidates = await self._candidates(affinity_id, force=False)
+        if self.bindings is None or affinity_id is None:
+            binding_state = "disabled"
+        elif binding is None:
+            binding_state = "miss"
+        elif (
+            candidates
+            and candidates[0].server_id == binding.server_id
+            and candidates[0].server_uri == binding.server_uri.rstrip("/")
+        ):
+            binding_state = "hit"
+        else:
+            binding_state = "stale"
+        logger.info(
+            "gateway_affinity mode=soft event=resolve request_id=%s "
+            "service=%r method=%s object=%r binding=%s owner_id=%r "
+            "owner_uri=%r registry_force=false candidates=%d",
+            request_id,
+            self.service,
+            request.method,
+            affinity_id or "-",
+            binding_state,
+            binding.server_id if binding is not None else "-",
+            binding.server_uri if binding is not None else "-",
+            len(candidates),
+        )
         if not candidates:
             # A negative cached roster is confirmed against Redis before the
             # gateway reports that no mirror is alive.
+            logger.info(
+                "gateway_affinity mode=soft event=roster_refresh "
+                "request_id=%s service=%r object=%r reason=no_candidates",
+                request_id,
+                self.service,
+                affinity_id or "-",
+            )
             binding, candidates = await self._candidates(affinity_id, force=True)
         if not candidates:
+            logger.error(
+                "gateway_affinity mode=soft event=route_failed request_id=%s "
+                "service=%r object=%r reason=no_healthy_server elapsed_ms=%.3f",
+                request_id,
+                self.service,
+                affinity_id or "-",
+                (time.monotonic() - request_started) * 1000.0,
+            )
             raise GatewayRequestError(
                 f"No healthy {self.service} servers are registered",
                 status_code=503,
@@ -333,6 +402,47 @@ class DockerMirrorProxy:
                 continue
             attempted.add(server)
             attempts += 1
+            selection = (
+                "binding"
+                if binding is not None
+                and binding.server_id == selected.server_id
+                and binding.server_uri.rstrip("/") == selected.server_uri
+                else "sample"
+            )
+
+            blob_digest = self._blob_digest(request)
+            if blob_digest is not None:
+                affinity_result = await self._remember(
+                    affinity_id,
+                    binding,
+                    selected,
+                )
+                location = self._upstream_url(server, request)
+                logger.info(
+                    "gateway_affinity mode=soft event=blob_redirect "
+                    "request_id=%s service=%r method=%s object=%r "
+                    "decision=%s previous_server_id=%r server_id=%r "
+                    "server_uri=%r selection=%s location=%r",
+                    request_id,
+                    self.service,
+                    request.method,
+                    affinity_id or "-",
+                    affinity_result,
+                    binding.server_id if binding is not None else "-",
+                    selected.server_id,
+                    selected.server_uri,
+                    selection,
+                    location,
+                )
+                return Response(
+                    status_code=307,
+                    headers={
+                        "Location": location,
+                        "Docker-Content-Digest": blob_digest,
+                        "Docker-Distribution-Api-Version": "registry/2.0",
+                        "Cache-Control": "no-store",
+                    },
+                )
             started = time.monotonic()
             response: aiohttp.ClientResponse | None = None
             try:
@@ -345,7 +455,29 @@ class DockerMirrorProxy:
                     timeout=timeout,
                 )
                 if response.status >= 500 and attempts < self.max_retries:
+                    logger.warning(
+                        "gateway_affinity mode=soft event=route_retry "
+                        "request_id=%s service=%r object=%r attempt=%d "
+                        "server_id=%r server_uri=%r selection=%s "
+                        "reason=upstream_5xx status=%d",
+                        request_id,
+                        self.service,
+                        affinity_id or "-",
+                        attempts,
+                        selected.server_id,
+                        selected.server_uri,
+                        selection,
+                        response.status,
+                    )
                     if not candidates and not refreshed:
+                        logger.info(
+                            "gateway_affinity mode=soft event=roster_refresh "
+                            "request_id=%s service=%r object=%r "
+                            "reason=candidates_exhausted",
+                            request_id,
+                            self.service,
+                            affinity_id or "-",
+                        )
                         binding, fresh = await self._candidates(
                             affinity_id, force=True
                         )
@@ -384,15 +516,45 @@ class DockerMirrorProxy:
                         selected,
                     )
                     logger.info(
-                        "Docker mirror route affinity=%s object=%s "
-                        "server_id=%s server_uri=%s attempt=%d "
-                        "upstream_ready_ms=%.3f status=%d",
+                        "gateway_affinity mode=soft event=route_complete "
+                        "request_id=%s service=%r method=%s object=%r "
+                        "decision=%s previous_server_id=%r server_id=%r "
+                        "server_uri=%r selection=%s attempt=%d "
+                        "roster_refreshed=%s upstream_ready_ms=%.3f "
+                        "elapsed_ms=%.3f status=%d",
+                        request_id,
+                        self.service,
+                        request.method,
+                        affinity_id or "-",
                         affinity_result,
+                        binding.server_id if binding is not None else "-",
+                        selected.server_id,
+                        selected.server_uri,
+                        selection,
+                        attempts,
+                        str(refreshed).lower(),
+                        upstream_ready_seconds * 1000.0,
+                        (time.monotonic() - request_started) * 1000.0,
+                        response.status,
+                    )
+                else:
+                    logger.warning(
+                        "gateway_affinity mode=soft event=route_complete "
+                        "request_id=%s service=%r method=%s object=%r "
+                        "decision=unchanged server_id=%r server_uri=%r "
+                        "selection=%s attempt=%d roster_refreshed=%s "
+                        "upstream_ready_ms=%.3f elapsed_ms=%.3f status=%d",
+                        request_id,
+                        self.service,
+                        request.method,
                         affinity_id or "-",
                         selected.server_id,
                         selected.server_uri,
+                        selection,
                         attempts,
+                        str(refreshed).lower(),
                         upstream_ready_seconds * 1000.0,
+                        (time.monotonic() - request_started) * 1000.0,
                         response.status,
                     )
                 if request.method == "HEAD":
@@ -414,11 +576,33 @@ class DockerMirrorProxy:
                     selected.probability,
                     False,
                 )
-                logger.warning("Docker mirror %s failed: %s", server, error)
+                logger.warning(
+                    "gateway_affinity mode=soft event=backend_failure "
+                    "request_id=%s service=%r object=%r attempt=%d "
+                    "server_id=%r server_uri=%r selection=%s "
+                    "error_type=%s elapsed_ms=%.3f",
+                    request_id,
+                    self.service,
+                    affinity_id or "-",
+                    attempts,
+                    selected.server_id,
+                    selected.server_uri,
+                    selection,
+                    type(error).__name__,
+                    (time.monotonic() - started) * 1000.0,
+                )
 
             if not candidates and not refreshed and attempts < self.max_retries:
                 # Only failures exhaust the cached choices and trigger a full
                 # roster refresh. The replacement may then receive a handoff.
+                logger.info(
+                    "gateway_affinity mode=soft event=roster_refresh "
+                    "request_id=%s service=%r object=%r "
+                    "reason=candidates_exhausted",
+                    request_id,
+                    self.service,
+                    affinity_id or "-",
+                )
                 binding, fresh = await self._candidates(affinity_id, force=True)
                 candidates.extend(
                     candidate
@@ -427,6 +611,18 @@ class DockerMirrorProxy:
                 )
                 refreshed = True
 
+        logger.error(
+            "gateway_affinity mode=soft event=route_failed request_id=%s "
+            "service=%r object=%r attempts=%d roster_refreshed=%s "
+            "reason=all_backends_failed error_type=%s elapsed_ms=%.3f",
+            request_id,
+            self.service,
+            affinity_id or "-",
+            attempts,
+            str(refreshed).lower(),
+            type(last_error).__name__ if last_error is not None else "-",
+            (time.monotonic() - request_started) * 1000.0,
+        )
         raise GatewayRequestError(
             f"All {self.service} servers failed: {last_error}",
             status_code=502,

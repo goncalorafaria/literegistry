@@ -9,17 +9,6 @@ Lightweight service registry and discovery system for distributed model inferenc
 pip install literegistry
 ```
 
-Install optional sibling packages through LiteRegistry extras:
-
-```bash
-pip install "literegistry[podman_client]"
-pip install "literegistry[podman_beaker]"
-pip install "literegistry[all]"
-```
-
-These are convenience dependencies; the client and Beaker deployment code
-remain separately versioned distributions.
-
 ## Documentation
 
 Usage guides with argument reference live in [`docs/`](docs/README.md)
@@ -36,6 +25,22 @@ Usage guides with argument reference live in [`docs/`](docs/README.md)
 - [Load balancing](docs/load-balancing.md)
 - [Runtimes](docs/runtimes.md)
 - [Console](docs/console.md)
+
+> **Optional companion packages:** LiteRegistry remains usable on its own. If
+> you need the async Podman gateway client or the Beaker deployment launchers,
+> install the separately versioned companions through an extra:
+>
+> ```bash
+> pip install "literegistry[podman_client]"    # Async PodmanClient
+> pip install "literegistry[podman_beaker]"    # Podman + mirror Beaker stack
+> pip install "literegistry[base_deployment]"  # General tools/model Beaker stack
+> pip install "literegistry[all]"              # Every companion
+> ```
+>
+> Their detailed setup guides live in
+> [`literegistry_podman_client/`](literegistry_podman_client/README.md),
+> [`literegistry_podman_beaker/`](literegistry_podman_beaker/README.md), and
+> [`literegistry_base_deployment/`](literegistry_base_deployment/README.md).
 
 ## Quick Start
 

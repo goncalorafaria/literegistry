@@ -5,7 +5,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import socket
+import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Protocol
 from urllib.parse import urlsplit, urlunsplit
@@ -25,6 +28,15 @@ from literegistry.http import HTTPResponseError, RegistryHTTPClient
 
 
 logger = logging.getLogger(__name__)
+_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+
+
+def _request_id(request: Request) -> str:
+    """Return a log-safe request correlation ID without exposing headers."""
+    supplied = request.headers.get("x-request-id", "")
+    if _REQUEST_ID_RE.fullmatch(supplied):
+        return supplied
+    return uuid.uuid4().hex[:16]
 
 
 def local_hostnames() -> set[str]:
@@ -243,13 +255,30 @@ class StrictAffinityGateway:
             ) from exc
 
     async def handshake(self, request: Request) -> Response:
+        request_id = _request_id(request)
+        started = time.monotonic()
         payload = await self._payload(request)
         service, forwarded = self._service(payload)
+        logger.info(
+            "gateway_affinity mode=strict event=handshake_start "
+            "request_id=%s service=%r",
+            request_id,
+            service,
+        )
         last_unavailable: Optional[GatewayRequestError] = None
         # Use cached discovery first. A complete registry refresh happens only
         # if every cached candidate fails or the cached roster is empty.
         for force in (False, True):
-            for selected in await self._candidate_servers(service, force=force):
+            candidates = await self._candidate_servers(service, force=force)
+            logger.info(
+                "gateway_affinity mode=strict event=roster "
+                "request_id=%s service=%r registry_force=%s candidates=%d",
+                request_id,
+                service,
+                str(force).lower(),
+                len(candidates),
+            )
+            for attempt, selected in enumerate(candidates, start=1):
                 try:
                     result = await self._post(
                         service,
@@ -260,6 +289,17 @@ class StrictAffinityGateway:
                 except GatewayRequestError as exc:
                     if exc.status_code == 503:
                         last_unavailable = exc
+                        logger.warning(
+                            "gateway_affinity mode=strict event=handshake_retry "
+                            "request_id=%s service=%r registry_force=%s attempt=%d "
+                            "server_id=%r server_uri=%r reason=unavailable",
+                            request_id,
+                            service,
+                            str(force).lower(),
+                            attempt,
+                            selected.server_id,
+                            selected.server_uri,
+                        )
                         continue
                     raise
 
@@ -279,15 +319,49 @@ class StrictAffinityGateway:
                         selected.server_uri,
                     )
                 except AffinityBindingConflict as exc:
+                    logger.warning(
+                        "gateway_affinity mode=strict event=bind_conflict "
+                        "request_id=%s service=%r affinity_id=%r "
+                        "server_id=%r server_uri=%r",
+                        request_id,
+                        service,
+                        affinity_id,
+                        selected.server_id,
+                        selected.server_uri,
+                    )
                     raise GatewayRequestError(str(exc), status_code=409) from exc
+                logger.info(
+                    "gateway_affinity mode=strict event=bound "
+                    "request_id=%s service=%r affinity_id=%r "
+                    "server_id=%r server_uri=%r registry_force=%s attempt=%d "
+                    "elapsed_ms=%.3f",
+                    request_id,
+                    service,
+                    affinity_id,
+                    selected.server_id,
+                    selected.server_uri,
+                    str(force).lower(),
+                    attempt,
+                    (time.monotonic() - started) * 1000.0,
+                )
                 return JSONResponse(result)
 
+        logger.error(
+            "gateway_affinity mode=strict event=handshake_failed "
+            "request_id=%s service=%r reason=no_available_server "
+            "elapsed_ms=%.3f",
+            request_id,
+            service,
+            (time.monotonic() - started) * 1000.0,
+        )
         raise GatewayRequestError(
             f"no available servers for affinity service {service}",
             status_code=503,
         ) from last_unavailable
 
     async def forward(self, request: Request, endpoint: str) -> Response:
+        request_id = _request_id(request)
+        started = time.monotonic()
         payload = await self._payload(request)
         service, forwarded = self._service(payload)
         affinity_id = forwarded.get("affinity_id")
@@ -295,17 +369,54 @@ class StrictAffinityGateway:
             raise GatewayRequestError("affinity_id must be a non-empty string")
         binding = await self.bindings.resolve(service, affinity_id)
         if binding is None:
+            logger.warning(
+                "gateway_affinity mode=strict event=binding_miss "
+                "request_id=%s service=%r affinity_id=%r endpoint=%r",
+                request_id,
+                service,
+                affinity_id,
+                endpoint,
+            )
             raise GatewayRequestError(
                 "strict affinity binding was not found or has expired",
                 status_code=404,
             )
+
+        liveness_check = "normal"
         try:
             # This normally checks RegistryClient's short-lived in-process
             # roster cache. A negative cached result is confirmed against
             # Redis before rejecting the pinned request.
             await self._ensure_active(service, binding, force=False)
         except GatewayRequestError:
-            await self._ensure_active(service, binding, force=True)
+            logger.info(
+                "gateway_affinity mode=strict event=liveness_refresh "
+                "request_id=%s service=%r affinity_id=%r endpoint=%r "
+                "server_id=%r server_uri=%r reason=owner_not_in_normal_roster",
+                request_id,
+                service,
+                affinity_id,
+                endpoint,
+                binding.server_id,
+                binding.server_uri,
+            )
+            try:
+                await self._ensure_active(service, binding, force=True)
+            except GatewayRequestError:
+                logger.warning(
+                    "gateway_affinity mode=strict event=owner_unavailable "
+                    "request_id=%s service=%r affinity_id=%r endpoint=%r "
+                    "server_id=%r server_uri=%r liveness=refresh",
+                    request_id,
+                    service,
+                    affinity_id,
+                    endpoint,
+                    binding.server_id,
+                    binding.server_uri,
+                )
+                raise
+            liveness_check = "forced_refresh"
+
         try:
             # The binding supplies the exact URI after the cached liveness check.
             # Strict affinity never substitutes another replica.
@@ -320,18 +431,61 @@ class StrictAffinityGateway:
                 raise
             # Only a failed cached route forces fresh discovery. If the
             # replica is still registered, retry once for transient failures.
-            await self._ensure_active(service, binding, force=True)
-            result = await self._post(
+            logger.warning(
+                "gateway_affinity mode=strict event=route_retry "
+                "request_id=%s service=%r affinity_id=%r endpoint=%r "
+                "server_id=%r server_uri=%r reason=backend_unavailable",
+                request_id,
                 service,
-                binding.server_uri,
+                affinity_id,
                 endpoint,
-                forwarded,
+                binding.server_id,
+                binding.server_uri,
             )
+            liveness_check = "forced_refresh"
+            try:
+                await self._ensure_active(service, binding, force=True)
+                result = await self._post(
+                    service,
+                    binding.server_uri,
+                    endpoint,
+                    forwarded,
+                )
+            except GatewayRequestError:
+                logger.warning(
+                    "gateway_affinity mode=strict event=route_failed "
+                    "request_id=%s service=%r affinity_id=%r endpoint=%r "
+                    "server_id=%r server_uri=%r",
+                    request_id,
+                    service,
+                    affinity_id,
+                    endpoint,
+                    binding.server_id,
+                    binding.server_uri,
+                )
+                raise
 
         if endpoint.strip("/") == "close":
             await self.bindings.release(service, affinity_id)
+            binding_action = "release"
         else:
             await self.bindings.touch(service, affinity_id)
+            binding_action = "touch"
+        logger.info(
+            "gateway_affinity mode=strict event=route_complete "
+            "request_id=%s service=%r affinity_id=%r endpoint=%r "
+            "server_id=%r server_uri=%r binding=hit action=%s "
+            "liveness_check=%s elapsed_ms=%.3f",
+            request_id,
+            service,
+            affinity_id,
+            endpoint,
+            binding.server_id,
+            binding.server_uri,
+            binding_action,
+            liveness_check,
+            (time.monotonic() - started) * 1000.0,
+        )
         return JSONResponse(result)
 
     async def put(self, request: Request) -> Response:

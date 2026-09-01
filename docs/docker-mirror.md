@@ -7,30 +7,32 @@ the cache and Redis never stores image data. The small LiteRegistry wrapper
 only advertises each healthy mirror's host and port and optionally warms it.
 
 The LiteRegistry gateway provides one stable address in front of multiple
-`docker-mirror` replicas. Docker's internal Registry V2 requests are streamed
-to a discovered replica. There is no handshake, container ID, or client-supplied
-affinity key. The experimental soft-affinity mode is optional and enabled by
-default. When enabled, the gateway infers the repository name from paths such as
-`/v2/library/alpine/manifests/3.20` and stores a soft affinity binding.
+`docker-mirror` replicas. There is no handshake, container ID, or
+client-supplied affinity key. The gateway proxies registry control requests,
+selects a live mirror for each exact registry object, and returns a temporary
+`307` redirect for blob `GET` and `HEAD` requests.
 
 ```text
-Docker / Podman -> LiteRegistry gateway /v2/... -> discovered docker-mirror replica
-                                              |
-                                              +-> Docker Hub on a cache miss
-Redis <- health + URI heartbeats -------------+
+manifests/control: Docker / Podman -> gateway -> selected mirror
+blob selection:    Docker / Podman -> gateway --307 Location--> client
+blob bytes:        Docker / Podman -------------------------> selected mirror
+                                                          -> Docker Hub on miss
+Redis <- mirror health + URI heartbeats
 ```
 
-The cache data itself is persistent when `/var/lib/registry` is mounted. The
-gateway streams Registry V2 `GET` and `HEAD` responses. Requests for manifests,
-blobs, tags, and referrers in one repository prefer the same mirror, so layer
-requests benefit from the cache populated by the manifest request. Root `/v2/`
-health requests remain normally load-balanced.
+The redirect is deliberately temporary and carries `Cache-Control: no-store`.
+Podman returns to the gateway for every new registry request; it follows the
+selected mirror only for that individual blob transfer. The gateway therefore
+remains the affinity control plane while image bytes do not traverse the
+single gateway node.
 
-When experimental soft affinity is enabled, the gateway first checks that its
-server ID and URI are in the cached healthy heartbeat roster. The roster cache is five seconds by default.
-If the owner is absent, or if the real request fails after that check, another
-healthy mirror is selected and the binding is handed off. Bindings use the same
-sliding `affinity_ttl_seconds` setting as strict affinity (15 minutes by default).
+The cache data itself is persistent when `/var/lib/registry` is mounted.
+Manifests, tags, referrers, and root `/v2/` requests remain proxied. Repeated
+requests for an exact manifest or blob prefer the same live mirror. When soft
+affinity is enabled, the gateway verifies that the binding's server ID and URI
+remain in the cached healthy roster. If the owner is absent, another live
+mirror is selected and the binding is handed off. The roster cache is five
+seconds by default; bindings use a sliding seven-day TTL by default.
 
 ## Build
 
@@ -45,8 +47,9 @@ and cache warmer. It runs as UID 10001, not root.
 
 ## Run one mirror
 
-The advertised host must be reachable by the LiteRegistry gateway. Mount the cache
-volume so a restart does not discard already-pulled layers.
+The advertised host must be reachable by both the LiteRegistry gateway and its
+Docker/Podman clients because blob downloads are redirected to it. Mount the
+cache volume so a restart does not discard already-pulled layers.
 
 ```bash
 docker volume create docker-mirror-cache
@@ -136,9 +139,10 @@ Check the route without a handshake:
 
 ```bash
 curl -i http://gateway.example:8080/v2/
-curl -fsS \
-  -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
-  http://gateway.example:8080/v2/library/alpine/manifests/3.20
+curl -fsS -H 'Accept: application/vnd.oci.image.manifest.v1+json' http://gateway.example:8080/v2/library/alpine/manifests/3.20
+
+# Blob requests return 307; --location follows the direct mirror transfer.
+curl --location --output /dev/null 'http://gateway.example:8080/v2/library/alpine/blobs/sha256:DIGEST'
 ```
 
 Configure Docker with the gateway as its Docker Hub mirror:
