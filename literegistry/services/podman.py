@@ -57,6 +57,20 @@ def build_podman_registry_mirror_config(mirror_url: str) -> str:
     )
 
 
+_MEMORY_SUFFIXES = {"b": 1, "k": 1024, "m": 1024**2, "g": 1024**3}
+
+
+def parse_memory_limit(value: str) -> int:
+    """Parse a Podman-style memory size (``256m``, ``4g``, ``1073741824``) to bytes."""
+    text = value.strip().lower()
+    if not text:
+        raise ValueError("memory limit must be non-empty")
+    suffix = text[-1]
+    if suffix in _MEMORY_SUFFIXES:
+        return int(float(text[:-1]) * _MEMORY_SUFFIXES[suffix])
+    return int(text)
+
+
 class PodmanBackendError(RuntimeError):
     pass
 
@@ -495,23 +509,145 @@ class PodmanSessionBackend:
                 result.stderr.decode(errors="replace").strip(),
             )
 
+    async def _container_init_pid(self, container_id: str) -> Optional[int]:
+        """Return the container's init PID as seen by the Podman host."""
+        result = await self._run(
+            [*self._podman, "inspect", "--format", "{{.State.Pid}}", container_id],
+            timeout=15.0,
+        )
+        if result.returncode != 0:
+            return None
+        text = result.stdout.decode().strip()
+        try:
+            pid = int(text)
+        except ValueError:
+            return None
+        return pid if pid > 0 else None
+
+    @staticmethod
+    def _subtree_stats(root_pid: int) -> Optional[tuple[int, int]]:
+        """Return (RSS bytes, process count) for the subtree rooted at ``root_pid``.
+
+        Reads the Podman host's own ``/proc`` (where the session's processes
+        are descendants of the container init PID), so it works regardless of
+        whether the host delegates memory/pids cgroups or whether the container
+        has an isolated ``/proc`` view. The count is processes (not threads),
+        which is what catches a fork bomb. Returns None if the root has already
+        exited.
+        """
+        parent_of: dict[int, int] = {}
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/stat", "rb") as handle:
+                    fields = handle.read().rsplit(b")", 1)[1].split()
+                parent_of[int(entry)] = int(fields[1])
+            except (OSError, IndexError, ValueError):
+                continue
+        if root_pid not in parent_of:
+            return None
+        children: dict[int, list[int]] = {}
+        for pid, ppid in parent_of.items():
+            children.setdefault(ppid, []).append(pid)
+        total_rss = 0
+        seen: set[int] = set()
+        stack = [root_pid]
+        while stack:
+            pid = stack.pop()
+            if pid in seen:
+                continue
+            seen.add(pid)
+            try:
+                with open(f"/proc/{pid}/status", "rb") as handle:
+                    for line in handle:
+                        if line.startswith(b"VmRSS:"):
+                            total_rss += int(line.split()[1]) * 1024
+                            break
+            except OSError:
+                pass
+            stack.extend(children.get(pid, ()))
+        return total_rss, len(seen)
+
+    async def enforce_resource_budgets(self) -> list[str]:
+        """Remove sessions over the memory or process-count budget.
+
+        Userspace fallback for hosts that accept ``--memory`` /
+        ``--pids-limit`` but do not enforce them because the corresponding
+        cgroup controllers are not delegated to Podman (nested/containerized
+        hosts such as Beaker tasks). Both are measured from the Podman host's
+        ``/proc`` over the process subtree rooted at each container's init PID,
+        so neither needs cgroup accounting nor a container-isolated ``/proc``.
+        Polling cannot stop a spike faster than one sweep; delegated cgroups
+        remain the robust mechanism where available (there this fallback never
+        fires, because the kernel kills over-budget sessions first). A session
+        is never removed on a failed or missing measurement.
+        """
+        memory_limit = (
+            parse_memory_limit(self.config.session_memory)
+            if self.config.session_memory
+            else None
+        )
+        pids_limit = self.config.session_pids_limit
+        if memory_limit is None and not pids_limit:
+            return []
+        async with self._locks_guard:
+            container_ids = list(self._owned_container_ids)
+        removed: list[str] = []
+        for container_id in container_ids:
+            init_pid = await self._container_init_pid(container_id)
+            if init_pid is None:
+                continue  # Container gone or not inspectable: never kill on a failed measurement.
+            stats = await asyncio.to_thread(self._subtree_stats, init_pid)
+            if stats is None:
+                continue
+            rss_bytes, proc_count = stats
+            reason: Optional[str] = None
+            if memory_limit is not None and rss_bytes > memory_limit:
+                reason = (
+                    f"resident memory {rss_bytes} bytes exceeds budget "
+                    f"{memory_limit} ({self.config.session_memory})"
+                )
+            elif pids_limit and proc_count > pids_limit:
+                reason = f"process count {proc_count} exceeds budget {pids_limit}"
+            if reason is None:
+                continue
+            logger.warning("Session %s %s; removing", container_id, reason)
+            try:
+                await self.remove_session(container_id)
+            except SessionNotFound:
+                pass
+            except PodmanBackendError as exc:
+                logger.warning("Failed to remove over-budget container %s: %s", container_id, exc)
+            else:
+                removed.append(container_id)
+        return removed
+
     async def janitor_loop(self) -> None:
         """Periodically reap idle sessions and prune stale images.
 
         Run as a background task for the lifetime of the server; a no-op when
         neither ``session_idle_timeout`` nor ``image_prune_until`` is set.
         """
-        if not self.config.session_idle_timeout and not self.config.image_prune_until:
+        if (
+            not self.config.session_idle_timeout
+            and not self.config.image_prune_until
+            and not self.config.session_memory
+            and not self.config.session_pids_limit
+        ):
             return
         logger.info(
-            "Janitor running (interval=%.0fs, session_idle_timeout=%s, image_prune_until=%s)",
+            "Janitor running (interval=%.0fs, session_idle_timeout=%s, image_prune_until=%s, "
+            "session_memory=%s)",
             self.config.janitor_interval,
             self.config.session_idle_timeout,
             self.config.image_prune_until,
+            self.config.session_memory,
         )
         while True:
             await asyncio.sleep(self.config.janitor_interval)
             try:
+                await self.enforce_resource_budgets()
                 await self.reap_idle_sessions()
                 await self.prune_images()
             except asyncio.CancelledError:

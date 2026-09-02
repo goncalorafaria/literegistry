@@ -392,3 +392,108 @@ def test_prune_images_issues_filtered_prune():
     quiet = _recording_backend()
     asyncio.run(quiet.prune_images())
     assert quiet.calls == []
+
+
+def test_parse_memory_limit():
+    from literegistry.services.podman import parse_memory_limit
+
+    assert parse_memory_limit("4g") == 4 * 1024**3
+    assert parse_memory_limit("256m") == 256 * 1024**2
+    assert parse_memory_limit("512K") == 512 * 1024
+    assert parse_memory_limit("1073741824") == 1073741824
+    with pytest.raises(ValueError):
+        parse_memory_limit("")
+
+
+def test_memory_watchdog_removes_over_budget_sessions():
+    over_id = CONTAINER_ID
+    under_id = "b" * 64
+    pid_of = {over_id: 111, under_id: 222}
+    rss_of = {111: 400 * 1024**2, 222: 10 * 1024**2}
+
+    class WatchdogBackend(PodmanSessionBackend):
+        def __init__(self):
+            super().__init__(
+                PodmanAffinityConfig(instance_id="replica-a", session_memory="256m")
+            )
+            self._owned_container_ids.update({over_id, under_id})
+            self.calls = []
+
+        async def _run(self, args, *, stdin=b"", timeout=None):
+            self.calls.append(list(args))
+            if "inspect" in args:
+                container_id = args[-1]
+                return CompletedPodmanCommand(tuple(args), 0, f"{pid_of[container_id]}\n".encode(), b"")
+            return CompletedPodmanCommand(tuple(args), 0, b"", b"")
+
+    backend = WatchdogBackend()
+    # Measurement reads the Podman *host* /proc subtree, not cgroups or the
+    # container's own /proc; stub it deterministically as (rss_bytes, procs).
+    backend._subtree_stats = staticmethod(lambda pid: (rss_of.get(pid, 0), 1))
+
+    removed = asyncio.run(backend.enforce_resource_budgets())
+
+    assert removed == [over_id]
+    assert over_id not in backend._owned_container_ids
+    assert under_id in backend._owned_container_ids
+    assert any("inspect" in args for args in backend.calls)
+
+
+def test_memory_watchdog_never_kills_on_unmeasurable_or_absent_budget():
+    class Backend(PodmanSessionBackend):
+        def __init__(self, memory, inspect_rc):
+            super().__init__(
+                PodmanAffinityConfig(instance_id="replica-a", session_memory=memory)
+            )
+            self._owned_container_ids.add(CONTAINER_ID)
+            self._inspect_rc = inspect_rc
+
+        async def _run(self, args, *, stdin=b"", timeout=None):
+            if "inspect" in args:
+                return CompletedPodmanCommand(tuple(args), self._inspect_rc, b"123\n", b"")
+            return CompletedPodmanCommand(tuple(args), 0, b"", b"")
+
+    # inspect fails -> no PID -> never killed
+    failing = Backend("256m", inspect_rc=1)
+    assert asyncio.run(failing.enforce_resource_budgets()) == []
+    assert CONTAINER_ID in failing._owned_container_ids
+
+    # PID exited between inspect and measurement (subtree returns None) -> never killed
+    exited = Backend("256m", inspect_rc=0)
+    exited._subtree_stats = staticmethod(lambda pid: None)
+    assert asyncio.run(exited.enforce_resource_budgets()) == []
+    assert CONTAINER_ID in exited._owned_container_ids
+
+    # No budget configured -> no-op
+    assert asyncio.run(Backend(None, inspect_rc=0).enforce_resource_budgets()) == []
+
+
+def test_pids_watchdog_removes_fork_bombed_sessions():
+    over_id = CONTAINER_ID
+    under_id = "b" * 64
+    pid_of = {over_id: 111, under_id: 222}
+    # (rss_bytes, proc_count): over_id has too many processes, both under memory.
+    stats_of = {111: (5 * 1024**2, 5000), 222: (5 * 1024**2, 12)}
+
+    class Backend(PodmanSessionBackend):
+        def __init__(self):
+            super().__init__(
+                PodmanAffinityConfig(
+                    instance_id="replica-a", session_memory="256m", session_pids_limit=2048
+                )
+            )
+            self._owned_container_ids.update({over_id, under_id})
+
+        async def _run(self, args, *, stdin=b"", timeout=None):
+            if "inspect" in args:
+                return CompletedPodmanCommand(tuple(args), 0, f"{pid_of[args[-1]]}\n".encode(), b"")
+            return CompletedPodmanCommand(tuple(args), 0, b"", b"")
+
+    backend = Backend()
+    backend._subtree_stats = staticmethod(lambda pid: stats_of[pid])
+
+    removed = asyncio.run(backend.enforce_resource_budgets())
+
+    assert removed == [over_id]
+    assert over_id not in backend._owned_container_ids
+    assert under_id in backend._owned_container_ids

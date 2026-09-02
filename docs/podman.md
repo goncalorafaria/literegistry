@@ -62,9 +62,34 @@ allocated port, then supplies that URL to every Podman replica automatically.
 `--memory-swap` to every session container, so a runaway session is OOM-killed
 by its own cgroup instead of exhausting the replica host and taking every
 colocated session down with it. `--session-pids-limit` guards against fork
-bombs the same way. Both are off by default and require the host to delegate
-the corresponding cgroup controllers (standard on rootful hosts; verify with
-`cat /sys/fs/cgroup/memory.max` inside a session when running nested).
+bombs the same way. Both are off by default.
+
+**Cgroup enforcement is host-dependent.** Podman accepts `--memory` on any
+host but the kernel only enforces it where the host delegates the memory
+cgroup controller to Podman. Nested/containerized hosts frequently do not:
+inside such a host `--memory` is silently a no-op (a container can allocate
+past its limit and `cat /sys/fs/cgroup/memory.max` reads `max`). Verify on a
+target host with:
+
+```bash
+podman run --rm --memory 256m --memory-swap 256m python:3.12-slim \
+  python3 -c "x = bytearray(400 * 1024 * 1024); print('NOT ENFORCED')"
+```
+
+If that prints `NOT ENFORCED` (exit 0), native limits are not enforced there.
+
+For those hosts the server runs a **userspace watchdog** as part of the
+janitor. Each sweep it walks each session's process subtree (rooted at the
+container's init PID, read from the Podman *host* `/proc` — needing neither
+cgroup accounting nor a container-isolated `/proc`) and removes any session
+whose resident memory exceeds `--session-memory` or whose process count
+exceeds `--session-pids-limit` (processes, which is what catches a fork bomb).
+It is a coarser backstop than a cgroup — a sweep-interval of latency, not
+instantaneous — so keep the sweep interval tight (`--janitor-interval`) where
+you rely on it, and it never removes a session on a failed or missing
+measurement. Where the respective cgroup controllers *are* delegated the
+watchdog simply never fires, because the kernel kills over-budget sessions
+first.
 
 ## Output truncation
 
