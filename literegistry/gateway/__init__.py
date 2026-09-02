@@ -12,8 +12,12 @@ Run it with uvicorn's factory mode::
 from __future__ import annotations
 
 import logging
+import multiprocessing
 import os
+import shutil
 import socket
+import subprocess
+import tempfile
 import time
 from collections import Counter, defaultdict, deque
 from contextlib import asynccontextmanager
@@ -746,6 +750,7 @@ def create_app(
 def advertised_gateway_url(
     port: int,
     advertise_host: Optional[str] = None,
+    scheme: str = "http",
 ) -> str:
     """Return the client-facing URL printed by Gateway at startup."""
     host = (
@@ -757,7 +762,103 @@ def advertised_gateway_url(
         raise ValueError("gateway advertise host must be non-empty")
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"
-    return f"http://{host}:{port}"
+    return f"{scheme}://{host}:{port}"
+
+
+def ensure_tls_credentials(
+    certfile: Optional[str],
+    keyfile: Optional[str],
+    common_name: str,
+) -> tuple[str, str]:
+    """Return a usable (certfile, keyfile) pair for the TLS listener.
+
+    When both paths are provided they are validated and returned as-is.
+    When neither is provided a self-signed certificate is generated. That is
+    sufficient for Docker/Podman mirror clients: registries configured with
+    ``insecure = true`` skip certificate verification but still attempt an
+    HTTPS handshake before falling back to plain HTTP, so any certificate
+    makes the first (HTTPS) attempt succeed.
+    """
+    if bool(certfile) != bool(keyfile):
+        raise ValueError("tls_certfile and tls_keyfile must be provided together")
+    if certfile and keyfile:
+        for path in (certfile, keyfile):
+            if not os.path.isfile(path):
+                raise FileNotFoundError(f"TLS credential not found: {path}")
+        return certfile, keyfile
+
+    common_name = (common_name or "localhost").strip().strip("[]") or "localhost"
+    cert_dir = tempfile.mkdtemp(prefix="literegistry-gateway-tls-")
+    cert_path = os.path.join(cert_dir, "gateway.crt")
+    key_path = os.path.join(cert_dir, "gateway.key")
+
+    openssl = shutil.which("openssl")
+    if openssl:
+        subprocess.run(
+            [
+                openssl,
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-days",
+                "3650",
+                "-keyout",
+                key_path,
+                "-out",
+                cert_path,
+                "-subj",
+                f"/CN={common_name}",
+                "-addext",
+                f"subjectAltName=DNS:{common_name}",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        logger.info("Generated self-signed TLS certificate for %s at %s", common_name, cert_path)
+        return cert_path, key_path
+
+    try:
+        from datetime import datetime, timedelta, timezone
+
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import NameOID
+    except ImportError as exc:  # pragma: no cover - depends on environment
+        raise RuntimeError(
+            "Cannot generate a self-signed TLS certificate: neither the "
+            "'openssl' binary nor the 'cryptography' package is available. "
+            "Install one of them, or pass tls_certfile/tls_keyfile explicitly."
+        ) from exc
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
+    now = datetime.now(timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now + timedelta(days=3650))
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName(common_name)]), critical=False)
+        .sign(key, hashes.SHA256())
+    )
+    with open(key_path, "wb") as f:
+        f.write(
+            key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.TraditionalOpenSSL,
+                serialization.NoEncryption(),
+            )
+        )
+    with open(cert_path, "wb") as f:
+        f.write(cert.public_bytes(serialization.Encoding.PEM))
+    logger.info("Generated self-signed TLS certificate for %s at %s", common_name, cert_path)
+    return cert_path, key_path
 
 
 def main(
@@ -778,12 +879,26 @@ def main(
     log_level: str = "info",
     access_log: bool = False,
     reload: bool = False,
+    tls_port: Optional[int] = None,
+    tls_certfile: Optional[str] = None,
+    tls_keyfile: Optional[str] = None,
+    tls_workers: Optional[int] = None,
 ) -> None:
     """Start Gateway with Uvicorn.
 
     A single worker receives an application object directly. Multiple workers
     and reload mode use Uvicorn's application-factory import string so every
     process creates its own registry client and connection pool.
+
+    When ``tls_port`` is set, a second listener serves the same app over
+    HTTPS on that port (``tls_workers`` workers, defaulting to ``workers``).
+    Docker/Podman clients always attempt HTTPS before falling back to HTTP —
+    even for registries marked ``insecure = true`` — so pointing their mirror
+    config (``MIRROR_URL``) at the TLS port makes the first attempt succeed
+    and removes the invalid-TLS-on-HTTP noise from gateway logs. If no
+    ``tls_certfile``/``tls_keyfile`` pair is given, a self-signed certificate
+    is generated at startup (sufficient because ``insecure = true`` clients
+    skip verification).
 
     Retry settings remain centralized in :meth:`GatewayConfig.from_env` and
     can be customized with ``TIMEOUT``, ``MAX_RETRIES``, and the existing
@@ -809,6 +924,20 @@ def main(
         raise ValueError("docker_mirror_max_retries must be at least one")
     if reload and workers != 1:
         raise ValueError("reload mode requires workers=1")
+    if tls_port is not None:
+        if tls_port == port:
+            raise ValueError(
+                "tls_port must differ from port (uvicorn cannot serve TLS and "
+                "plaintext on one socket)"
+            )
+        if tls_port < 1 or tls_port > 65535:
+            raise ValueError("tls_port must be a valid TCP port")
+        if reload:
+            raise ValueError("tls_port is not supported in reload mode")
+        if tls_workers is not None and tls_workers < 1:
+            raise ValueError("tls_workers must be at least 1")
+    elif tls_certfile or tls_keyfile:
+        raise ValueError("tls_certfile/tls_keyfile require tls_port to be set")
 
     # Factory workers need connection settings to cross the process boundary.
     os.environ["REGISTRY_PATH"] = registry
@@ -834,22 +963,63 @@ def main(
         flush=True,
     )
 
+    tls_process: Optional[multiprocessing.Process] = None
+    if tls_port is not None:
+        resolved_host = (
+            advertise_host
+            or os.getenv("BEAKER_NODE_HOSTNAME")
+            or socket.getfqdn()
+        ).strip()
+        certfile, keyfile = ensure_tls_credentials(
+            tls_certfile, tls_keyfile, resolved_host
+        )
+        print(
+            f"GATEWAY_TLS_URL={advertised_gateway_url(tls_port, advertise_host, scheme='https')}",
+            flush=True,
+        )
+        # A sibling process serves the same app factory over TLS: uvicorn's
+        # process supervisor (workers > 1) owns its process, so two listeners
+        # cannot share one uvicorn.run call. Environment exports above cross
+        # the process boundary for GatewayConfig.from_env().
+        ctx = multiprocessing.get_context("spawn")
+        tls_process = ctx.Process(
+            target=uvicorn.run,
+            kwargs=dict(
+                app="literegistry.gateway:create_app",
+                host=host,
+                port=tls_port,
+                workers=tls_workers or workers,
+                factory=True,
+                log_level=log_level,
+                access_log=access_log,
+                ssl_certfile=certfile,
+                ssl_keyfile=keyfile,
+            ),
+            name="literegistry-gateway-tls",
+        )
+        tls_process.start()
+
     use_factory = workers > 1 or reload
     app = (
         "literegistry.gateway:create_app"
         if use_factory
         else create_app(GatewayConfig.from_env())
     )
-    uvicorn.run(
-        app,
-        host=host,
-        port=port,
-        workers=workers,
-        factory=use_factory,
-        log_level=log_level,
-        access_log=access_log,
-        reload=reload,
-    )
+    try:
+        uvicorn.run(
+            app,
+            host=host,
+            port=port,
+            workers=workers,
+            factory=use_factory,
+            log_level=log_level,
+            access_log=access_log,
+            reload=reload,
+        )
+    finally:
+        if tls_process is not None and tls_process.is_alive():
+            tls_process.terminate()
+            tls_process.join(timeout=10)
 
 
 __all__ = [
@@ -865,6 +1035,7 @@ __all__ = [
     "RoutingResponse",
     "advertised_gateway_url",
     "create_app",
+    "ensure_tls_credentials",
     "default_proxy_routes",
     "fixed_service",
     "main",
