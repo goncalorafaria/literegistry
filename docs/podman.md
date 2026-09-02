@@ -27,7 +27,11 @@ literegistry podman \
   --instance-id podman-0 \
   --registry-mirror http://gateway.example:8080 \
   --image python:3.12-slim \
-  --network none
+  --network none \
+  --session-memory 4g \
+  --session-pids-limit 2048 \
+  --session-idle-timeout 7200 \
+  --image-prune-until 24h
 ```
 
 `--registry-mirror` makes Podman use the LiteRegistry gateway as its native
@@ -51,6 +55,39 @@ allocated port, then supplies that URL to every Podman replica automatically.
 > use `pip install "literegistry[podman_beaker]"`. These packages are
 > convenience extensions; neither is required to run the core server and HTTP
 > API documented below.
+
+## Session resource limits
+
+`--session-memory` (e.g. `4g`) applies `--memory` plus an equal
+`--memory-swap` to every session container, so a runaway session is OOM-killed
+by its own cgroup instead of exhausting the replica host and taking every
+colocated session down with it. `--session-pids-limit` guards against fork
+bombs the same way. Both are off by default and require the host to delegate
+the corresponding cgroup controllers (standard on rootful hosts; verify with
+`cat /sys/fs/cgroup/memory.max` inside a session when running nested).
+
+## Output truncation
+
+A command whose stdout exceeds 1MB (stderr: 256KB) is no longer aborted.
+The replica keeps the first bytes up to the limit, drains the rest, and
+returns the command's real exit code with `stdout_truncated` /
+`stderr_truncated` set on the response. Previously the exec was killed and the
+request failed with HTTP 413, which retry layers could re-run — re-executing a
+command that deterministically overflows again and serializing behind the
+per-container lock.
+
+## Janitor
+
+`--session-idle-timeout SECONDS` starts a background janitor (sweep interval
+`--janitor-interval`, default 300s) that removes session containers with no
+activity for that long. This reclaims containers whose client died without
+calling close and containers orphaned when a handshake response was lost in
+transit — both otherwise persist until the replica restarts. Pick a timeout
+comfortably above your longest legitimate gap between commands in one session.
+`--image-prune-until 24h` additionally runs `podman image prune --all
+--filter until=24h` each sweep; under the `vfs` storage driver every container
+copies its whole image, so replicas serving many distinct images fill their
+disk without pruning.
 
 ## Session lifecycle
 
