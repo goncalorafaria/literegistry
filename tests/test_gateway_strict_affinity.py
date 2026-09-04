@@ -48,7 +48,12 @@ class InProcessPinnedTransport:
             "mock://replica-b": AffinityKVService(instance_id="replica-b"),
         }
         self.calls = []
+        self.probes = []
         self.unavailable = set()
+
+    async def probe(self, service, server_uri):
+        self.probes.append(server_uri)
+        return server_uri not in self.unavailable
 
     async def post(self, service, server_uri, endpoint, payload, retry):
         self.calls.append((server_uri, endpoint, dict(payload)))
@@ -166,6 +171,37 @@ def test_registry_pinned_transport_uses_loopback_for_same_host():
         assert captured["server_uri"] == "http://127.0.0.1:8091"
         assert captured["endpoint"] == "handshake"
         assert captured["payload"] == {"client_id": "client-a"}
+
+    asyncio.run(check())
+
+
+def test_registry_pinned_transport_probe_reports_reachability():
+    """probe() is a plain GET /health against the exact URI: any HTTP answer
+    (even 401 from a token-protected replica) means alive; connection
+    failures and timeouts mean unreachable."""
+    from aiohttp import web
+
+    async def check():
+        async def health(request):
+            return web.json_response({"detail": "token required"}, status=401)
+
+        app = web.Application()
+        app.router.add_get("/health", health)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = runner.addresses[0][1]
+        transport = RegistryPinnedTransport(
+            registry=None, host_aliases={"localhost"}, probe_timeout=2.0
+        )
+        try:
+            assert await transport.probe("podman", f"http://127.0.0.1:{port}") is True
+            assert await transport.probe("podman", f"http://127.0.0.1:{port}/") is True
+        finally:
+            await runner.cleanup()
+        # Nothing listens there any more.
+        assert await transport.probe("podman", f"http://127.0.0.1:{port}") is False
 
     asyncio.run(check())
 
@@ -503,6 +539,88 @@ def test_strict_affinity_confirms_dead_owner_before_forwarding():
         assert "no longer registered" in response["error"]
         assert len(transport.calls) == calls_before
         assert registry.model_forces == [False, True]
+        # The roster miss was confirmed against the server itself before failing.
+        assert transport.probes == ["mock://replica-a"]
+
+    with tempfile.TemporaryDirectory() as root:
+        asyncio.run(check(root))
+
+
+def test_strict_affinity_forwards_to_live_owner_missing_from_roster():
+    """A lagging roster (missed heartbeats, registry hiccup) must not sever
+    sessions whose owner is still up: the pinned server is asked directly."""
+
+    async def check(root):
+        app, registry, transport, _ = make_environment(root)
+        status, handshake = await call_json(
+            app,
+            "/affinity/handshake",
+            {"service": "affinity-kv"},
+        )
+        assert status == 200
+        affinity_id = handshake["affinity_id"]
+        status, _ = await call_json(
+            app,
+            "/affinity/kv/put",
+            {
+                "service": "affinity-kv",
+                "affinity_id": affinity_id,
+                "key": "key-0",
+                "value": "v0",
+            },
+        )
+        assert status == 200
+
+        # replica-a vanishes from the roster but keeps answering.
+        registry.records = [registry.records[1]]
+        registry.model_forces.clear()
+        transport.probes.clear()
+
+        status, response = await call_json(
+            app,
+            "/affinity/kv/get",
+            {
+                "service": "affinity-kv",
+                "affinity_id": affinity_id,
+                "key": "key-0",
+            },
+        )
+        assert status == 200
+        assert response["value"] == "v0"
+        assert response["instance_id"] == "replica-a"
+        assert registry.model_forces == [False, True]
+        assert transport.probes == ["mock://replica-a"]
+        assert transport.calls[-1][0] == "mock://replica-a"
+
+    with tempfile.TemporaryDirectory() as root:
+        asyncio.run(check(root))
+
+
+def test_strict_affinity_without_probe_support_keeps_rejecting_off_roster_owner():
+    async def check(root):
+        app, registry, transport, _ = make_environment(root)
+        status, handshake = await call_json(
+            app,
+            "/affinity/handshake",
+            {"service": "affinity-kv"},
+        )
+        assert status == 200
+        registry.records = [registry.records[1]]
+        calls_before = len(transport.calls)
+        transport.probe = None  # transport predates liveness probing
+
+        status, response = await call_json(
+            app,
+            "/affinity/kv/get",
+            {
+                "service": "affinity-kv",
+                "affinity_id": handshake["affinity_id"],
+                "key": "key-0",
+            },
+        )
+        assert status == 503
+        assert "no longer registered" in response["error"]
+        assert len(transport.calls) == calls_before
 
     with tempfile.TemporaryDirectory() as root:
         asyncio.run(check(root))

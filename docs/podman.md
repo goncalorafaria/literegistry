@@ -91,6 +91,20 @@ measurement. Where the respective cgroup controllers *are* delegated the
 watchdog simply never fires, because the kernel kills over-budget sessions
 first.
 
+## Command execution and deadlines
+
+Each `/podman` command runs as `podman exec` of a login shell
+(`/bin/bash -lc COMMAND`) in the session container, under an in-container
+deadline of `timeout` seconds (request field, at most 60). The deadline is
+enforced by whatever the *task image* provides: coreutils or BusyBox
+`timeout` when the image ships one, otherwise a bash watchdog that runs the
+command in its own process group and SIGKILLs the whole group when the
+deadline passes. Either way a timed-out command exits `137` and none of its
+processes survive the exec. The replica no longer assumes `/usr/bin/timeout`
+exists — slim images without coreutils used to fail every command with exit
+`127` ("executable file not found"). `bash` itself remains a hard requirement of
+session images (the container entrypoint runs under it).
+
 ## Output truncation
 
 A command whose stdout exceeds 1MB (stderr: 256KB) is no longer aborted.

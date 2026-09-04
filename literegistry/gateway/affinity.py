@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Protocol
 from urllib.parse import urlsplit, urlunsplit
 
+import aiohttp
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -25,6 +26,7 @@ from literegistry.affinity import (
 )
 from literegistry.gateway import GatewayRequestError, RetryConfig
 from literegistry.http import HTTPResponseError, RegistryHTTPClient
+from literegistry.shared_session import get_shared_session
 
 
 logger = logging.getLogger(__name__)
@@ -72,7 +74,13 @@ def same_host_loopback_uri(
 
 
 class PinnedTransport(Protocol):
-    """Send one request to an exact server URI without load balancing."""
+    """Send one request to an exact server URI without load balancing.
+
+    Transports may additionally implement ``probe(service, server_uri)``
+    returning whether the exact server currently answers ``GET /health``.
+    Strict affinity uses it to distinguish a stale roster from a dead owner;
+    transports without it are treated as unable to confirm liveness.
+    """
 
     async def post(
         self,
@@ -85,6 +93,13 @@ class PinnedTransport(Protocol):
         ...
 
 
+# How long a strict-affinity liveness probe of an off-roster owner may take.
+# Only paid on the failure path (owner missing from the refreshed roster).
+DEFAULT_OWNER_PROBE_TIMEOUT_S = float(
+    os.getenv("GATEWAY_AFFINITY_OWNER_PROBE_TIMEOUT_SECONDS", "3")
+)
+
+
 class RegistryPinnedTransport:
     """Exact-server HTTP transport using LiteRegistry's shared session."""
 
@@ -95,11 +110,39 @@ class RegistryPinnedTransport:
         *,
         host_aliases: Optional[set[str]] = None,
         loopback_host: str = "127.0.0.1",
+        probe_timeout: float = DEFAULT_OWNER_PROBE_TIMEOUT_S,
     ) -> None:
         self.registry = registry
         self.client_factory = client_factory
         self.host_aliases = host_aliases or local_hostnames()
         self.loopback_host = loopback_host
+        self.probe_timeout = probe_timeout
+
+    async def probe(self, service: str, server_uri: str) -> bool:
+        """Return True if the exact server answers ``GET /health``.
+
+        Any HTTP answer counts (including 401 from token-protected replicas):
+        the question is whether the process is alive, not whether it is
+        healthy. Transport failures and timeouts mean "not reachable".
+        """
+        request_uri = same_host_loopback_uri(
+            server_uri,
+            aliases=self.host_aliases,
+            loopback_host=self.loopback_host,
+        ).rstrip("/")
+        timeout = aiohttp.ClientTimeout(total=self.probe_timeout)
+        session = await get_shared_session()
+        owns_session = session is None or session.closed
+        if owns_session:
+            session = aiohttp.ClientSession(timeout=timeout)
+        try:
+            async with session.get(f"{request_uri}/health", timeout=timeout) as response:
+                return response.status < 500
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+            return False
+        finally:
+            if owns_session:
+                await session.close()
 
     async def post(
         self,
@@ -230,6 +273,24 @@ class StrictAffinityGateway:
             "strict affinity server is no longer registered",
             status_code=503,
         )
+
+    async def _owner_reachable(
+        self, service: str, binding: StrictAffinityBinding
+    ) -> bool:
+        """Ask the bound server directly whether it is alive.
+
+        The roster is a lagging view of the fleet (heartbeat delays, registry
+        hiccups, records dropped while a key read fails), so a roster miss on
+        its own is not proof that the pinned owner is gone.
+        """
+        probe = getattr(self.transport, "probe", None)
+        if probe is None:
+            return False
+        try:
+            return bool(await probe(service, binding.server_uri))
+        except Exception:  # pragma: no cover - defensive, probe already maps errors
+            logger.exception("strict affinity owner probe failed for %s", binding.server_uri)
+            return False
 
     async def _post(
         self,
@@ -402,11 +463,32 @@ class StrictAffinityGateway:
             )
             try:
                 await self._ensure_active(service, binding, force=True)
+                liveness_check = "forced_refresh"
             except GatewayRequestError:
+                # The refreshed roster does not list the owner either. Before
+                # failing every request pinned to it, ask the server itself:
+                # a replica whose heartbeat lapsed still holds the session
+                # state, and forwarding to it is the only way to keep the
+                # affinity contract. A restarted replica answers the forward
+                # with its own 404 (container gone), which clients treat as
+                # session loss; strict affinity never substitutes a replica.
+                if not await self._owner_reachable(service, binding):
+                    logger.warning(
+                        "gateway_affinity mode=strict event=owner_unavailable "
+                        "request_id=%s service=%r affinity_id=%r endpoint=%r "
+                        "server_id=%r server_uri=%r liveness=refresh+probe",
+                        request_id,
+                        service,
+                        affinity_id,
+                        endpoint,
+                        binding.server_id,
+                        binding.server_uri,
+                    )
+                    raise
                 logger.warning(
-                    "gateway_affinity mode=strict event=owner_unavailable "
+                    "gateway_affinity mode=strict event=owner_off_roster_alive "
                     "request_id=%s service=%r affinity_id=%r endpoint=%r "
-                    "server_id=%r server_uri=%r liveness=refresh",
+                    "server_id=%r server_uri=%r liveness=probe",
                     request_id,
                     service,
                     affinity_id,
@@ -414,8 +496,7 @@ class StrictAffinityGateway:
                     binding.server_id,
                     binding.server_uri,
                 )
-                raise
-            liveness_check = "forced_refresh"
+                liveness_check = "direct_probe"
 
         try:
             # The binding supplies the exact URI after the cached liveness check.

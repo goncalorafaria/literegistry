@@ -28,6 +28,35 @@ _OWNER_LABEL = "io.literegistry.podman-affinity"
 _INSTANCE_LABEL = "io.literegistry.podman-affinity.instance"
 _CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{12,64}$")
 
+# Runs one session command under an in-container deadline. Task images differ
+# in what they ship: coreutils ``timeout`` is missing from slim/distroless
+# images (hard-coding ``/usr/bin/timeout`` made every exec there exit 127) and
+# BusyBox only understands the short ``-s SIG`` spelling. The wrapper uses
+# ``timeout`` when the image has one and otherwise falls back to a bash
+# watchdog: with job control on, the command runs in its own process group so
+# the whole tree (not just the login shell) is SIGKILLed at the deadline and
+# nothing outlives the outer ``podman exec`` when that times out. bash is
+# already a hard requirement (the session container's entrypoint runs under
+# it). Arguments: $1 = timeout in seconds, $2 = command. The watchdog closes
+# its stdio so a lingering ``sleep`` cannot hold the exec's output pipes open.
+_EXEC_WRAPPER = """\
+if command -v timeout >/dev/null 2>&1; then
+  exec timeout -s KILL "$1" /bin/bash -lc "$2"
+fi
+exec 3<&0
+set -m
+/bin/bash -lc "$2" <&3 &
+cmd=$!
+set +m
+exec 3<&-
+( sleep "$1"; kill -9 -- "-$cmd" 2>/dev/null ) >/dev/null 2>&1 </dev/null &
+watchdog=$!
+wait "$cmd" 2>/dev/null
+rc=$?
+kill "$watchdog" 2>/dev/null
+exit "$rc"
+"""
+
 def build_podman_registry_mirror_config(mirror_url: str) -> str:
     """Build a Podman registries.conf that mirrors docker.io via one gateway."""
 
@@ -369,8 +398,9 @@ class PodmanSessionBackend:
         async with lock:
             await self._require_owned(container_id)
             self._session_last_used[container_id] = time.monotonic()
-            # timeout runs inside the inner container, so timed-out children do
-            # not remain alive if the outer podman exec process is terminated.
+            # The deadline is enforced inside the container (see _EXEC_WRAPPER),
+            # so timed-out children do not remain alive if the outer podman exec
+            # process is terminated.
             return await self._run(
                 [
                     *self._podman,
@@ -379,12 +409,11 @@ class PodmanSessionBackend:
                     "--workdir",
                     workdir,
                     container_id,
-                    "/usr/bin/timeout",
-                    "--signal=KILL",
-                    "--kill-after=1s",
-                    f"{timeout}s",
                     "/bin/bash",
-                    "-lc",
+                    "-c",
+                    _EXEC_WRAPPER,
+                    "literegistry-exec",
+                    f"{timeout:g}",
                     command,
                 ],
                 stdin=stdin.encode(),

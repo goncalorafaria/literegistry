@@ -1,6 +1,12 @@
 import asyncio
+import os
+import shutil
+import subprocess
+import time
+
 import pytest
 
+from literegistry.services import podman as podman_module
 from literegistry.services.podman import (
     CloseRequest,
     CompletedPodmanCommand,
@@ -155,11 +161,75 @@ def test_backend_uses_owned_container_and_bash_without_outer_shell_interpolation
 
     assert result.stdout == b"ok\n"
     exec_args, stdin, outer_timeout = backend.calls[-1]
-    assert exec_args[-3:] == ["/bin/bash", "-lc", command]
+    # The command runs under the portable deadline wrapper: bash -c WRAPPER
+    # with the deadline and the command passed as positional arguments, so
+    # neither is ever interpolated into shell text.
+    assert exec_args[-6:-3] == ["/bin/bash", "-c", podman_module._EXEC_WRAPPER]
+    assert exec_args[-3] == "literegistry-exec"  # $0 for the wrapper
+    assert exec_args[-2:] == ["2.5", command]
+    assert "/usr/bin/timeout" not in exec_args
     assert CONTAINER_ID in exec_args
     assert stdin == b"abc"
     assert outer_timeout == 7.5
     assert all("inspect" not in args for args, _, _ in backend.calls)
+
+
+def test_exec_wrapper_uses_timeout_when_available_and_falls_back_otherwise(tmp_path):
+    """Run the in-container wrapper on the host shell, with and without ``timeout``.
+
+    ``$1`` is the deadline, ``$2`` the command. The fallback must forward
+    stdin, preserve the exit code and kill the whole process tree (not just the
+    login shell) when the deadline passes.
+    """
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("bash not available")
+
+    def run(command, deadline, *, with_timeout, stdin=b""):
+        env = dict(os.environ)
+        if not with_timeout:
+            # Hide coreutils/busybox ``timeout`` but keep bash, sleep and kill
+            # reachable through a PATH of symlinks.
+            shim = tmp_path / "bin"
+            shim.mkdir(exist_ok=True)
+            for tool in ("sleep", "bash", "sh", "cat", "true"):
+                target = shutil.which(tool)
+                link = shim / tool
+                if target and not link.exists():
+                    link.symlink_to(target)
+            env["PATH"] = str(shim)
+        started = time.monotonic()
+        proc = subprocess.run(
+            [bash, "-c", podman_module._EXEC_WRAPPER, "wrapper", str(deadline), command],
+            input=stdin,
+            capture_output=True,
+            env=env,
+            timeout=30,
+        )
+        return proc, time.monotonic() - started
+
+    for with_timeout in (True, False):
+        if with_timeout and shutil.which("timeout") is None:
+            continue
+        proc, _ = run("cat; echo -n done; exit 3", 10, with_timeout=with_timeout, stdin=b"in\n")
+        assert proc.returncode == 3, (with_timeout, proc)
+        assert proc.stdout == b"in\ndone", (with_timeout, proc)
+
+        # A distinctive duration makes the child identifiable by its own argv.
+        duration = 3600 + (os.getpid() % 1000) * 2 + int(with_timeout)
+        proc, elapsed = run(f"sleep {duration}; echo late", 1, with_timeout=with_timeout)
+        # GNU timeout SIGKILLs its own process group (so the host sees -9);
+        # podman exec reports that as 137, which the fallback exits with directly.
+        assert proc.returncode in (137, -9), (with_timeout, proc)
+        assert b"late" not in proc.stdout
+        assert elapsed < 10, elapsed
+        # The sleep spawned by the login shell must be gone with it.
+        survivors = subprocess.run(
+            ["pgrep", "-f", f"^sleep {duration}$"], capture_output=True, text=True
+        ).stdout.split()
+        for pid in survivors:
+            subprocess.run(["kill", "-9", pid], check=False)
+        assert survivors == [], (with_timeout, survivors)
 
 
 def test_backend_forces_immediate_container_removal():
