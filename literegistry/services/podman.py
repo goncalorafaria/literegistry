@@ -28,6 +28,35 @@ _OWNER_LABEL = "io.literegistry.podman-affinity"
 _INSTANCE_LABEL = "io.literegistry.podman-affinity.instance"
 _CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{12,64}$")
 
+# Runs one session command under an in-container deadline. Task images differ
+# in what they ship: coreutils ``timeout`` is missing from slim/distroless
+# images (hard-coding ``/usr/bin/timeout`` made every exec there exit 127) and
+# BusyBox only understands the short ``-s SIG`` spelling. The wrapper uses
+# ``timeout`` when the image has one and otherwise falls back to a bash
+# watchdog: with job control on, the command runs in its own process group so
+# the whole tree (not just the login shell) is SIGKILLed at the deadline and
+# nothing outlives the outer ``podman exec`` when that times out. bash is
+# already a hard requirement (the session container's entrypoint runs under
+# it). Arguments: $1 = timeout in seconds, $2 = command. The watchdog closes
+# its stdio so a lingering ``sleep`` cannot hold the exec's output pipes open.
+_EXEC_WRAPPER = """\
+if command -v timeout >/dev/null 2>&1; then
+  exec timeout -s KILL "$1" /bin/bash -lc "$2"
+fi
+exec 3<&0
+set -m
+/bin/bash -lc "$2" <&3 &
+cmd=$!
+set +m
+exec 3<&-
+( sleep "$1"; kill -9 -- "-$cmd" 2>/dev/null ) >/dev/null 2>&1 </dev/null &
+watchdog=$!
+wait "$cmd" 2>/dev/null
+rc=$?
+kill "$watchdog" 2>/dev/null
+exit "$rc"
+"""
+
 def build_podman_registry_mirror_config(mirror_url: str) -> str:
     """Build a Podman registries.conf that mirrors docker.io via one gateway."""
 
@@ -55,6 +84,20 @@ def build_podman_registry_mirror_config(mirror_url: str) -> str:
         f'insecure = {insecure}\n'
         'pull-from-mirror = "all"\n'
     )
+
+
+_MEMORY_SUFFIXES = {"b": 1, "k": 1024, "m": 1024**2, "g": 1024**3}
+
+
+def parse_memory_limit(value: str) -> int:
+    """Parse a Podman-style memory size (``256m``, ``4g``, ``1073741824``) to bytes."""
+    text = value.strip().lower()
+    if not text:
+        raise ValueError("memory limit must be non-empty")
+    suffix = text[-1]
+    if suffix in _MEMORY_SUFFIXES:
+        return int(float(text[:-1]) * _MEMORY_SUFFIXES[suffix])
+    return int(text)
 
 
 class PodmanBackendError(RuntimeError):
@@ -123,6 +166,8 @@ class PodmanResponse(BaseModel):
     exit_code: int
     execution_time: float
     timed_out: bool = False
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
 
 
 @dataclass(frozen=True)
@@ -131,6 +176,11 @@ class PodmanAffinityConfig:
     storage_driver: str = "vfs"
     session_image: str = "docker.io/library/ubuntu:24.04"
     session_network: str = "none"
+    session_memory: Optional[str] = None
+    session_pids_limit: Optional[int] = None
+    session_idle_timeout: Optional[float] = None
+    janitor_interval: float = 300.0
+    image_prune_until: Optional[str] = None
     instance_id: str = "podman-affinity-1"
     max_stdout_bytes: int = 1024 * 1024
     max_stderr_bytes: int = 256 * 1024
@@ -144,6 +194,8 @@ class CompletedPodmanCommand:
     returncode: int
     stdout: bytes
     stderr: bytes
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
 
 
 class PodmanSessionBackend:
@@ -153,6 +205,7 @@ class PodmanSessionBackend:
         self.config = config or PodmanAffinityConfig()
         self._locks: dict[str, asyncio.Lock] = {}
         self._owned_container_ids: set[str] = set()
+        self._session_last_used: dict[str, float] = {}
         self._locks_guard = asyncio.Lock()
         self._registry_config_file: Optional[Any] = None
         self._podman_env: Optional[dict[str, str]] = None
@@ -181,15 +234,31 @@ class PodmanSessionBackend:
 
     async def _read_limited(
         self, stream: asyncio.StreamReader, limit: int, stream_name: str
-    ) -> bytes:
+    ) -> tuple[bytes, bool]:
+        """Read a stream, keeping at most ``limit`` bytes.
+
+        Excess output is drained and discarded rather than aborting the
+        command: aborting kills the exec mid-flight and surfaces an error the
+        caller cannot distinguish from a broken session, and any gateway-level
+        retry would re-run a command that deterministically overflows again.
+        Returns the (possibly truncated) bytes and whether truncation happened.
+        """
         chunks: list[bytes] = []
         total = 0
+        truncated = False
         while chunk := await stream.read(64 * 1024):
+            if truncated:
+                continue
             total += len(chunk)
             if total > limit:
-                raise OutputLimitExceeded(f"{stream_name} exceeded {limit} bytes")
+                keep = limit - (total - len(chunk))
+                if keep > 0:
+                    chunks.append(chunk[:keep])
+                truncated = True
+                logger.warning("%s exceeded %s bytes; truncating", stream_name, limit)
+                continue
             chunks.append(chunk)
-        return b"".join(chunks)
+        return b"".join(chunks), truncated
 
     async def _terminate(self, process: asyncio.subprocess.Process) -> None:
         if process.returncode is not None:
@@ -230,18 +299,25 @@ class PodmanSessionBackend:
         )
         stdin_task = asyncio.create_task(self._write_stdin(process, stdin))
         try:
-            stdout, stderr, _, _ = await asyncio.wait_for(
+            stdout_read, stderr_read, _, _ = await asyncio.wait_for(
                 asyncio.gather(stdout_task, stderr_task, process.wait(), stdin_task),
                 timeout=timeout or self.config.operation_timeout,
             )
-        except (asyncio.TimeoutError, OutputLimitExceeded):
+        except asyncio.TimeoutError:
             await self._terminate(process)
             for task in (stdout_task, stderr_task, stdin_task):
                 task.cancel()
             await asyncio.gather(stdout_task, stderr_task, stdin_task, return_exceptions=True)
             raise
+        stdout, stdout_truncated = stdout_read
+        stderr, stderr_truncated = stderr_read
         return CompletedPodmanCommand(
-            tuple(args), process.returncode or 0, stdout, stderr
+            tuple(args),
+            process.returncode or 0,
+            stdout,
+            stderr,
+            stdout_truncated=stdout_truncated,
+            stderr_truncated=stderr_truncated,
         )
 
     async def _lock_for(self, container_id: str) -> asyncio.Lock:
@@ -256,6 +332,18 @@ class PodmanSessionBackend:
         instance_slug = re.sub(r"[^a-zA-Z0-9_.-]", "-", self.config.instance_id)[:32]
         name = f"literegistry-{instance_slug}-{secrets.token_hex(12)}"
         session_image = image or self.config.session_image
+        resource_flags: list[str] = []
+        if self.config.session_memory:
+            # --memory-swap equal to --memory disables swap growth, so a
+            # runaway session is OOM-killed instead of thrashing the replica.
+            resource_flags += [
+                "--memory",
+                self.config.session_memory,
+                "--memory-swap",
+                self.config.session_memory,
+            ]
+        if self.config.session_pids_limit:
+            resource_flags += ["--pids-limit", str(self.config.session_pids_limit)]
         result = await self._run(
             [
                 *self._podman,
@@ -269,6 +357,7 @@ class PodmanSessionBackend:
                 f"{_INSTANCE_LABEL}={self.config.instance_id}",
                 "--network",
                 self.config.session_network,
+                *resource_flags,
                 "--",
                 session_image,
                 "/bin/bash",
@@ -286,6 +375,7 @@ class PodmanSessionBackend:
             raise PodmanBackendError("Podman returned an invalid container ID")
         async with self._locks_guard:
             self._owned_container_ids.add(container_id)
+            self._session_last_used[container_id] = time.monotonic()
         logger.info("Created container=%s client_id=%r", container_id, client_id)
         return container_id
 
@@ -307,8 +397,10 @@ class PodmanSessionBackend:
         lock = await self._lock_for(container_id)
         async with lock:
             await self._require_owned(container_id)
-            # timeout runs inside the inner container, so timed-out children do
-            # not remain alive if the outer podman exec process is terminated.
+            self._session_last_used[container_id] = time.monotonic()
+            # The deadline is enforced inside the container (see _EXEC_WRAPPER),
+            # so timed-out children do not remain alive if the outer podman exec
+            # process is terminated.
             return await self._run(
                 [
                     *self._podman,
@@ -317,12 +409,11 @@ class PodmanSessionBackend:
                     "--workdir",
                     workdir,
                     container_id,
-                    "/usr/bin/timeout",
-                    "--signal=KILL",
-                    "--kill-after=1s",
-                    f"{timeout}s",
                     "/bin/bash",
-                    "-lc",
+                    "-c",
+                    _EXEC_WRAPPER,
+                    "literegistry-exec",
+                    f"{timeout:g}",
                     command,
                 ],
                 stdin=stdin.encode(),
@@ -350,6 +441,7 @@ class PodmanSessionBackend:
                 )
         async with self._locks_guard:
             self._owned_container_ids.discard(container_id)
+            self._session_last_used.pop(container_id, None)
             self._locks.pop(container_id, None)
 
     async def owned_container_ids(self) -> list[str]:
@@ -382,6 +474,215 @@ class PodmanSessionBackend:
                 await self.remove_session(container_id)
             except SessionNotFound:
                 pass
+
+    async def reap_idle_sessions(self) -> list[str]:
+        """Remove sessions idle longer than ``session_idle_timeout``.
+
+        Covers clients that died without calling close and containers whose
+        handshake response was lost in transit: both keep running otherwise
+        until the replica restarts. Containers found in Podman but unknown to
+        the activity map are adopted with a fresh timestamp so they get one
+        full idle window before being reaped.
+        """
+        idle_timeout = self.config.session_idle_timeout
+        if not idle_timeout:
+            return []
+        now = time.monotonic()
+        listed = await self.owned_container_ids()
+        async with self._locks_guard:
+            self._owned_container_ids.update(listed)
+            for container_id in listed:
+                self._session_last_used.setdefault(container_id, now)
+            expired = [
+                container_id
+                for container_id, last_used in self._session_last_used.items()
+                if now - last_used > idle_timeout
+            ]
+        removed: list[str] = []
+        for container_id in expired:
+            try:
+                await self.remove_session(container_id)
+            except SessionNotFound:
+                pass
+            except PodmanBackendError as exc:
+                logger.warning("Failed to reap idle container %s: %s", container_id, exc)
+            else:
+                removed.append(container_id)
+                logger.info("Reaped idle container=%s (idle > %.0fs)", container_id, idle_timeout)
+        return removed
+
+    async def prune_images(self) -> None:
+        """Prune unused images older than ``image_prune_until``.
+
+        Session containers copy their whole image under the vfs storage
+        driver, so replicas serving many distinct task images fill their disk
+        without periodic pruning.
+        """
+        until = self.config.image_prune_until
+        if not until:
+            return
+        result = await self._run(
+            [
+                *self._podman,
+                "image",
+                "prune",
+                "--all",
+                "--force",
+                "--filter",
+                f"until={until}",
+            ]
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "podman image prune failed: %s",
+                result.stderr.decode(errors="replace").strip(),
+            )
+
+    async def _container_init_pid(self, container_id: str) -> Optional[int]:
+        """Return the container's init PID as seen by the Podman host."""
+        result = await self._run(
+            [*self._podman, "inspect", "--format", "{{.State.Pid}}", container_id],
+            timeout=15.0,
+        )
+        if result.returncode != 0:
+            return None
+        text = result.stdout.decode().strip()
+        try:
+            pid = int(text)
+        except ValueError:
+            return None
+        return pid if pid > 0 else None
+
+    @staticmethod
+    def _subtree_stats(root_pid: int) -> Optional[tuple[int, int]]:
+        """Return (RSS bytes, process count) for the subtree rooted at ``root_pid``.
+
+        Reads the Podman host's own ``/proc`` (where the session's processes
+        are descendants of the container init PID), so it works regardless of
+        whether the host delegates memory/pids cgroups or whether the container
+        has an isolated ``/proc`` view. The count is processes (not threads),
+        which is what catches a fork bomb. Returns None if the root has already
+        exited.
+        """
+        parent_of: dict[int, int] = {}
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/stat", "rb") as handle:
+                    fields = handle.read().rsplit(b")", 1)[1].split()
+                parent_of[int(entry)] = int(fields[1])
+            except (OSError, IndexError, ValueError):
+                continue
+        if root_pid not in parent_of:
+            return None
+        children: dict[int, list[int]] = {}
+        for pid, ppid in parent_of.items():
+            children.setdefault(ppid, []).append(pid)
+        total_rss = 0
+        seen: set[int] = set()
+        stack = [root_pid]
+        while stack:
+            pid = stack.pop()
+            if pid in seen:
+                continue
+            seen.add(pid)
+            try:
+                with open(f"/proc/{pid}/status", "rb") as handle:
+                    for line in handle:
+                        if line.startswith(b"VmRSS:"):
+                            total_rss += int(line.split()[1]) * 1024
+                            break
+            except OSError:
+                pass
+            stack.extend(children.get(pid, ()))
+        return total_rss, len(seen)
+
+    async def enforce_resource_budgets(self) -> list[str]:
+        """Remove sessions over the memory or process-count budget.
+
+        Userspace fallback for hosts that accept ``--memory`` /
+        ``--pids-limit`` but do not enforce them because the corresponding
+        cgroup controllers are not delegated to Podman (nested/containerized
+        hosts such as Beaker tasks). Both are measured from the Podman host's
+        ``/proc`` over the process subtree rooted at each container's init PID,
+        so neither needs cgroup accounting nor a container-isolated ``/proc``.
+        Polling cannot stop a spike faster than one sweep; delegated cgroups
+        remain the robust mechanism where available (there this fallback never
+        fires, because the kernel kills over-budget sessions first). A session
+        is never removed on a failed or missing measurement.
+        """
+        memory_limit = (
+            parse_memory_limit(self.config.session_memory)
+            if self.config.session_memory
+            else None
+        )
+        pids_limit = self.config.session_pids_limit
+        if memory_limit is None and not pids_limit:
+            return []
+        async with self._locks_guard:
+            container_ids = list(self._owned_container_ids)
+        removed: list[str] = []
+        for container_id in container_ids:
+            init_pid = await self._container_init_pid(container_id)
+            if init_pid is None:
+                continue  # Container gone or not inspectable: never kill on a failed measurement.
+            stats = await asyncio.to_thread(self._subtree_stats, init_pid)
+            if stats is None:
+                continue
+            rss_bytes, proc_count = stats
+            reason: Optional[str] = None
+            if memory_limit is not None and rss_bytes > memory_limit:
+                reason = (
+                    f"resident memory {rss_bytes} bytes exceeds budget "
+                    f"{memory_limit} ({self.config.session_memory})"
+                )
+            elif pids_limit and proc_count > pids_limit:
+                reason = f"process count {proc_count} exceeds budget {pids_limit}"
+            if reason is None:
+                continue
+            logger.warning("Session %s %s; removing", container_id, reason)
+            try:
+                await self.remove_session(container_id)
+            except SessionNotFound:
+                pass
+            except PodmanBackendError as exc:
+                logger.warning("Failed to remove over-budget container %s: %s", container_id, exc)
+            else:
+                removed.append(container_id)
+        return removed
+
+    async def janitor_loop(self) -> None:
+        """Periodically reap idle sessions and prune stale images.
+
+        Run as a background task for the lifetime of the server; a no-op when
+        neither ``session_idle_timeout`` nor ``image_prune_until`` is set.
+        """
+        if (
+            not self.config.session_idle_timeout
+            and not self.config.image_prune_until
+            and not self.config.session_memory
+            and not self.config.session_pids_limit
+        ):
+            return
+        logger.info(
+            "Janitor running (interval=%.0fs, session_idle_timeout=%s, image_prune_until=%s, "
+            "session_memory=%s)",
+            self.config.janitor_interval,
+            self.config.session_idle_timeout,
+            self.config.image_prune_until,
+            self.config.session_memory,
+        )
+        while True:
+            await asyncio.sleep(self.config.janitor_interval)
+            try:
+                await self.enforce_resource_budgets()
+                await self.reap_idle_sessions()
+                await self.prune_images()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Janitor iteration failed")
 
 
 class PodmanAffinityService:
@@ -418,6 +719,8 @@ class PodmanAffinityService:
             exit_code=result.returncode,
             execution_time=time.perf_counter() - started,
             timed_out=result.returncode in {124, 137},
+            stdout_truncated=result.stdout_truncated,
+            stderr_truncated=result.stderr_truncated,
         )
 
     async def close(self, request: CloseRequest) -> dict[str, Any]:
@@ -463,6 +766,9 @@ def create_app(
             "sessions": len(containers),
             "image": service.backend.config.session_image,
             "registry_mirror": service.backend.config.registry_mirror,
+            "session_memory": service.backend.config.session_memory,
+            "session_pids_limit": service.backend.config.session_pids_limit,
+            "session_idle_timeout": service.backend.config.session_idle_timeout,
         }
 
     @app.post("/handshake", response_model=HandshakeResponse)

@@ -74,7 +74,20 @@ factory-created worker process.
 | `GET/HEAD` | `/v2/{path}` | A discovered `model_path=docker-mirror` replica |
 
 Podman routes are stateful: handshake creates an affinity binding and every
-command/close request carries that ID. Mirror soft affinity is experimental, optional, and enabled by default. Disable it to use normal mirror
+command/close request carries that ID. Before forwarding, the gateway checks
+that the bound replica is still in the registry roster (cached, then refreshed
+from Redis). Because the roster lags reality — a replica whose heartbeats were
+delayed, or a registry hiccup, drops it for a while although it still holds
+the session containers — an owner missing from the refreshed roster is then
+probed directly (`GET /health` on its exact URI, bounded by
+`GATEWAY_AFFINITY_OWNER_PROBE_TIMEOUT_SECONDS`, default `3`). A reachable owner
+keeps receiving its pinned requests (logged as
+`event=owner_off_roster_alive`); an unreachable one fails the request with
+HTTP 503 `strict affinity server is no longer registered`. A replica that was
+*restarted* at the same address answers the forwarded request with its own
+HTTP 404 (the container is gone), which clients should treat as session loss
+and handshake again. Strict affinity never substitutes another replica.
+Mirror soft affinity is experimental, optional, and enabled by default. Disable it to use normal mirror
 load balancing. When enabled, affinity is inferred from the repository path
 without a handshake.
 

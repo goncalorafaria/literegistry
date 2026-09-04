@@ -74,6 +74,7 @@ class RedisRegistration:
         instance_id: str,
         image: str,
         registry_mirror: Optional[str] = None,
+        session_limits: Optional[dict] = None,
         heartbeat_interval: float = 10.0,
         store: Optional[AsyncRedisStore] = None,
         registry: Optional[ServerRegistry] = None,
@@ -86,6 +87,7 @@ class RedisRegistration:
         self.instance_id = instance_id
         self.image = image
         self.registry_mirror = registry_mirror
+        self.session_limits = session_limits or {}
         self.heartbeat_interval = heartbeat_interval
         self._heartbeat_task: Optional[asyncio.Task] = None
 
@@ -96,6 +98,7 @@ class RedisRegistration:
             "instance_id": self.instance_id,
             "image": self.image,
             "registry_mirror": self.registry_mirror,
+            "session_limits": self.session_limits,
             "affinity": {
                 "enabled": True,
                 "handshake_endpoint": "handshake",
@@ -149,9 +152,12 @@ def build_registered_app(
     async def lifespan(app):
         await backend.cleanup()
         await registration.start()
+        janitor_task = asyncio.create_task(backend.janitor_loop())
         try:
             yield
         finally:
+            janitor_task.cancel()
+            await asyncio.gather(janitor_task, return_exceptions=True)
             await registration.stop()
             await backend.cleanup()
 
@@ -179,6 +185,21 @@ def main(
     ),
     storage_driver: str = os.environ.get("PODMAN_STORAGE_DRIVER", "vfs"),
     registry_mirror: Optional[str] = os.environ.get("PODMAN_REGISTRY_MIRROR"),
+    session_memory: Optional[str] = os.environ.get("PODMAN_AFFINITY_SESSION_MEMORY"),
+    session_pids_limit: Optional[int] = (
+        int(os.environ["PODMAN_AFFINITY_SESSION_PIDS_LIMIT"])
+        if os.environ.get("PODMAN_AFFINITY_SESSION_PIDS_LIMIT")
+        else None
+    ),
+    session_idle_timeout: Optional[float] = (
+        float(os.environ["PODMAN_AFFINITY_SESSION_IDLE_TIMEOUT"])
+        if os.environ.get("PODMAN_AFFINITY_SESSION_IDLE_TIMEOUT")
+        else None
+    ),
+    janitor_interval: float = float(
+        os.environ.get("PODMAN_AFFINITY_JANITOR_INTERVAL", "300")
+    ),
+    image_prune_until: Optional[str] = os.environ.get("PODMAN_AFFINITY_IMAGE_PRUNE_UNTIL"),
     heartbeat_interval: float = float(
         os.environ.get("PODMAN_AFFINITY_HEARTBEAT_INTERVAL", "10")
     ),
@@ -198,6 +219,16 @@ def main(
         storage_driver: Podman storage driver in the outer Docker container.
         registry_mirror: Optional HTTP(S) gateway root used as the native
             docker.io pull-through mirror. Podman falls back to Docker Hub.
+        session_memory: Optional per-container memory limit (e.g. ``4g``).
+            Applied with an equal ``--memory-swap`` so a runaway session is
+            OOM-killed instead of exhausting the replica host.
+        session_pids_limit: Optional per-container pids limit (fork-bomb guard).
+        session_idle_timeout: Seconds of inactivity after which a session
+            container is reaped by the janitor. Unset disables reaping;
+            clients that never call close then leak containers until restart.
+        janitor_interval: Seconds between janitor sweeps.
+        image_prune_until: Optional ``podman image prune --filter until=``
+            value (e.g. ``24h``) applied on each janitor sweep.
         heartbeat_interval: Seconds between Redis heartbeats.
         allow_non_loopback: Explicitly permit a managed cluster bind. This is
             required for Beaker host networking and must not be used casually.
@@ -213,6 +244,11 @@ def main(
         storage_driver=storage_driver,
         session_image=image,
         session_network=network,
+        session_memory=session_memory,
+        session_pids_limit=session_pids_limit,
+        session_idle_timeout=session_idle_timeout,
+        janitor_interval=janitor_interval,
+        image_prune_until=image_prune_until,
         instance_id=instance_id,
         registry_mirror=registry_mirror,
     )
@@ -223,6 +259,11 @@ def main(
         instance_id=instance_id,
         image=image,
         registry_mirror=registry_mirror,
+        session_limits={
+            "memory": session_memory,
+            "pids_limit": session_pids_limit,
+            "idle_timeout": session_idle_timeout,
+        },
         heartbeat_interval=heartbeat_interval,
     )
     uvicorn.run(
