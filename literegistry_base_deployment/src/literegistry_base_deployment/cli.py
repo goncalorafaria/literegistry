@@ -24,9 +24,13 @@ class StackCommand:
     def __call__(
         self,
         registry: str | None = None,
+        head_registry: str | None = None,
         python_replicas: int = 1,
         terminal_replicas: int = 1,
         web_search_replicas: int = 1,
+        cache_maxmemory: str = "4gb",
+        cache_maxmemory_policy: str = "allkeys-lfu",
+        cache_ttl_seconds: int = 3600,
         local_search_replicas: int = 0,
         local_search_corpus_jsonl: str | None = None,
         local_search_index_dir: str | None = None,
@@ -70,9 +74,13 @@ class StackCommand:
     ) -> None:
         config = BaseDeploymentConfig(
             registry=registry,
+            head_registry=head_registry,
             python_replicas=python_replicas,
             terminal_replicas=terminal_replicas,
             web_search_replicas=web_search_replicas,
+            cache_maxmemory=cache_maxmemory,
+            cache_maxmemory_policy=cache_maxmemory_policy,
+            cache_ttl_seconds=cache_ttl_seconds,
             local_search_replicas=local_search_replicas,
             local_search_corpus_jsonl=local_search_corpus_jsonl,
             local_search_index_dir=local_search_index_dir,

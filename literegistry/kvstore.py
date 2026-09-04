@@ -2,9 +2,40 @@ import abc
 import asyncio
 import hashlib
 import math
+import os
 from pathlib import Path
+import tempfile
 import time
 from typing import Optional, Union, List
+from urllib.parse import unquote, urlsplit
+
+
+FILE_REGISTRY_SCHEME = "file://"
+
+
+def filesystem_registry_path(value: Union[str, Path]) -> Path:
+    """Decode a filesystem registry path or canonical ``file://`` URI."""
+
+    text = str(value)
+    if not text.startswith("file:"):
+        return Path(text).expanduser()
+    parsed = urlsplit(text)
+    if parsed.scheme != "file":
+        raise ValueError("filesystem registry URI must use the file:// scheme")
+    if parsed.netloc not in {"", "localhost"}:
+        raise ValueError("file:// registry URI cannot use a remote hostname")
+    if parsed.query or parsed.fragment:
+        raise ValueError("file:// registry URI cannot contain a query or fragment")
+    path = Path(unquote(parsed.path)).expanduser()
+    if not parsed.path or not path.is_absolute():
+        raise ValueError("file:// registry URI must contain an absolute path")
+    return path
+
+
+def filesystem_registry_uri(value: Union[str, Path]) -> str:
+    """Return a canonical ``file:///absolute/path`` registry URI."""
+
+    return filesystem_registry_path(value).absolute().as_uri()
 
 
 class KeyValueStore(abc.ABC):
@@ -40,13 +71,31 @@ class KeyValueStore(abc.ABC):
         """Get keys in the store, optionally restricted to a prefix."""
         pass
 
+    async def items(
+        self,
+        prefix: Optional[str] = None,
+    ) -> List[tuple[str, bytes]]:
+        """Get live key/value pairs, optionally restricted to a prefix.
+
+        Backends may override this to perform one native bulk query. Keeping a
+        default implementation preserves compatibility with custom stores.
+        """
+
+        keys = await self.keys(prefix=prefix)
+        values = await asyncio.gather(*(self.get(key) for key in keys))
+        return [
+            (key, value)
+            for key, value in zip(keys, values)
+            if value is not None
+        ]
+
 
 class FileSystemKVStore(KeyValueStore):
     """Filesystem-based key-value store (keys = files, values = content)"""
 
     def __init__(self, root: Union[str, Path] = "/gscratch/ark/graf/registry"):
-        self.root = Path(root)
-        self.root.mkdir(exist_ok=True)
+        self.root = filesystem_registry_path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
         self._ttl_root = self.root / ".literegistry_ttl"
 
     @staticmethod
@@ -116,16 +165,46 @@ class FileSystemKVStore(KeyValueStore):
             value = value.encode("utf-8")
 
         def _set_sync() -> None:
-            key_path.write_bytes(value)
             ttl_path = self._ttl_path(key)
-            if ttl is None:
+            value_fd, value_temp_name = tempfile.mkstemp(
+                prefix=f".{key_path.name}.", suffix=".tmp", dir=self.root
+            )
+            value_temp = Path(value_temp_name)
+            try:
+                with os.fdopen(value_fd, "wb") as output:
+                    output.write(value)
+                    output.flush()
+                    os.fsync(output.fileno())
+
+                if ttl is None:
+                    try:
+                        ttl_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                else:
+                    self._ttl_root.mkdir(exist_ok=True)
+                    ttl_fd, ttl_temp_name = tempfile.mkstemp(
+                        prefix=f".{ttl_path.name}.", suffix=".tmp", dir=self._ttl_root
+                    )
+                    ttl_temp = Path(ttl_temp_name)
+                    try:
+                        with os.fdopen(ttl_fd, "w", encoding="utf-8") as output:
+                            output.write(str(time.time() + ttl))
+                            output.flush()
+                            os.fsync(output.fileno())
+                        os.replace(ttl_temp, ttl_path)
+                    finally:
+                        try:
+                            ttl_temp.unlink()
+                        except FileNotFoundError:
+                            pass
+
+                os.replace(value_temp, key_path)
+            finally:
                 try:
-                    ttl_path.unlink()
+                    value_temp.unlink()
                 except FileNotFoundError:
                     pass
-                return
-            self._ttl_root.mkdir(exist_ok=True)
-            ttl_path.write_text(str(time.time() + ttl), encoding="utf-8")
 
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, _set_sync)
@@ -159,4 +238,3 @@ class FileSystemKVStore(KeyValueStore):
     async def close(self):
         """No-op for compatibility; nothing to close for filesystem store."""
         pass
-

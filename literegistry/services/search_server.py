@@ -9,12 +9,12 @@ import socket
 import time
 from dataclasses import dataclass, field
 from typing import Any, Literal
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
 import aiohttp
-import redis.asyncio as redis
 from fastapi import FastAPI, HTTPException
-from literegistry import ServerRegistry, get_kvstore
+from literegistry import RegistryClient, get_kvstore
+from literegistry.cache_server import CacheServiceClient
 from pydantic import BaseModel, Field, root_validator
 
 
@@ -72,18 +72,11 @@ class SearchServerConfig:
     jina_api_key: str | None = None
     jina_return_format: str = "markdown"
     upstream_timeout: float = 60
-    cache_db: int = 1
+    cache_service: str = "cache"
+    cache_timeout: float = 5
+    cache_retries: int = 3
     cache_ttl: int = 3600
     upstream_headers: dict[str, str] = field(default_factory=dict)
-
-
-def _redis_url_for_db(url: str, db: int) -> str:
-    """Return the registry Redis URL with its logical database replaced."""
-    parsed = urlsplit(url)
-    query = [(key, value) for key, value in parse_qsl(parsed.query) if key != "db"]
-    return urlunsplit(
-        (parsed.scheme, parsed.netloc, f"/{db}", urlencode(query), parsed.fragment)
-    )
 
 
 class SearchServer:
@@ -91,14 +84,16 @@ class SearchServer:
 
     def __init__(self, config: SearchServerConfig | None = None):
         self.config = config or SearchServerConfig()
-        self.registry = ServerRegistry(store=get_kvstore(self.config.registry))
+        self.registry = RegistryClient(store=get_kvstore(self.config.registry))
         self.url = f"http://{socket.getfqdn()}"
         self.should_run = False
         self.heartbeat_task: asyncio.Task | None = None
         self.session: aiohttp.ClientSession | None = None
-        self.cache = redis.from_url(
-            _redis_url_for_db(self.config.registry, self.config.cache_db),
-            decode_responses=False,
+        self.cache = CacheServiceClient(
+            registry=self.registry,
+            service_name=self.config.cache_service,
+            timeout=self.config.cache_timeout,
+            max_retries=self.config.cache_retries,
         )
         self.app = FastAPI(title="LiteRegistry Search Server")
         self._install_routes()
@@ -112,7 +107,9 @@ class SearchServer:
             "extra_kwargs": {
                 "modes": ["query", "url"],
                 "provider": self.config.provider,
-                "cache_db": self.config.cache_db,
+                "cache_service": self.config.cache_service,
+                "cache_timeout": self.config.cache_timeout,
+                "cache_retries": self.config.cache_retries,
                 "cache_ttl": self.config.cache_ttl,
             },
         }
@@ -188,10 +185,8 @@ class SearchServer:
 
     async def _cache_get(self, key: str) -> dict[str, Any] | None:
         try:
-            value = await self.cache.get(key)
-            if value is None:
-                return None
-            return json.loads(value)
+            response = await self.cache.get(key)
+            return response.value if response.hit else None
         except Exception as exc:
             logger.warning("Search cache read failed: %s", exc)
             return None
@@ -200,11 +195,7 @@ class SearchServer:
         if self.config.cache_ttl <= 0:
             return
         try:
-            await self.cache.set(
-                key,
-                json.dumps(value, ensure_ascii=False, separators=(",", ":")),
-                ex=self.config.cache_ttl,
-            )
+            await self.cache.set(key, value, ttl_seconds=self.config.cache_ttl)
         except Exception as exc:
             logger.warning("Search cache write failed: %s", exc)
 
@@ -281,13 +272,14 @@ class SearchServer:
         timeout = aiohttp.ClientTimeout(total=self.config.upstream_timeout)
         self.session = aiohttp.ClientSession(timeout=timeout)
         try:
+            await self.cache.start()
             await self.registry.register_server(
                 self.url, self.config.port, self._metadata()
             )
         except Exception:
             await self.session.close()
             self.session = None
-            await self.cache.aclose()
+            await self.cache.close()
             raise
         self.should_run = True
         self.heartbeat_task = asyncio.create_task(self._heartbeat_loop())
@@ -312,7 +304,7 @@ class SearchServer:
         if self.session:
             await self.session.close()
             self.session = None
-        await self.cache.aclose()
+        await self.cache.close()
 
     def _install_routes(self) -> None:
         @self.app.post("/search", response_model=SearchResponse)
@@ -335,7 +327,7 @@ class SearchServer:
                 "jina_reader_configured": bool(
                     self.config.fetch_api_url and self.config.jina_api_key
                 ),
-                "cache_db": self.config.cache_db,
+                "cache_service": self.config.cache_service,
                 "cache_ttl": self.config.cache_ttl,
             }
 
@@ -357,7 +349,9 @@ def main(
     search_api_url: str | None = None,
     fetch_api_url: str | None = None,
     upstream_timeout: float = 60,
-    cache_db: int = 1,
+    cache_service: str = "cache",
+    cache_timeout: float = 5,
+    cache_retries: int = 3,
     cache_ttl: int = 3600,
     upstream_headers_json: str | None = None,
 ) -> None:
@@ -405,7 +399,9 @@ def main(
         fetch_api_url=fetch_api_url,
         jina_api_key=jina_api_key,
         upstream_timeout=upstream_timeout,
-        cache_db=cache_db,
+        cache_service=cache_service,
+        cache_timeout=cache_timeout,
+        cache_retries=cache_retries,
         cache_ttl=cache_ttl,
         upstream_headers={str(key): str(value) for key, value in upstream_headers.items()},
     )

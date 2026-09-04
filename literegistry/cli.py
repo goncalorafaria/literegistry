@@ -5,6 +5,7 @@ import asyncio
 from literegistry import RegistryClient, get_kvstore
 import fire
 import literegistry.redis as redis
+import literegistry.cache_server as cache_server
 import literegistry.gateway as gateway
 import literegistry.gateway.legacy as old_gateway
 import literegistry.services.openai_proxy as openai_proxy
@@ -68,6 +69,7 @@ def main():
     fire.Fire({
         "summary": check_summary,
         "redis": redis.main,
+        "cache": cache_server.main,
         "gateway": gateway.main,
         "old-gateway": old_gateway.main,
         "podman": podman_server.main,

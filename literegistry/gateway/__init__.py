@@ -11,13 +11,18 @@ Run it with uvicorn's factory mode::
 
 from __future__ import annotations
 
+import asyncio
+import fcntl
+import hashlib
 import logging
 import os
 import socket
+import tempfile
 import time
 from collections import Counter, defaultdict, deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, MutableMapping, Optional, Protocol, Sequence
 
 from starlette.applications import Starlette
@@ -27,9 +32,10 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 import uvicorn
 
-from literegistry import get_kvstore
+from literegistry import get_kvstore, head_registry_uri
 from literegistry.client import RegistryClient
 from literegistry.http import HTTPResponseError, RegistryHTTPClient
+from literegistry.registry import ServerRegistry
 from literegistry.shared_session import SharedSessionManager, get_session_manager
 
 
@@ -56,9 +62,16 @@ ResponseMapper = Callable[[Any], Response]
 class GatewayRequestError(ValueError):
     """A client request that cannot be forwarded."""
 
-    def __init__(self, message: str, status_code: int = 400) -> None:
+    def __init__(
+        self,
+        message: str,
+        status_code: int = 400,
+        *,
+        response_body: Mapping[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.response_body = dict(response_body) if response_body is not None else None
 
 
 @dataclass(frozen=True)
@@ -142,6 +155,10 @@ class GatewayConfig:
     affinity_ttl_seconds: float = 900.0
     docker_mirror_affinity_ttl_seconds: float = 604800.0
     docker_mirror_soft_affinity: bool = True
+    advertise_host: Optional[str] = None
+    registration_enabled: bool = True
+    registration_instance_id: Optional[str] = None
+    registration_heartbeat_interval: float = 10.0
 
     def __post_init__(self) -> None:
         if self.stats_window_seconds <= 0:
@@ -152,6 +169,19 @@ class GatewayConfig:
             )
         if self.affinity_ttl_seconds <= 0:
             raise ValueError("affinity_ttl_seconds must be greater than zero")
+        if self.registration_enabled and self.registration_heartbeat_interval <= 0:
+            raise ValueError(
+                "registration_heartbeat_interval must be greater than zero"
+            )
+        if self.advertise_host is not None and not self.advertise_host.strip():
+            raise ValueError("advertise_host must be non-empty when supplied")
+        if (
+            self.registration_instance_id is not None
+            and not self.registration_instance_id.strip()
+        ):
+            raise ValueError(
+                "registration_instance_id must be non-empty when supplied"
+            )
 
     def retry_config(self, name: str) -> RetryConfig:
         try:
@@ -215,7 +245,200 @@ class GatewayConfig:
             docker_mirror_soft_affinity=_env_bool(
                 "DOCKER_MIRROR_SOFT_AFFINITY", True
             ),
+            advertise_host=os.getenv("GATEWAY_ADVERTISE_HOST"),
+            registration_enabled=_env_bool(
+                "GATEWAY_REGISTRATION_ENABLED", True
+            ),
+            registration_instance_id=os.getenv("GATEWAY_INSTANCE_ID"),
+            registration_heartbeat_interval=float(
+                os.getenv("GATEWAY_HEARTBEAT_INTERVAL", "10")
+            ),
         )
+
+
+class GatewayRegistration:
+    """Publish one gateway lifecycle, independently of its worker count.
+
+    Uvicorn creates the application once in every worker process. A local
+    advisory lock elects exactly one of those workers to own the shared
+    registry record. Waiting workers take over the same stable record if the
+    current owner exits.
+    """
+
+    def __init__(
+        self,
+        *,
+        store: Any,
+        advertise_host: str,
+        advertise_port: int,
+        instance_id: str,
+        heartbeat_interval: float = 10.0,
+        worker_count: int = 1,
+        registry: Optional[ServerRegistry] = None,
+        leader_lock_path: Optional[str | os.PathLike[str]] = None,
+    ) -> None:
+        if heartbeat_interval <= 0:
+            raise ValueError("heartbeat_interval must be greater than zero")
+        if worker_count < 1:
+            raise ValueError("worker_count must be at least one")
+        if not advertise_host.strip():
+            raise ValueError("advertise_host must be non-empty")
+        if not instance_id.strip():
+            raise ValueError("instance_id must be non-empty")
+        formatted_host = advertise_host.strip()
+        if ":" in formatted_host and not formatted_host.startswith("["):
+            formatted_host = f"[{formatted_host}]"
+        self.store = store
+        self.registry = registry or ServerRegistry(store=store)
+        self.url = f"http://{formatted_host}"
+        self.port = int(advertise_port)
+        self.instance_id = instance_id.strip()
+        identity_digest = hashlib.sha256(
+            self.instance_id.encode("utf-8")
+        ).hexdigest()[:32]
+        # All workers address one public lifecycle record. The deterministic,
+        # filesystem-safe identifier also makes leader handoff seamless.
+        self.registry.server_id = f"gateway-{identity_digest}"
+        self.heartbeat_interval = float(heartbeat_interval)
+        self.worker_count = int(worker_count)
+        self._leader_lock_path = Path(
+            leader_lock_path
+            or Path(tempfile.gettempdir())
+            / f"literegistry-gateway-{identity_digest}.lock"
+        )
+        self._leader_lock_file: Optional[Any] = None
+        self._registered = False
+        self._stop_event: Optional[asyncio.Event] = None
+        self._heartbeat_task: Optional[asyncio.Task[None]] = None
+
+    def metadata(self) -> dict[str, Any]:
+        return {
+            "model_path": "gateway",
+            "backend": "registry-gateway",
+            "instance_id": self.instance_id,
+            "worker_count": self.worker_count,
+            "health_endpoint": "/health",
+            "capabilities": [
+                "service-proxy",
+                "strict-affinity",
+                "docker-mirror-proxy",
+            ],
+            "authentication": {"type": "none"},
+        }
+
+    def heartbeat_data(self) -> dict[str, Any]:
+        return {
+            "status": "healthy",
+            "worker_count": self.worker_count,
+        }
+
+    @property
+    def is_leader(self) -> bool:
+        """Whether this process currently owns the gateway lifecycle."""
+        return self._leader_lock_file is not None
+
+    def _try_acquire_leadership(self) -> bool:
+        if self.is_leader:
+            return True
+        self._leader_lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_file = self._leader_lock_path.open("a+b")
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock_file.close()
+            return False
+        self._leader_lock_file = lock_file
+        return True
+
+    def _release_leadership(self) -> None:
+        lock_file = self._leader_lock_file
+        self._leader_lock_file = None
+        if lock_file is None:
+            return
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock_file.close()
+
+    async def _register_as_leader(self) -> None:
+        await self.registry.register_server(self.url, self.port, self.metadata())
+        self._registered = True
+        logger.info(
+            "Registered gateway server_id=%s instance_id=%s uri=%s:%s",
+            self.registry.server_id,
+            self.instance_id,
+            self.url,
+            self.port,
+        )
+
+    async def start(self) -> None:
+        if self._heartbeat_task is not None:
+            return
+        if self._try_acquire_leadership():
+            try:
+                await self._register_as_leader()
+            except BaseException:
+                self._release_leadership()
+                raise
+        else:
+            logger.info(
+                "Gateway instance_id=%s is following the heartbeat owner",
+                self.instance_id,
+            )
+        self._stop_event = asyncio.Event()
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
+    async def _heartbeat_loop(self) -> None:
+        stop_event = self._stop_event
+        assert stop_event is not None
+        while not stop_event.is_set():
+            delay = (
+                self.heartbeat_interval
+                if self.is_leader
+                else min(self.heartbeat_interval, 1.0)
+            )
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=delay)
+                break
+            except asyncio.TimeoutError:
+                pass
+            if not self.is_leader:
+                if not self._try_acquire_leadership():
+                    continue
+                try:
+                    await self._register_as_leader()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    self._release_leadership()
+                    logger.exception("Gateway registry leadership takeover failed")
+                continue
+            try:
+                await self.registry.heartbeat(
+                    self.url,
+                    self.port,
+                    data=self.heartbeat_data(),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Gateway registry heartbeat failed")
+
+    async def stop(self) -> None:
+        task = self._heartbeat_task
+        if task is None:
+            return
+        assert self._stop_event is not None
+        self._stop_event.set()
+        await task
+        self._heartbeat_task = None
+        self._stop_event = None
+        try:
+            if self._registered:
+                await self.registry.deregister()
+                self._registered = False
+        finally:
+            self._release_leadership()
 
 
 def json_response(body: Any) -> Response:
@@ -460,6 +683,7 @@ class Gateway:
         enable_strict_affinity: bool = True,
         docker_mirror: Optional[Any] = None,
         enable_docker_mirror: bool = True,
+        registration: Optional[GatewayRegistration] = None,
     ) -> None:
         self.registry = registry
         self.config = config or GatewayConfig()
@@ -467,6 +691,7 @@ class Gateway:
         self.routing = routing or LoadBalancedRouting(registry)
         self.session_manager = session_manager or get_session_manager()
         self.metrics = metrics or GatewayMetrics(self.config.stats_window_seconds)
+        self.registration = registration
         self._validate_routes()
         self.app = self._create_app()
         self.strict_affinity = None
@@ -642,11 +867,17 @@ class Gateway:
         async def lifespan(app: Starlette):
             app.state.gateway = self
             owns_session = not self.session_manager.is_initialized
+            registration_started = False
             if owns_session:
                 await self.session_manager.initialize()
             try:
+                if self.registration is not None:
+                    await self.registration.start()
+                    registration_started = True
                 yield
             finally:
+                if registration_started:
+                    await self.registration.stop()
                 if owns_session:
                     await self.session_manager.shutdown()
                 await self._close_registry()
@@ -668,6 +899,7 @@ class Gateway:
         )
         app = Starlette(routes=routes, lifespan=lifespan)
         app.state.gateway = self
+        app.state.gateway_registration = self.registration
         app.add_middleware(
             CORSMiddleware,
             allow_origins=list(self.config.cors_origins),
@@ -688,7 +920,7 @@ class Gateway:
     async def _request_error(self, request: Request, exc: Exception) -> Response:
         assert isinstance(exc, GatewayRequestError)
         return JSONResponse(
-            {"error": str(exc), "status": "failed"},
+            exc.response_body or {"error": str(exc), "status": "failed"},
             status_code=exc.status_code,
         )
 
@@ -717,6 +949,8 @@ def create_app(
     enable_strict_affinity: bool = True,
     docker_mirror: Optional[Any] = None,
     enable_docker_mirror: bool = True,
+    registration: Optional[GatewayRegistration] = None,
+    enable_registration: Optional[bool] = None,
 ) -> Starlette:
     """Create a configured gateway app for uvicorn or embedding."""
     resolved_config = config or GatewayConfig.from_env()
@@ -730,6 +964,33 @@ def create_app(
             service_type="model_path",
             cache_ttl=int(os.getenv("REGISTRY_CACHE_TTL_SECONDS", "5")),
         )
+    registration_enabled = (
+        resolved_config.registration_enabled
+        if enable_registration is None
+        else enable_registration
+    )
+    if registration is None and registration_enabled:
+        store = getattr(registry, "store", None)
+        if store is None:
+            raise ValueError("gateway registration requires a registry store")
+        resolved_host = (
+            resolved_config.advertise_host
+            or os.getenv("BEAKER_NODE_HOSTNAME")
+            or socket.getfqdn()
+        ).strip()
+        instance_id = resolved_config.registration_instance_id or (
+            f"gateway-{resolved_host}-{resolved_config.port}"
+        )
+        registration = GatewayRegistration(
+            store=store,
+            advertise_host=resolved_host,
+            advertise_port=resolved_config.port,
+            instance_id=instance_id,
+            heartbeat_interval=(
+                resolved_config.registration_heartbeat_interval
+            ),
+            worker_count=int(os.getenv("GATEWAY_WORKERS", "1")),
+        )
     gateway = Gateway(
         registry,
         config=resolved_config,
@@ -739,6 +1000,7 @@ def create_app(
         enable_strict_affinity=enable_strict_affinity,
         docker_mirror=docker_mirror,
         enable_docker_mirror=enable_docker_mirror,
+        registration=registration,
     )
     return gateway.app
 
@@ -762,10 +1024,14 @@ def advertised_gateway_url(
 
 def main(
     registry: str = "redis://klone-login01.hyak.local:6379",
+    head_registry: Optional[str] = None,
     host: str = "0.0.0.0",
     port: int = 8080,
     advertise_host: Optional[str] = None,
+    instance_id: Optional[str] = None,
     workers: int = 1,
+    register: bool = True,
+    heartbeat_interval: float = 10.0,
     affinity_ttl_seconds: float = 900,
     docker_mirror_affinity_ttl_seconds: float = 604800,
     registry_cache_ttl_seconds: int = 5,
@@ -791,6 +1057,12 @@ def main(
     """
     if workers < 1:
         raise ValueError("workers must be at least 1")
+    if head_registry is not None:
+        if not head_registry.strip():
+            raise ValueError("head_registry must be non-empty when supplied")
+        registry = head_registry_uri(head_registry)
+    if register and heartbeat_interval <= 0:
+        raise ValueError("heartbeat_interval must be greater than zero")
     if docker_mirror_affinity_ttl_seconds <= 0:
         raise ValueError(
             "docker_mirror_affinity_ttl_seconds must be greater than zero"
@@ -814,6 +1086,18 @@ def main(
     os.environ["REGISTRY_PATH"] = registry
     os.environ["HOST"] = host
     os.environ["PORT"] = str(port)
+    resolved_advertise_host = (
+        advertise_host
+        or os.getenv("BEAKER_NODE_HOSTNAME")
+        or socket.getfqdn()
+    ).strip()
+    os.environ["GATEWAY_ADVERTISE_HOST"] = resolved_advertise_host
+    os.environ["GATEWAY_INSTANCE_ID"] = (
+        instance_id or f"gateway-{resolved_advertise_host}-{port}"
+    )
+    os.environ["GATEWAY_WORKERS"] = str(workers)
+    os.environ["GATEWAY_REGISTRATION_ENABLED"] = str(register)
+    os.environ["GATEWAY_HEARTBEAT_INTERVAL"] = str(heartbeat_interval)
     os.environ["AFFINITY_TTL_SECONDS"] = str(affinity_ttl_seconds)
     os.environ["DOCKER_MIRROR_AFFINITY_TTL_SECONDS"] = str(
         docker_mirror_affinity_ttl_seconds
@@ -830,7 +1114,7 @@ def main(
     )
 
     print(
-        f"GATEWAY_URL={advertised_gateway_url(port, advertise_host)}",
+        f"GATEWAY_URL={advertised_gateway_url(port, resolved_advertise_host)}",
         flush=True,
     )
 
@@ -855,6 +1139,7 @@ def main(
 __all__ = [
     "GatewayConfig",
     "GatewayMetrics",
+    "GatewayRegistration",
     "Gateway",
     "GatewayRequestError",
     "LoadBalancedRouting",

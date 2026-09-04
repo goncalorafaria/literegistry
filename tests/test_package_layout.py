@@ -7,10 +7,13 @@ from pathlib import Path
 def test_canonical_modules_are_importable() -> None:
     modules = (
         "literegistry.coop.artifacts",
+        "literegistry.coop.endpoints",
         "literegistry.coop.ports",
         "literegistry.coop.redis",
+        "literegistry.head_registry",
         "literegistry.redis",
         "literegistry.runtime",
+        "literegistry.sqlite",
         "literegistry.services.executable_wrapper",
         "literegistry.services.vllm_wrapper",
         "literegistry.services.sglang_wrapper",

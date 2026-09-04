@@ -6,12 +6,14 @@ the non-Podman LiteRegistry stack previously launched from Datadev:
 ```text
 clients -> one gateway -> Python execution replicas
                        -> restricted terminal replicas
-                       -> cached Serper query + Jina URL replicas
+                       -> Serper query + Jina URL replicas
                        -> Lucene BM25 local-search replicas
                        -> vLLM generation replicas
                        -> vLLM classification replicas
                                 |
-                                +-> managed or external Redis registry
+                                +-> cache service -> private Redis cache
+                                |
+                                +-> managed or external Redis controller
 ```
 
 It depends strongly on `literegistry` and has no Datadev dependency. Shared
@@ -19,7 +21,7 @@ coordination lives in `literegistry.coop`; this package contains no copy of the
 port allocator, Redis barrier, or artifact-build locks. It copies the proven
 mechanics from `literegistry-podman-beaker`: Fire CLI, preview before
 submission, host networking, collision-safe dynamic ports, CPU-cluster replica
-spreading, managed-or-external Redis, Weka URL files, and direct Beaker specs.
+spreading, managed-or-external Redis, TTL-backed Weka endpoint discovery, and direct Beaker specs.
 
 ## What is deployed
 
@@ -29,15 +31,40 @@ spreading, managed-or-external Redis, Weka URL files, and direct Beaker specs.
 | Python | `POST /python` | 1 | CPU |
 | Terminal | `POST /terminal` | 1 | CPU |
 | Web search / fetch | `POST /search` | 1 | CPU |
+| Cache | `POST /cache` (registry-discovered) | 1 when web search is enabled | CPU |
 | Local BM25 search | `POST /search` with `model_path=localsearch:...` | 0 | CPU |
 | vLLM generation | `/v1/chat/completions`, `/v1/completions` | 0 | GPU |
 | vLLM classification | `POST /classify` | 0 | GPU |
-| Redis | internal service discovery | 1 when `--registry` is omitted | CPU |
+| Controller Redis | service discovery and health checks | 1 when `--registry` is omitted | CPU |
 
 Generation and classification are separate vLLM pools. Generation launches
 vLLM with `--task=generate`; classification launches it with
 `--task=classify`, which exposes vLLM's sequence-classification endpoint. The
 gateway chooses either pool using the request's `model` field.
+
+### Beaker resource contract
+
+Redis, gateway, Python, terminal, cache, web-search, and local-search tasks are
+CPU-only. For every one of those tasks, the launcher deliberately emits:
+
+```yaml
+resources:
+  gpuCount: 0
+context:
+  minRuntime: "0h"
+```
+
+There is intentionally **no `cpuCount` field**. On GPU-shaped Beaker clusters,
+adding a CPU request can cause an otherwise CPU-only task to be assigned a GPU
+worker. Keep CPU omitted, keep `gpuCount: 0`, and keep the default
+`--min-runtime-hours=0`. Do not pass `--omit-service-resources=True` for normal
+Beaker deployments because that also removes the explicit zero-GPU request.
+Use `preview` before launch and verify these fields on every generated CPU
+task.
+
+vLLM generation and classification tasks are the only exception: when those
+pools are configured, their `gpuCount` is set from the pool's tensor-parallel
+size. A deployment with no vLLM pools remains entirely CPU-only.
 
 ## End-to-end setup
 
@@ -70,7 +97,7 @@ pip install literegistry-base-deployment
 ### 2. Make LiteRegistry available to Docker
 
 Every runtime image installs this package, which installs
-`literegistry>=1.0.36`. Publish that LiteRegistry version to the Python index
+`literegistry>=1.0.47`. Publish that LiteRegistry version to the Python index
 used by Docker, or expose its wheel through an HTTP wheelhouse reachable from
 inside Docker:
 
@@ -78,7 +105,7 @@ inside Docker:
 cd /weka/gfaria/literegistry
 python -m build
 python -m twine check dist/*
-# python -m twine upload dist/literegistry-1.0.36*
+# python -m twine upload dist/literegistry-1.0.47*
 
 export PIP_INDEX_URL=https://python.example/simple
 # Or: export PIP_FIND_LINKS=https://python.example/wheels
@@ -110,10 +137,13 @@ literegistry-base-vllm:0.1.0
 The services image runs gateway, Python, or web search depending on its Beaker
 command. Terminal has every binary allowed by the restricted pipeline server.
 Local search is not rebuilt by default: the launcher targets the Beaker image
-`goncalof/jtc-local-search-lucene-bm25`, which must contain LiteRegistry 1.0.36
+`goncalof/jtc-local-search-lucene-bm25`, which must contain LiteRegistry 1.0.47
 or newer. vLLM uses
 `vllm/vllm-openai:latest` by default; pin or replace it when reproducibility
-requires a specific vLLM/CUDA combination:
+requires a specific vLLM/CUDA combination. When web search is enabled, the
+`literegistry-redis` image also runs one `literegistry cache` task. That task
+owns a private Redis child process; search replicas reach it through the
+registry-discovered HTTP API and never write cache entries to controller Redis:
 
 ```bash
 VLLM_BASE_IMAGE=vllm/vllm-openai:0.11.0 \
@@ -195,6 +225,9 @@ literegistry-base-deployment preview \
   --python-replicas=2 \
   --terminal-replicas=2 \
   --web-search-replicas=2 \
+  --cache-maxmemory=4gb \
+  --cache-maxmemory-policy=allkeys-lfu \
+  --cache-ttl-seconds=3600 \
   --local-search-replicas=2 \
   --local-search-corpus-jsonl=/weka/gfaria/search/corpus.jsonl \
   --local-search-index-dir=/weka/gfaria/search/lucene-index \
@@ -218,7 +251,19 @@ literegistry-base-deployment preview \
 ```
 
 Preview validates and prints the exact Beaker spec without creating anything.
-With no `--registry`, it includes one managed Redis task. To reuse Redis, add:
+With no `--registry`, it includes one managed controller Redis task. The
+cache task is independent of that choice: one cache task is included whenever
+`--web-search-replicas` is greater than zero.
+
+Managed mode gives every service an experiment-scoped `head+file://` Weka URI,
+not a fixed Redis URL. Services wait there during an outage and reconnect when
+resumed Redis publishes its current address. To reuse an externally managed
+head registry without creating Redis, pass
+`--registry=head+file:///weka/shared/my-stack`. SQLite and separate Redis
+heads use `head+sqlite:///...` and `head+redis://...`. `--head-registry` remains a
+convenience spelling for the same value.
+
+To reuse controller Redis, add:
 
 ```bash
 literegistry-base-deployment preview \
@@ -249,9 +294,12 @@ literegistry-base-deployment launch \
 
 export EXPERIMENT_ID="$(jq -r '.beaker.id' /tmp/literegistry-base-launch.json)"
 export EXPERIMENT_NAME="$(jq -r '.experiment_name' /tmp/literegistry-base-launch.json)"
-export GATEWAY_FILE="/weka/gfaria/literegistry_base_gateway_${EXPERIMENT_NAME}.url"
-until [[ -s "$GATEWAY_FILE" ]]; do sleep 2; done
-export GATEWAY_URL="$(tail -n 1 "$GATEWAY_FILE")"
+export COOP_ROOT="/weka/gfaria/.literegistry-coop/${EXPERIMENT_NAME}"
+export GATEWAY_URL="$(python -m literegistry.coop.endpoints wait \
+  --root="$COOP_ROOT" \
+  --name=gateway \
+  --healthcheck=http \
+  --timeout=600)"
 echo "$GATEWAY_URL"
 
 beaker experiment get "$EXPERIMENT_ID"
@@ -259,8 +307,14 @@ curl -fsS "$GATEWAY_URL/health"
 curl -fsS "$GATEWAY_URL/v1/models"
 ```
 
-The gateway also prints `GATEWAY_URL=...` in its Beaker logs. The file is an
-atomic convenience for other Weka-connected jobs.
+The gateway also prints `LITEREGISTRY_ENDPOINT_GATEWAY=...` in its Beaker
+logs. Its endpoint record is refreshed while the gateway is healthy and removed
+on clean shutdown; after a crash, its short TTL expires automatically.
+
+For a managed registry, `launch` creates the per-experiment Weka coordination
+directory before submitting Beaker tasks and gives it sticky shared-write
+permissions. This lets the non-root service UID create Redis persistence and
+endpoint files without making the parent Weka directory writable.
 
 ### 8. Exercise every gateway route
 
@@ -317,14 +371,14 @@ literegistry-base-deployment stop "$EXPERIMENT_ID"
 
 | Task | `context.autoResume` | `propagateFailure` | `propagatePreemption` |
 |---|---:|---:|---:|
-| Managed Redis | `false` | `true` | `true` |
+| Managed Redis | `true` | `false` | `false` |
 | Gateway and every worker pool | `true` | `false` | `false` |
 
-Every non-Redis task is resumable and isolated from experiment-wide failure.
-Managed Redis is intentionally the only non-resumable task and the only task
-whose failure or preemption terminates the complete experiment. With external
-`--registry`, no Redis task is created, so every task in this experiment is
-resumable.
+Every task is resumable and non-propagating. During Redis loss, services wait
+for a live `redis` record in the shared head registry instead of exiting.
+Redis's AOF database is stored under that directory and is loaded by the resumed
+task. With an external `--registry`, whether direct or `head+...`, no Redis
+task is created.
 
 ## Local-search behavior
 

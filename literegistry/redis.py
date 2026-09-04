@@ -1,22 +1,58 @@
-import abc
 import asyncio
+import json
 import math
+from pathlib import Path
+import sys
+import tempfile
 from typing import Optional, Union, List
+from urllib.parse import urlsplit, urlunsplit
 import redis.asyncio as redis
 from literegistry.kvstore import KeyValueStore
 import socket
-import time 
 import subprocess
 import shutil
 import os
 import fire
+import logging
 from literegistry.runtime import build_runtime
+from literegistry.coop.endpoints import (
+    endpoint_registry_filesystem_path,
+    normalize_endpoint_registry,
+    run as supervise_endpoint,
+    wait_for_endpoint,
+)
+from literegistry.sqlite import sqlite_registry_path
+
+
+logger = logging.getLogger(__name__)
+
+
+def redact_redis_url(url: str) -> str:
+    """Return a Redis URL safe for logs."""
+    parsed = urlsplit(url)
+    if parsed.password is None:
+        return url
+    host = parsed.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    credentials = f"{parsed.username}:***@" if parsed.username else ":***@"
+    port = f":{parsed.port}" if parsed.port is not None else ""
+    return urlunsplit(
+        (parsed.scheme, f"{credentials}{host}{port}", parsed.path, parsed.query, parsed.fragment)
+    )
 
 
 class RedisKVStore(KeyValueStore):
     """Redis-based key-value store"""
     #  http://klone-login01.hyak.local:8080/v1/models
-    def __init__(self, url: str = "redis://klone-login01.hyak.local:6379", db: int = 0):
+    def __init__(
+        self,
+        url: str = "redis://klone-login01.hyak.local:6379",
+        db: int = 0,
+        *,
+        raise_on_error: bool = False,
+        log_connections: bool = True,
+    ):
         """
         Initialize Redis KV store
         
@@ -26,6 +62,8 @@ class RedisKVStore(KeyValueStore):
         """
         self.url = url
         self.db = db
+        self.raise_on_error = raise_on_error
+        self.log_connections = log_connections
         self._redis = None
 
     async def _get_redis(self) -> redis.Redis:
@@ -35,11 +73,25 @@ class RedisKVStore(KeyValueStore):
                 self._redis = redis.from_url(self.url, db=self.db, decode_responses=False)
                 # Test the connection
                 await self._redis.ping()
-                print(f"Successfully connected to Redis at {self.url}")
+                if self.log_connections:
+                    logger.info(
+                        "Successfully connected to Redis at %s",
+                        redact_redis_url(self.url),
+                    )
             except Exception as e:
-                print(f"Failed to connect to Redis at {self.url}: {e}")
+                if self.log_connections:
+                    logger.warning(
+                        "Failed to connect to Redis at %s: %s",
+                        redact_redis_url(self.url),
+                        e,
+                    )
                 raise
         return self._redis
+
+    async def ping(self) -> bool:
+        """Check the Redis connection, propagating connection failures."""
+        redis_client = await self._get_redis()
+        return bool(await redis_client.ping())
 
     async def get(self, key: str) -> Optional[bytes]:
         """Get value for a key from Redis"""
@@ -48,6 +100,8 @@ class RedisKVStore(KeyValueStore):
             value = await redis_client.get(key)
             return value
         except Exception:
+            if self.raise_on_error:
+                raise
             return None
 
     async def set(
@@ -73,6 +127,8 @@ class RedisKVStore(KeyValueStore):
             await redis_client.set(key, value, **options)
             return True
         except Exception:
+            if self.raise_on_error:
+                raise
             return False
 
     async def delete(self, key: str) -> bool:
@@ -82,6 +138,8 @@ class RedisKVStore(KeyValueStore):
             result = await redis_client.delete(key)
             return result > 0
         except Exception:
+            if self.raise_on_error:
+                raise
             return False
 
     async def exists(self, key: str) -> bool:
@@ -91,6 +149,8 @@ class RedisKVStore(KeyValueStore):
             result = await redis_client.exists(key)
             return result > 0
         except Exception:
+            if self.raise_on_error:
+                raise
             return False
 
     async def keys(self, prefix: Optional[str] = None) -> List[str]:
@@ -103,6 +163,8 @@ class RedisKVStore(KeyValueStore):
                 keys.append(key.decode("utf-8") if isinstance(key, bytes) else key)
             return keys
         except Exception:
+            if self.raise_on_error:
+                raise
             return []
 
     async def close(self):
@@ -127,6 +189,16 @@ def start_redis_server(
     apptainer_cleanenv=True,
     apptainer_executable="apptainer",
     apptainer_extra_args=None,
+    advertise_host=None,
+    coordination_dir=None,
+    head_registry=None,
+    coordination_ttl_seconds=60.0,
+    coordination_refresh_interval=30.0,
+    coordination_startup_timeout=600.0,
+    coordination_healthcheck_timeout=2.0,
+    persistence=True,
+    data_dir=None,
+    appendfsync="everysec",
 ):
     """
     Start a Redis server instance.
@@ -145,6 +217,21 @@ def start_redis_server(
         pull_image: Pull image_source before launch when provided
         bind: Apptainer bind mount(s), e.g. /host:/container
         env: Apptainer environment entry or entries as KEY=VALUE
+        advertise_host: Hostname placed in the published Redis URL.
+        coordination_dir: Backward-compatible name for ``head_registry``.
+        head_registry: Stable endpoint registry. Accepts ``file://``,
+            ``sqlite://``, or ``redis://``. A raw absolute path remains a
+            compatibility alias for ``file://``. When omitted, a unique
+            filesystem registry is created under the temporary directory.
+        coordination_ttl_seconds: Lifetime of the Redis endpoint record.
+        coordination_refresh_interval: Seconds between health checks and refreshes.
+        coordination_startup_timeout: Maximum wait for Redis to become healthy.
+        coordination_healthcheck_timeout: Timeout for each Redis PING.
+        persistence: Enable append-only-file persistence.
+        data_dir: Redis persistence directory. Defaults to ``redis-data`` under
+            the head registry when it is file- or SQLite-backed. For a
+            Redis-backed head, a temporary directory is used unless supplied.
+        appendfsync: Redis AOF fsync policy: always, everysec, or no.
     
     Returns:
         Redis URL string
@@ -191,22 +278,96 @@ def start_redis_server(
         launch_runtime.prepare()
         server_command = ["redis-server"]
     
-    # get hostname
-    hostname = socket.gethostname()
-    url = socket.getfqdn()
+    if coordination_ttl_seconds <= coordination_refresh_interval:
+        raise ValueError(
+            "coordination_ttl_seconds must be greater than "
+            "coordination_refresh_interval"
+        )
+    if coordination_refresh_interval <= 0:
+        raise ValueError("coordination_refresh_interval must be positive")
+    if coordination_startup_timeout <= 0:
+        raise ValueError("coordination_startup_timeout must be positive")
+    if coordination_healthcheck_timeout <= 0:
+        raise ValueError("coordination_healthcheck_timeout must be positive")
 
-    url = f"redis://{url}:{port}"
+    resolved_host = (
+        advertise_host
+        or os.getenv("BEAKER_NODE_HOSTNAME")
+        or socket.getfqdn()
+    ).strip()
+    if not resolved_host:
+        raise ValueError("advertise_host must be non-empty")
+    url = f"redis://{resolved_host}:{port}"
 
-    command = launch_runtime.build_command(
+    if coordination_dir is not None and head_registry is not None:
+        raise ValueError("supply only one of coordination_dir or head_registry")
+    configured_head_registry = head_registry or coordination_dir
+    if configured_head_registry is None:
+        coordination_path = Path(
+            tempfile.mkdtemp(prefix="literegistry-redis-coordination-")
+        )
+        coordination_location = normalize_endpoint_registry(coordination_path)
+    else:
+        if not str(configured_head_registry).strip():
+            raise ValueError("head_registry must be non-empty when supplied")
+        coordination_location = normalize_endpoint_registry(
+            configured_head_registry
+        )
+        coordination_path = endpoint_registry_filesystem_path(
+            coordination_location
+        )
+        if coordination_path is not None:
+            coordination_path.mkdir(parents=True, exist_ok=True)
+
+    if appendfsync not in {"always", "everysec", "no"}:
+        raise ValueError("appendfsync must be one of: always, everysec, no")
+    resolved_data_dir = None
+    if persistence:
+        if data_dir is not None:
+            default_data_dir = Path(data_dir)
+        elif coordination_path is not None:
+            default_data_dir = coordination_path / "redis-data"
+        elif coordination_location.startswith("sqlite:"):
+            default_data_dir = Path(
+                str(sqlite_registry_path(coordination_location)) + ".redis-data"
+            )
+        else:
+            default_data_dir = Path(
+                tempfile.mkdtemp(prefix="literegistry-redis-data-")
+            )
+            logger.warning(
+                "Redis-backed head registry has no filesystem location for AOF "
+                "data; using temporary directory %s. Pass data_dir on shared "
+                "storage for resume persistence.",
+                default_data_dir,
+            )
+        resolved_data_dir = Path(
+            default_data_dir
+        ).expanduser().absolute()
+        resolved_data_dir.mkdir(parents=True, exist_ok=True)
+
+    persistence_args = (
         [
-            *server_command,
             "--save", "",
-            "--appendonly", "no",
-            "--port", str(port),
-            "--protected-mode", "no",
+            "--appendonly", "yes",
+            "--appendfsync", appendfsync,
+            "--dir", str(resolved_data_dir),
         ]
+        if persistence
+        else ["--save", "", "--appendonly", "no"]
     )
+    command = launch_runtime.build_command([
+        *server_command,
+        *persistence_args,
+        "--port", str(port),
+        "--protected-mode", "no",
+    ])
 
+    print(f"LITEREGISTRY_HEAD_REGISTRY={coordination_location}", flush=True)
+    print(f"LITEREGISTRY_COORDINATION_DIR={coordination_location}", flush=True)
+    print("LITEREGISTRY_REDIS_ENDPOINT_NAME=redis", flush=True)
+    if resolved_data_dir is not None:
+        print(f"LITEREGISTRY_REDIS_DATA_DIR={resolved_data_dir}", flush=True)
     print(f"REDIS_URL={url}", flush=True)
     if log is not None:
         log_path = os.path.expanduser(log)
@@ -218,12 +379,48 @@ def start_redis_server(
 
     if foreground:
         print(f"Redis server running with URL: {url}", flush=True)
-        subprocess.run(command, check=True)
+        supervise_endpoint(
+            root=coordination_location,
+            name="redis",
+            uri=url,
+            command_json=command,
+            healthcheck="redis",
+            startup_timeout=coordination_startup_timeout,
+            healthcheck_timeout=coordination_healthcheck_timeout,
+            ttl_seconds=coordination_ttl_seconds,
+            refresh_interval=coordination_refresh_interval,
+        )
     else:
-        subprocess.Popen(command)
-
-        # Give it a moment to start
-        time.sleep(2)
+        supervisor_command = [
+            sys.executable,
+            "-m",
+            "literegistry.coop.endpoints",
+            "run",
+            f"--root={coordination_location}",
+            "--name=redis",
+            f"--uri={url}",
+            "--healthcheck=redis",
+            f"--startup_timeout={coordination_startup_timeout}",
+            f"--healthcheck_timeout={coordination_healthcheck_timeout}",
+            f"--ttl_seconds={coordination_ttl_seconds}",
+            f"--refresh_interval={coordination_refresh_interval}",
+            f"--command_json={json.dumps(command, separators=(',', ':'))}",
+        ]
+        supervisor = subprocess.Popen(supervisor_command, start_new_session=True)
+        try:
+            asyncio.run(
+                wait_for_endpoint(
+                    coordination_location,
+                    "redis",
+                    timeout=coordination_startup_timeout,
+                    poll_interval=min(0.25, coordination_refresh_interval),
+                    healthcheck="redis",
+                    healthcheck_timeout=coordination_healthcheck_timeout,
+                )
+            )
+        except BaseException:
+            supervisor.terminate()
+            raise
 
     return url
 
@@ -243,13 +440,24 @@ async def main_async(
     apptainer_cleanenv=True,
     apptainer_executable="apptainer",
     apptainer_extra_args=None,
+    advertise_host=None,
+    coordination_dir=None,
+    head_registry=None,
+    coordination_ttl_seconds=60.0,
+    coordination_refresh_interval=30.0,
+    coordination_startup_timeout=600.0,
+    coordination_healthcheck_timeout=2.0,
+    persistence=True,
+    data_dir=None,
+    appendfsync="everysec",
 ):
     # FileSystem Example
     #fs_store = FileSystemKVStore()
     #await fs_store.set("test1.txt", "Hello FS!")
     #await fs_store.set("test2.txt", "World FS!")
     #print(await fs_store.keys())  # ['test1.txt', 'test2.txt']
-    url = start_redis_server(
+    url = await asyncio.to_thread(
+        start_redis_server,
         port=port,
         redis_server_path=redis_server_path,
         runtime=runtime,
@@ -264,6 +472,16 @@ async def main_async(
         apptainer_cleanenv=apptainer_cleanenv,
         apptainer_executable=apptainer_executable,
         apptainer_extra_args=apptainer_extra_args,
+        advertise_host=advertise_host,
+        coordination_dir=coordination_dir,
+        head_registry=head_registry,
+        coordination_ttl_seconds=coordination_ttl_seconds,
+        coordination_refresh_interval=coordination_refresh_interval,
+        coordination_startup_timeout=coordination_startup_timeout,
+        coordination_healthcheck_timeout=coordination_healthcheck_timeout,
+        persistence=persistence,
+        data_dir=data_dir,
+        appendfsync=appendfsync,
     )
     print(f"Redis server started with URL: {url}")
     
@@ -282,6 +500,16 @@ def main(
     apptainer_cleanenv=True,
     apptainer_executable="apptainer",
     apptainer_extra_args=None,
+    advertise_host=None,
+    coordination_dir=None,
+    head_registry=None,
+    coordination_ttl_seconds=60.0,
+    coordination_refresh_interval=30.0,
+    coordination_startup_timeout=600.0,
+    coordination_healthcheck_timeout=2.0,
+    persistence=True,
+    data_dir=None,
+    appendfsync="everysec",
 ):
     asyncio.run(
         main_async(
@@ -299,6 +527,16 @@ def main(
             apptainer_cleanenv=apptainer_cleanenv,
             apptainer_executable=apptainer_executable,
             apptainer_extra_args=apptainer_extra_args,
+            advertise_host=advertise_host,
+            coordination_dir=coordination_dir,
+            head_registry=head_registry,
+            coordination_ttl_seconds=coordination_ttl_seconds,
+            coordination_refresh_interval=coordination_refresh_interval,
+            coordination_startup_timeout=coordination_startup_timeout,
+            coordination_healthcheck_timeout=coordination_healthcheck_timeout,
+            persistence=persistence,
+            data_dir=data_dir,
+            appendfsync=appendfsync,
         )
     )
 

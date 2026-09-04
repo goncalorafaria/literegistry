@@ -6,10 +6,19 @@ import pytest
 
 from literegistry_base_deployment import BaseDeploymentConfig, BaseDeploymentLauncher
 from literegistry_base_deployment import cli
+from literegistry_base_deployment import launcher as launcher_module
 
 
 def _tasks(spec):
     return {task["name"]: task for task in spec["tasks"]}
+
+
+def test_prepare_shared_directory_is_sticky_and_writable(tmp_path) -> None:
+    root = tmp_path / "managed" / "head"
+    launcher_module._prepare_shared_directory(str(root))
+
+    assert root.is_dir()
+    assert root.stat().st_mode & 0o7777 == 0o1777
 
 
 def test_complete_external_registry_stack_has_every_requested_service() -> None:
@@ -34,6 +43,7 @@ def test_complete_external_registry_stack_has_every_requested_service() -> None:
 
     assert set(tasks) == {
         "gateway",
+        "cache",
         "python",
         "terminal",
         "search",
@@ -45,6 +55,17 @@ def test_complete_external_registry_stack_has_every_requested_service() -> None:
     assert tasks["terminal"]["replicas"] == 3
     assert tasks["gateway"]["constraints"] == {"cluster": ["ai2/phobos"]}
     assert "--docker_mirror_soft_affinity=True" in tasks["gateway"]["command"][2]
+    cache = tasks["cache"]
+    cache_command = cache["command"][2]
+    assert cache["image"]["beaker"] == "goncalof/literegistry-redis"
+    assert "exec literegistry cache" in cache_command
+    assert "--registry=" in cache_command
+    assert "$REGISTRY" in cache_command
+    assert "--backend_port=" in cache_command
+    assert "$((PORT + 64))" in cache_command
+    assert "--maxmemory=4gb" in cache_command
+    assert "--maxmemory_policy=allkeys-lfu" in cache_command
+    assert "--default_ttl=3600" in cache_command
     assert tasks["vllm-generate-generator"]["constraints"] == {
         "cluster": ["ai2/saturn"]
     }
@@ -120,18 +141,120 @@ def test_managed_redis_publishes_registry_url() -> None:
     assert set(tasks) == {"redis", "gateway", "python"}
     assert all(task["resources"] == {"gpuCount": 0} for task in tasks.values())
     assert tasks["redis"]["constraints"] == {"cluster": ["ai2/phobos"]}
-    assert tasks["redis"]["propagateFailure"] is True
-    assert tasks["redis"]["propagatePreemption"] is True
-    assert tasks["redis"]["context"]["autoResume"] is False
+    assert tasks["redis"]["propagateFailure"] is False
+    assert tasks["redis"]["propagatePreemption"] is False
+    assert tasks["redis"]["context"]["autoResume"] is True
     for service in ("gateway", "python"):
         assert tasks[service]["propagateFailure"] is False
         assert tasks[service]["propagatePreemption"] is False
         assert tasks[service]["context"]["autoResume"] is True
-    assert "REDIS_URL=" in tasks["redis"]["command"][2]
-    assert "exec literegistry redis" in tasks["redis"]["command"][2]
+    redis_command = tasks["redis"]["command"][2]
+    assert "exec literegistry redis" in redis_command
+    assert "--head_registry=file:///weka/gfaria/.literegistry-coop/managed-stack" in redis_command
+    assert "--data_dir=/weka/gfaria/.literegistry-coop/managed-stack/redis-data" in redis_command
+    assert "--persistence=True" in redis_command
+    assert "--advertise_host=" in redis_command
+    assert "REDIS_ADVERTISE_HOST" in redis_command
+    assert "literegistry.coop.endpoints run" not in redis_command
     for service in ("gateway", "python"):
-        assert "literegistry_base_registry_managed-stack.url" in tasks[service]["command"][2]
-        assert "literegistry.coop.redis wait" in tasks[service]["command"][2]
+        command = tasks[service]["command"][2]
+        assert "/.literegistry-coop/managed-stack" in command
+        assert "REGISTRY=head+file:///weka/gfaria/.literegistry-coop/managed-stack" in command
+        assert "literegistry.coop.endpoints wait" not in command
+        assert "literegistry_base_registry_managed-stack.url" not in command
+    gateway_command = tasks["gateway"]["command"][2]
+    assert "literegistry.coop.endpoints run" in gateway_command
+    assert "--name=gateway" in gateway_command
+
+
+def test_registry_head_uri_is_passed_to_every_service_without_redis_task() -> None:
+    config = BaseDeploymentConfig(
+        registry="head:///weka/shared/head-registry",
+        python_replicas=1,
+        terminal_replicas=0,
+        web_search_replicas=0,
+    )
+    _, spec = BaseDeploymentLauncher(config).build_spec(experiment_name="external-head")
+    tasks = _tasks(spec)
+
+    assert "redis" not in tasks
+    assert set(tasks) == {"gateway", "python"}
+    assert all(
+        "REGISTRY=head+file:///weka/shared/head-registry" in task["command"][2]
+        for task in tasks.values()
+    )
+    assert all(
+        "literegistry.coop.redis wait" not in task["command"][2]
+        for task in tasks.values()
+    )
+
+
+def test_head_registry_option_normalizes_to_registry_uri() -> None:
+    config = BaseDeploymentConfig(head_registry="/weka/shared/head-registry").validate()
+    assert config.resolved_registry() == "head+file:///weka/shared/head-registry"
+
+
+def test_registry_and_head_registry_are_mutually_exclusive() -> None:
+    with pytest.raises(ValueError, match="only one"):
+        BaseDeploymentConfig(
+            registry="redis://registry.example:6379",
+            head_registry="/weka/shared/head-registry",
+        ).validate()
+    with pytest.raises(ValueError, match="absolute shared path"):
+        BaseDeploymentConfig(head_registry="relative/head").validate()
+    with pytest.raises(ValueError):
+        BaseDeploymentConfig(registry="head://relative/head").validate()
+
+
+@pytest.mark.parametrize(
+    ("head_registry", "resolved"),
+    [
+        (
+            "sqlite:///weka/shared/head.sqlite3",
+            "head+sqlite:///weka/shared/head.sqlite3",
+        ),
+        (
+            "redis://head.example:6379",
+            "head+redis://head.example:6379",
+        ),
+        (
+            "file:///weka/shared/head",
+            "head+file:///weka/shared/head",
+        ),
+    ],
+)
+def test_head_registry_backends_are_rendered(
+    head_registry: str,
+    resolved: str,
+) -> None:
+    config = BaseDeploymentConfig(head_registry=head_registry).validate()
+    assert config.resolved_registry() == resolved
+
+
+def test_explicit_sqlite_head_launches_managed_redis() -> None:
+    config = BaseDeploymentConfig(
+        head_registry="sqlite:///weka/shared/base-head.sqlite3",
+        python_replicas=1,
+        terminal_replicas=0,
+        web_search_replicas=0,
+    )
+    _, spec = BaseDeploymentLauncher(config).build_spec(
+        experiment_name="sqlite-managed-stack"
+    )
+    tasks = _tasks(spec)
+
+    assert set(tasks) == {"redis", "gateway", "python"}
+    redis_command = tasks["redis"]["command"][2]
+    assert "--head_registry=sqlite:///weka/shared/base-head.sqlite3" in redis_command
+    assert (
+        "--data_dir=/weka/gfaria/.literegistry-coop/"
+        "sqlite-managed-stack/redis-data"
+    ) in redis_command
+    for service in ("gateway", "python"):
+        assert (
+            "REGISTRY=head+sqlite:///weka/shared/base-head.sqlite3"
+            in tasks[service]["command"][2]
+        )
 
 
 def test_beaker_commands_restore_bundled_virtualenv_path() -> None:
@@ -169,6 +292,39 @@ def test_search_credentials_are_only_beaker_secret_references() -> None:
     assert "MY_SERPER_SECRET" not in search["command"][2]
 
 
+def test_web_search_uses_one_configured_cache_service() -> None:
+    config = BaseDeploymentConfig(
+        registry="redis://registry.example:6379",
+        python_replicas=0,
+        terminal_replicas=0,
+        web_search_replicas=4,
+        cache_maxmemory="12gb",
+        cache_maxmemory_policy="allkeys-lru",
+        cache_ttl_seconds=7200,
+        service_clusters=("ai2/jupiter", "ai2/ceres"),
+    )
+    _, spec = BaseDeploymentLauncher(config).build_spec(
+        experiment_name="cache-stack"
+    )
+    tasks = _tasks(spec)
+
+    assert tasks["cache"].get("replicas", 1) == 1
+    assert tasks["cache"]["constraints"] == {"cluster": ["ai2/jupiter"]}
+    cache_command = tasks["cache"]["command"][2]
+    assert "--maxmemory=12gb" in cache_command
+    assert "--maxmemory_policy=allkeys-lru" in cache_command
+    assert "--default_ttl=7200" in cache_command
+    search_commands = [
+        task["command"][2]
+        for name, task in tasks.items()
+        if name.startswith("search")
+    ]
+    assert search_commands
+    assert all("--cache_service=cache" in command for command in search_commands)
+    assert all("--cache_ttl=7200" in command for command in search_commands)
+    assert all("--cache_db" not in command for command in search_commands)
+
+
 def test_validation_rejects_incomplete_optional_pools() -> None:
     with pytest.raises(ValueError, match="generation_model"):
         BaseDeploymentConfig(generation_replicas=1).validate()
@@ -176,6 +332,10 @@ def test_validation_rejects_incomplete_optional_pools() -> None:
         BaseDeploymentConfig(local_search_replicas=1).validate()
     with pytest.raises(ValueError, match="Serper and Jina"):
         BaseDeploymentConfig(serper_api_key_secret=None).validate()
+    with pytest.raises(ValueError, match="cache_maxmemory_policy"):
+        BaseDeploymentConfig(cache_maxmemory_policy="noeviction").validate()
+    with pytest.raises(ValueError, match="cache_ttl_seconds"):
+        BaseDeploymentConfig(cache_ttl_seconds=0).validate()
 
 
 def test_fire_cli_previews_stack(capsys) -> None:

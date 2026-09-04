@@ -35,10 +35,14 @@ REGISTRY_PATH=redis://login-node:6379 \
 | Argument | Default | Meaning |
 |----------|---------|---------|
 | `registry` | cluster Redis URL | `redis://…` or filesystem path |
+| `head_registry` | `None` | Shared directory that publishes the current Redis endpoint; overrides `registry` |
 | `host` | `0.0.0.0` | Listen address |
 | `port` | `8080` | Listen port |
 | `advertise_host` | node FQDN | Host used in the printed `GATEWAY_URL` |
+| `instance_id` | advertised host + port | Stable identity for this gateway deployment |
 | `workers` | `1` | Uvicorn workers (`>1` uses factory mode) |
+| `register` | `True` | Register and heartbeat the gateway as `model_path=gateway` |
+| `heartbeat_interval` | `10` | Seconds between gateway health updates |
 | `registry_cache_ttl_seconds` | `5` | Registry roster cache lifetime |
 | `timeout` | `300` | Default and Podman affinity request timeout |
 | `docker_mirror_service` | `docker-mirror` | Registry service used for mirror discovery |
@@ -53,6 +57,20 @@ REGISTRY_PATH=redis://login-node:6379 \
 
 When `workers > 1`, registry and affinity settings are exported for each
 factory-created worker process.
+
+## Gateway registry lifecycle
+
+By default the gateway registers itself under `model_path="gateway"` in the
+same Redis or filesystem registry that it uses for service discovery. The
+record publishes its advertised URI, `/health` endpoint, configured worker
+count, and capabilities. It is refreshed every `heartbeat_interval` seconds
+and removed during a clean shutdown.
+
+A multi-worker gateway publishes **one record for the entire gateway**, not one
+record per Uvicorn worker. One worker owns that heartbeat through a local
+leader lock; another worker takes over the same stable record within one second
+if the owner exits. Use a distinct `instance_id` for each independently
+deployed gateway. Registration can be disabled with `--register=False`.
 
 ## Endpoints
 

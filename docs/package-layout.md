@@ -10,7 +10,8 @@ literegistry/
 ├── coop/                                             # cross-process coordination
 │   ├── ports.py                                      # collision-safe host ports
 │   ├── artifacts.py                                  # atomic warm/build materialization
-│   └── redis.py                                      # registry readiness barrier
+│   ├── endpoints.py                                  # file/SQLite/Redis endpoint bootstrap
+│   └── redis.py                                      # Redis protocol readiness probe
 ├── services/                                         # runnable servers/wrappers
 │   ├── vllm_wrapper.py and sglang_wrapper.py
 │   ├── code_server.py, terminal_server.py, search_server.py, bm25_server.py
@@ -32,9 +33,11 @@ tools/                                                  # repository-only utilit
 `literegistry.coop` owns reusable coordination that is neither a backend service
 nor gateway routing. `ports.py` serializes host-port selection until a child has
 bound its ports; `artifacts.py` provides single-writer atomic directory builds
-for warmed or extracted assets; `redis.py` provides the shared readiness
-barrier used by Beaker launchers. Deployment packages call these modules
-directly and contain no compatibility copies.
+for warmed or extracted assets; `endpoints.py` provides TTL-backed endpoint
+publication, health-aware waiting, and supervised cleanup on top of
+`FileSystemKVStore`; `redis.py` provides the Redis protocol readiness probe.
+Deployment packages call these modules directly and contain no compatibility
+copies.
 
 ## Redis
 

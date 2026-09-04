@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, replace
 import hashlib
@@ -333,6 +334,13 @@ class AffinityBindingStore(ABC, Generic[BindingT]):
         payload = await self.store.get(key)
         if payload is None:
             return None
+        return await self._load_payload(key, payload)
+
+    async def _load_payload(
+        self,
+        key: str,
+        payload: bytes | str,
+    ) -> Optional[AffinityBinding]:
         try:
             decoded = (
                 payload.decode("utf-8")
@@ -445,6 +453,16 @@ class AffinityBindingStore(ABC, Generic[BindingT]):
         await self._set_binding(key, refreshed, ttl)
         return cast(BindingT, refreshed)
 
+    async def refresh_binding(
+        self,
+        binding: BindingT,
+        ttl_seconds: Optional[float] = None,
+    ) -> BindingT:
+        """Refresh an already-resolved binding without reading it again."""
+        binding = self._ensure_type(binding)
+        key = f"{self.service_prefix(binding.service)}{binding.affinity_id_hash}"
+        return await self._refresh(key, binding, self._ttl(ttl_seconds))
+
     async def touch(
         self,
         service: str,
@@ -480,6 +498,34 @@ class AffinityBindingStore(ABC, Generic[BindingT]):
                 if key.startswith(prefix)
             ]
 
+    async def _items(
+        self,
+        prefix: str,
+        *,
+        service: Optional[str] = None,
+        server_id: Optional[str] = None,
+    ) -> list[tuple[str, bytes | str]]:
+        affinity_items = getattr(self.store, "affinity_items", None)
+        if callable(affinity_items):
+            return await affinity_items(
+                service=service,
+                affinity_type=self.binding_class().type_name(),
+                server_id=server_id,
+            )
+        items = getattr(self.store, "items", None)
+        if callable(items):
+            try:
+                return await items(prefix=prefix)
+            except TypeError:
+                pass
+        keys = await self._keys(prefix)
+        values = await asyncio.gather(*(self.store.get(key) for key in keys))
+        return [
+            (key, value)
+            for key, value in zip(keys, values)
+            if value is not None
+        ]
+
     async def list_bindings(
         self,
         service: Optional[str] = None,
@@ -492,8 +538,8 @@ class AffinityBindingStore(ABC, Generic[BindingT]):
         )
         bindings = []
         expected_class = self.binding_class()
-        for key in await self._keys(prefix):
-            binding = await self._load_key(key)
+        for key, payload in await self._items(prefix, service=service):
+            binding = await self._load_payload(key, payload)
             if binding is not None and isinstance(binding, expected_class):
                 bindings.append(cast(BindingT, binding))
         return bindings
@@ -505,6 +551,19 @@ class AffinityBindingStore(ABC, Generic[BindingT]):
     ) -> int:
         """Release this store type's bindings owned by one server."""
         self._validate_text(server_id, "server_id")
+        if service is not None:
+            self._validate_text(service, "service")
+        delete_affinity_bindings = getattr(
+            self.store,
+            "delete_affinity_bindings",
+            None,
+        )
+        if callable(delete_affinity_bindings):
+            return await delete_affinity_bindings(
+                affinity_type=self.binding_class().type_name(),
+                server_id=server_id,
+                service=service,
+            )
         prefix = (
             self.service_prefix(service)
             if service is not None
@@ -512,8 +571,12 @@ class AffinityBindingStore(ABC, Generic[BindingT]):
         )
         released = 0
         expected_class = self.binding_class()
-        for key in await self._keys(prefix):
-            binding = await self._load_key(key)
+        for key, payload in await self._items(
+            prefix,
+            service=service,
+            server_id=server_id,
+        ):
+            binding = await self._load_payload(key, payload)
             if (
                 binding is not None
                 and isinstance(binding, expected_class)

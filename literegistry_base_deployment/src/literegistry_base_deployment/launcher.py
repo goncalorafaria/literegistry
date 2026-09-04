@@ -14,6 +14,15 @@ import tempfile
 from typing import Any, Mapping, Sequence
 from uuid import uuid4
 
+from literegistry.coop.endpoints import (
+    normalize_endpoint_registry,
+    prepare_endpoint_registry_storage,
+)
+from literegistry.head_registry import (
+    head_registry_backend,
+    head_registry_uri,
+    is_head_registry_uri,
+)
 
 RESULT = {"path": "/tmp/result"}
 RESTORE_VENV_PATH = (
@@ -34,6 +43,16 @@ SERVICE_SLOTS = {
     "localsearch": 5,
     "vllm-generate": 6,
     "vllm-classify": 7,
+    "cache": 8,
+}
+CACHE_EVICTION_POLICIES = {
+    "allkeys-lfu",
+    "allkeys-lru",
+    "allkeys-random",
+    "volatile-lfu",
+    "volatile-lru",
+    "volatile-random",
+    "volatile-ttl",
 }
 
 
@@ -47,6 +66,19 @@ def _clusters(value: str | Sequence[str]) -> tuple[str, ...]:
 def _slug(value: str) -> str:
     result = re.sub(r"[^a-z0-9]+", "-", value.casefold()).strip("-")
     return result or "service"
+
+
+def _head_registry_location(value: str | None) -> str | None:
+    if value is None or not is_head_registry_uri(value):
+        return None
+    return head_registry_backend(value)
+
+
+def _prepare_shared_directory(path: str) -> None:
+    """Create a managed Weka directory writable by the service container UID."""
+    root = Path(path)
+    root.mkdir(parents=True, exist_ok=True)
+    root.chmod(0o1777)
 
 
 @dataclass(frozen=True)
@@ -84,9 +116,13 @@ class BaseDeploymentConfig:
     """Configuration for gateway, Redis, tools, search, and vLLM."""
 
     registry: str | None = None
+    head_registry: str | None = None
     python_replicas: int = 1
     terminal_replicas: int = 1
     web_search_replicas: int = 1
+    cache_maxmemory: str = "4gb"
+    cache_maxmemory_policy: str = "allkeys-lfu"
+    cache_ttl_seconds: int = 3600
     local_search_replicas: int = 0
     local_search_corpus_jsonl: str | None = None
     local_search_index_dir: str | None = None
@@ -137,6 +173,15 @@ class BaseDeploymentConfig:
     def resolved_redis_cluster(self) -> str:
         return self.redis_cluster or self.resolved_gateway_cluster()
 
+    def resolved_head_registry(self) -> str | None:
+        if self.head_registry is not None:
+            return normalize_endpoint_registry(self.head_registry)
+        return _head_registry_location(self.registry)
+
+    def resolved_registry(self) -> str | None:
+        head = self.resolved_head_registry()
+        return head_registry_uri(head) if head is not None else self.registry
+
     def model_pools(self) -> tuple[ModelPoolConfig, ...]:
         pools: list[ModelPoolConfig] = []
         if self.generation_replicas:
@@ -166,8 +211,25 @@ class BaseDeploymentConfig:
         return tuple(pools)
 
     def validate(self) -> "BaseDeploymentConfig":
-        if self.registry is not None and not re.fullmatch(r"rediss?://\S+", self.registry):
-            raise ValueError("registry must be a redis:// or rediss:// URL when supplied")
+        if self.registry is not None and self.head_registry is not None:
+            raise ValueError("supply only one of registry or head_registry")
+        if self.registry is not None:
+            if is_head_registry_uri(self.registry):
+                head_registry_backend(self.registry)
+            else:
+                normalize_endpoint_registry(self.registry)
+        if self.head_registry is not None:
+            if not self.head_registry.strip():
+                raise ValueError("head_registry must be non-empty when supplied")
+            if (
+                "://" not in self.head_registry
+                and not Path(self.head_registry).expanduser().is_absolute()
+            ):
+                raise ValueError(
+                    "head_registry must be file://, sqlite://, redis://, "
+                    "or an absolute shared path"
+                )
+            normalize_endpoint_registry(self.head_registry)
         for name in (
             "python_replicas",
             "terminal_replicas",
@@ -185,6 +247,13 @@ class BaseDeploymentConfig:
             raise ValueError("min_runtime_hours must be non-negative")
         if self.gateway_timeout <= 0 or self.registry_cache_ttl_seconds < 1:
             raise ValueError("gateway timeout and registry cache TTL must be positive")
+        if not self.cache_maxmemory.strip():
+            raise ValueError("cache_maxmemory must be non-empty")
+        if self.cache_maxmemory_policy not in CACHE_EVICTION_POLICIES:
+            choices = ", ".join(sorted(CACHE_EVICTION_POLICIES))
+            raise ValueError(f"cache_maxmemory_policy must be one of: {choices}")
+        if self.cache_ttl_seconds < 1 or self.cache_ttl_seconds > 7 * 24 * 3600:
+            raise ValueError("cache_ttl_seconds must be between 1 and 604800")
         if self.service_priority not in {"normal", "high", "urgent"}:
             raise ValueError("service_priority must be normal, high, or urgent")
         if self.model_priority not in {"normal", "high", "urgent"}:
@@ -270,6 +339,39 @@ def _dynamic_port_command(
     )
 
 
+def _managed_endpoint_command(
+    root: str,
+    name: str,
+    uri_variable: str,
+    healthcheck: str,
+    child_command: str,
+) -> str:
+    command_json = json.dumps(
+        ["bash", "-lc", RESTORE_VENV_PATH + child_command],
+        separators=(",", ":"),
+    )
+    return (
+        "exec python3 -m literegistry.coop.endpoints run "
+        f"--root={shlex.quote(root)} --name={shlex.quote(name)} "
+        f'--uri="${{{uri_variable}}}" --healthcheck={shlex.quote(healthcheck)} '
+        f"--command-json={shlex.quote(command_json)}"
+    )
+
+
+def _wait_for_endpoint_command(
+    root: str,
+    name: str,
+    variable: str,
+    healthcheck: str,
+) -> str:
+    return (
+        f'{variable}="$(python3 -m literegistry.coop.endpoints wait '
+        f"--root={shlex.quote(root)} --name={shlex.quote(name)} "
+        f'--healthcheck={shlex.quote(healthcheck)} --timeout=600)"; '
+        f"export {variable}; "
+    )
+
+
 class BaseDeploymentLauncher:
     """Build, preview, submit, and stop standalone base-stack experiments."""
 
@@ -298,6 +400,8 @@ class BaseDeploymentLauncher:
         gpu_count: int = 0,
         model_task: bool = False,
         critical: bool = False,
+        auto_resume: bool | None = None,
+        propagate_preemption: bool | None = None,
     ) -> dict[str, Any]:
         task: dict[str, Any] = {
             "name": name,
@@ -305,7 +409,11 @@ class BaseDeploymentLauncher:
             "command": ["bash", "-lc", RESTORE_VENV_PATH + command],
             "hostNetworking": True,
             "propagateFailure": critical,
-            "propagatePreemption": critical,
+            "propagatePreemption": (
+                critical
+                if propagate_preemption is None
+                else propagate_preemption
+            ),
             "datasets": [
                 {"mountPath": "/weka", "source": {"weka": self.config.weka_source}}
             ],
@@ -313,7 +421,7 @@ class BaseDeploymentLauncher:
             "context": {
                 "priority": self.config.model_priority if model_task else self.config.service_priority,
                 "minRuntime": f"{self.config.min_runtime_hours}h",
-                "autoResume": not critical,
+                "autoResume": not critical if auto_resume is None else auto_resume,
             },
             "constraints": {"cluster": [cluster]},
         }
@@ -330,17 +438,26 @@ class BaseDeploymentLauncher:
         return task
 
     def _registry_commands(self, name: str, tasks: list[dict[str, Any]]) -> str:
-        registry_url_file = f"{self.config.shared_dir.rstrip('/')}/literegistry_base_registry_{name}.url"
+        configured_registry = self.config.resolved_registry()
+        default_coordination_path = (
+            f"{self.config.shared_dir.rstrip('/')}/.literegistry-coop/{name}"
+        )
+        endpoint_registry = self.config.resolved_head_registry()
         if self.config.registry is None:
+            endpoint_registry = endpoint_registry or normalize_endpoint_registry(
+                default_coordination_path
+            )
+            redis_process = (
+                'exec literegistry redis --runtime=local --foreground=True '
+                '--port="$PORT" --advertise_host="$REDIS_ADVERTISE_HOST" '
+                f"--head_registry={shlex.quote(endpoint_registry)} "
+                f"--data_dir={shlex.quote(default_coordination_path + '/redis-data')} "
+                "--persistence=True"
+            )
             redis_child = (
                 'REDIS_ADVERTISE_HOST="${BEAKER_NODE_HOSTNAME:-$(hostname -f)}"; '
-                f"REDIS_URL_FILE={shlex.quote(registry_url_file)}; "
-                'REDIS_URL="redis://${REDIS_ADVERTISE_HOST}:${PORT}"; '
-                'REDIS_URL_TMP="${REDIS_URL_FILE}.${BEAKER_REPLICA_RANK:-0}.tmp"; '
-                'printf "%s\\n" "$REDIS_URL" > "$REDIS_URL_TMP"; '
-                'mv "$REDIS_URL_TMP" "$REDIS_URL_FILE"; '
-                'echo "REDIS_URL=$REDIS_URL"; '
-                'exec literegistry redis --runtime=local --foreground=True --port="$PORT"'
+                "export REDIS_ADVERTISE_HOST; "
+                + redis_process
             )
             tasks.append(
                 self._task(
@@ -348,23 +465,25 @@ class BaseDeploymentLauncher:
                     self.config.redis_image,
                     "set -euo pipefail; " + _dynamic_port_command(name, "redis", redis_child),
                     cluster=self.config.resolved_redis_cluster(),
-                    critical=True,
+                    critical=False,
+                    auto_resume=True,
+                    propagate_preemption=False,
                 )
             )
+            configured_registry = head_registry_uri(endpoint_registry)
+        if endpoint_registry is None:
+            endpoint_registry = normalize_endpoint_registry(configured_registry)
+        if is_head_registry_uri(configured_registry):
+            setup = f"REGISTRY={shlex.quote(configured_registry)}; export REGISTRY; "
+        elif configured_registry.startswith(("redis://", "rediss://")):
             setup = (
-                f"REGISTRY_URL_FILE={shlex.quote(registry_url_file)}; "
-                'for _ in $(seq 1 120); do [[ -s "$REGISTRY_URL_FILE" ]] && break; sleep 5; done; '
-                '[[ -s "$REGISTRY_URL_FILE" ]] || { echo registry-url-timeout >&2; exit 1; }; '
-                'REGISTRY=$(tail -n 1 "$REGISTRY_URL_FILE" | tr -d "\\r"); export REGISTRY; '
+                f"REGISTRY={shlex.quote(configured_registry)}; export REGISTRY; "
+                "python3 -m literegistry.coop.redis wait "
+                '--registry "$REGISTRY" --timeout 600; '
             )
         else:
-            setup = f"REGISTRY={shlex.quote(self.config.registry)}; export REGISTRY; "
-        return (
-            "set -euo pipefail; "
-            + setup
-            + "python3 -m literegistry.coop.redis wait "
-            + '--registry "$REGISTRY" --timeout 600; '
-        )
+            setup = f"REGISTRY={shlex.quote(configured_registry)}; export REGISTRY; "
+        return "set -euo pipefail; " + setup
 
     def _add_spread_service(
         self,
@@ -401,21 +520,32 @@ class BaseDeploymentLauncher:
         tasks: list[dict[str, Any]] = []
         wait = self._registry_commands(name, tasks)
 
-        gateway_url_file = f"{self.config.shared_dir.rstrip('/')}/literegistry_base_gateway_{name}.url"
-        gateway_child = (
-            'GATEWAY_ADVERTISE_HOST="${BEAKER_NODE_HOSTNAME:-$(hostname -f)}"; '
-            f"GATEWAY_URL_FILE={shlex.quote(gateway_url_file)}; "
-            'GATEWAY_URL="http://${GATEWAY_ADVERTISE_HOST}:${PORT}"; '
-            'GATEWAY_URL_TMP="${GATEWAY_URL_FILE}.${BEAKER_REPLICA_RANK:-0}.tmp"; '
-            'printf "%s\\n" "$GATEWAY_URL" > "$GATEWAY_URL_TMP"; '
-            'mv "$GATEWAY_URL_TMP" "$GATEWAY_URL_FILE"; '
-            'echo "GATEWAY_URL=$GATEWAY_URL"; '
+        endpoint_registry = self.config.resolved_head_registry()
+        if endpoint_registry is None:
+            configured_registry = self.config.resolved_registry()
+            endpoint_registry = normalize_endpoint_registry(
+                configured_registry
+                or f"{self.config.shared_dir.rstrip('/')}/.literegistry-coop/{name}"
+            )
+        gateway_process = (
             'exec python -m literegistry.gateway --registry="$REGISTRY" --port="$PORT" '
             '--advertise_host="$GATEWAY_ADVERTISE_HOST" '
             f"--workers={self.config.gateway_workers} "
             f"--registry_cache_ttl_seconds={self.config.registry_cache_ttl_seconds} "
             f"--timeout={self.config.gateway_timeout:g} "
             f"--docker_mirror_soft_affinity={self.config.docker_mirror_soft_affinity}"
+        )
+        gateway_child = (
+            'GATEWAY_ADVERTISE_HOST="${BEAKER_NODE_HOSTNAME:-$(hostname -f)}"; '
+            'GATEWAY_URL="http://${GATEWAY_ADVERTISE_HOST}:${PORT}"; '
+            "export GATEWAY_URL; "
+            + _managed_endpoint_command(
+                endpoint_registry,
+                "gateway",
+                "GATEWAY_URL",
+                "http",
+                gateway_process,
+            )
         )
         tasks.append(
             self._task(
@@ -455,6 +585,22 @@ class BaseDeploymentLauncher:
             self._add_spread_service(
                 tasks,
                 experiment_name=name,
+                name="cache",
+                service="cache",
+                image=self.config.redis_image,
+                replicas=1,
+                wait=wait,
+                child=(
+                    'exec literegistry cache --host=0.0.0.0 --port="$PORT" '
+                    '--registry="$REGISTRY" --backend_port="$((PORT + 64))" '
+                    f"--maxmemory={shlex.quote(self.config.cache_maxmemory)} "
+                    f"--maxmemory_policy={shlex.quote(self.config.cache_maxmemory_policy)} "
+                    f"--default_ttl={self.config.cache_ttl_seconds}"
+                ),
+            )
+            self._add_spread_service(
+                tasks,
+                experiment_name=name,
                 name="search",
                 service="search",
                 image=self.config.services_image,
@@ -462,7 +608,8 @@ class BaseDeploymentLauncher:
                 wait=wait,
                 child=(
                     'exec literegistry search --host=0.0.0.0 --port="$PORT" '
-                    '--registry="$REGISTRY" --cache_db=1 --cache_ttl=3600'
+                    '--registry="$REGISTRY" --cache_service=cache '
+                    f'--cache_ttl={self.config.cache_ttl_seconds}'
                 ),
                 env_vars=(
                     {"name": "SERPER_API_KEY", "secret": self.config.serper_api_key_secret or ""},
@@ -557,6 +704,13 @@ class BaseDeploymentLauncher:
 
     def submit(self) -> dict[str, Any]:
         name, spec = self.build_spec()
+        if self.config.registry is None:
+            _prepare_shared_directory(
+                f"{self.config.shared_dir.rstrip('/')}/.literegistry-coop/{name}"
+            )
+            head = self.config.resolved_head_registry()
+            if head is not None:
+                prepare_endpoint_registry_storage(head)
         with tempfile.NamedTemporaryFile(
             mode="w",
             suffix=".json",

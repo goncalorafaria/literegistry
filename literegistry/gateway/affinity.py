@@ -228,7 +228,12 @@ class StrictAffinityGateway:
                 return
         raise GatewayRequestError(
             "strict affinity server is no longer registered",
-            status_code=503,
+            status_code=410,
+            response_body={
+                "error": "strict affinity server is no longer registered",
+                "code": "affinity_owner_lost",
+                "recoverable": False,
+            },
         )
 
     async def _post(
@@ -469,7 +474,7 @@ class StrictAffinityGateway:
             await self.bindings.release(service, affinity_id)
             binding_action = "release"
         else:
-            await self.bindings.touch(service, affinity_id)
+            await self.bindings.refresh_binding(binding)
             binding_action = "touch"
         logger.info(
             "gateway_affinity mode=strict event=route_complete "

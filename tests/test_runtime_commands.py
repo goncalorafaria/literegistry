@@ -1,8 +1,10 @@
+import asyncio
+import json
 import os
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from literegistry.runtime import (
     ApptainerRuntime,
@@ -19,6 +21,24 @@ import literegistry.redis as redis_wrapper
 
 
 class RuntimeCommandTest(unittest.TestCase):
+    def test_redis_cli_wrapper_forwards_head_registry(self):
+        with patch(
+            "literegistry.redis.asyncio.to_thread",
+            new_callable=AsyncMock,
+        ) as to_thread:
+            to_thread.return_value = "redis://redis-host:6379"
+            asyncio.run(
+                redis_wrapper.main_async(
+                    runtime="local",
+                    head_registry="/weka/shared/head-registry",
+                )
+            )
+
+        self.assertEqual(
+            to_thread.await_args.kwargs["head_registry"],
+            "/weka/shared/head-registry",
+        )
+
     def test_resolve_apptainer_image_uses_home(self):
         with patch.dict("os.environ", {"HOME": "/home/graf"}, clear=True):
             self.assertEqual(
@@ -179,8 +199,11 @@ class RuntimeCommandTest(unittest.TestCase):
         ), patch(
             "literegistry.runtime.subprocess.run"
         ) as run, patch("literegistry.redis.subprocess.Popen") as popen, patch(
-            "literegistry.redis.time.sleep"
-        ):
+            "literegistry.redis.wait_for_endpoint", new_callable=AsyncMock
+        ), patch(
+            "literegistry.redis.tempfile.mkdtemp",
+            return_value="/tmp/redis-coordination-test",
+        ), patch("builtins.print") as print_mock:
             url = redis_wrapper.start_redis_server(port=6380)
 
         run.assert_called_once_with(
@@ -192,8 +215,20 @@ class RuntimeCommandTest(unittest.TestCase):
             ],
             check=True,
         )
-        popen.assert_called_once_with(
-            [
+        supervisor_command = popen.call_args.args[0]
+        self.assertEqual(supervisor_command[:4], [
+            sys.executable,
+            "-m",
+            "literegistry.coop.endpoints",
+            "run",
+        ])
+        self.assertIn(
+            "--root=file:///tmp/redis-coordination-test", supervisor_command
+        )
+        self.assertIn("--name=redis", supervisor_command)
+        self.assertIn("--healthcheck=redis", supervisor_command)
+        self.assertIn(
+            "--command_json=" + json.dumps([
                 "apptainer",
                 "exec",
                 "--cleanenv",
@@ -202,12 +237,26 @@ class RuntimeCommandTest(unittest.TestCase):
                 "--save",
                 "",
                 "--appendonly",
-                "no",
+                "yes",
+                "--appendfsync",
+                "everysec",
+                "--dir",
+                "/tmp/redis-coordination-test/redis-data",
                 "--port",
                 "6380",
                 "--protected-mode",
                 "no",
-            ]
+            ], separators=(",", ":")),
+            supervisor_command,
+        )
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        print_mock.assert_any_call(
+            "LITEREGISTRY_COORDINATION_DIR=file:///tmp/redis-coordination-test",
+            flush=True,
+        )
+        print_mock.assert_any_call(
+            "LITEREGISTRY_REDIS_DATA_DIR=/tmp/redis-coordination-test/redis-data",
+            flush=True,
         )
         self.assertTrue(url.startswith("redis://"))
         self.assertTrue(url.endswith(":6380"))
@@ -217,26 +266,77 @@ class RuntimeCommandTest(unittest.TestCase):
             "literegistry.redis.shutil.which",
             return_value="/usr/bin/redis-server",
         ), patch("literegistry.redis.subprocess.Popen") as popen, patch(
-            "literegistry.redis.time.sleep"
+            "literegistry.redis.wait_for_endpoint", new_callable=AsyncMock
         ), patch("literegistry.redis.socket.getfqdn", return_value="redis-host"), patch(
             "builtins.print"
         ) as print_mock:
-            redis_wrapper.start_redis_server(port=6381, runtime="local")
+            redis_wrapper.start_redis_server(
+                port=6381,
+                runtime="local",
+                coordination_dir="/tmp/custom-redis-coordination",
+            )
 
+        print_mock.assert_any_call(
+            "LITEREGISTRY_COORDINATION_DIR=file:///tmp/custom-redis-coordination",
+            flush=True,
+        )
         print_mock.assert_any_call("REDIS_URL=redis://redis-host:6381", flush=True)
-        popen.assert_called_once_with(
-            [
+        supervisor_command = popen.call_args.args[0]
+        self.assertIn(
+            "--root=file:///tmp/custom-redis-coordination", supervisor_command
+        )
+        self.assertIn(
+            "--command_json=" + json.dumps([
                 "/usr/bin/redis-server",
                 "--save",
                 "",
                 "--appendonly",
-                "no",
+                "yes",
+                "--appendfsync",
+                "everysec",
+                "--dir",
+                "/tmp/custom-redis-coordination/redis-data",
                 "--port",
                 "6381",
                 "--protected-mode",
                 "no",
-            ]
+            ], separators=(",", ":")),
+            supervisor_command,
         )
+
+    def test_redis_persistence_can_be_disabled(self):
+        with patch.dict("os.environ", {}, clear=True), patch(
+            "literegistry.redis.shutil.which",
+            return_value="/usr/bin/redis-server",
+        ), patch("literegistry.redis.supervise_endpoint") as supervise:
+            redis_wrapper.start_redis_server(
+                runtime="local",
+                foreground=True,
+                advertise_host="redis-host",
+                coordination_dir="/tmp/redis-no-persistence-test",
+                persistence=False,
+            )
+
+        command = supervise.call_args.kwargs["command_json"]
+        self.assertEqual(command[command.index("--appendonly") + 1], "no")
+        self.assertNotIn("--dir", command)
+
+    def test_redis_background_supervisor_stops_when_health_never_publishes(self):
+        with patch.dict("os.environ", {}, clear=True), patch(
+            "literegistry.redis.shutil.which",
+            return_value="/usr/bin/redis-server",
+        ), patch("literegistry.redis.subprocess.Popen") as popen, patch(
+            "literegistry.redis.wait_for_endpoint",
+            new_callable=AsyncMock,
+            side_effect=TimeoutError("not healthy"),
+        ):
+            with self.assertRaisesRegex(TimeoutError, "not healthy"):
+                redis_wrapper.start_redis_server(
+                    runtime="local",
+                    coordination_dir="/tmp/redis-failed-startup-test",
+                )
+
+        popen.return_value.terminate.assert_called_once_with()
 
     def test_redis_log_appends_url_to_existing_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -248,12 +348,13 @@ class RuntimeCommandTest(unittest.TestCase):
                 "literegistry.redis.shutil.which",
                 return_value="/usr/bin/redis-server",
             ), patch("literegistry.redis.subprocess.Popen"), patch(
-                "literegistry.redis.time.sleep"
+                "literegistry.redis.wait_for_endpoint", new_callable=AsyncMock
             ), patch("literegistry.redis.socket.getfqdn", return_value="redis-host"):
                 redis_wrapper.start_redis_server(
                     port=6381,
                     runtime="local",
                     log=log_path,
+                    coordination_dir=os.path.join(temp_dir, "coordination"),
                 )
 
             with open(log_path, "r") as log_file:
@@ -273,12 +374,13 @@ class RuntimeCommandTest(unittest.TestCase):
                 "literegistry.redis.shutil.which",
                 return_value="/usr/bin/redis-server",
             ), patch("literegistry.redis.subprocess.Popen"), patch(
-                "literegistry.redis.time.sleep"
+                "literegistry.redis.wait_for_endpoint", new_callable=AsyncMock
             ), patch("literegistry.redis.socket.getfqdn", return_value="redis-host"):
                 redis_wrapper.start_redis_server(
                     port=6383,
                     runtime="local",
                     log=log_path,
+                    coordination_dir=os.path.join(temp_dir, "coordination"),
                 )
 
             with open(log_path, "r") as log_file:
@@ -288,15 +390,14 @@ class RuntimeCommandTest(unittest.TestCase):
         with patch.dict("os.environ", {}, clear=True), patch(
             "literegistry.redis.shutil.which",
             return_value="/usr/bin/redis-server",
-        ), patch("literegistry.redis.subprocess.run") as run, patch(
-            "literegistry.redis.subprocess.Popen"
-        ) as popen, patch("literegistry.redis.time.sleep") as sleep, patch(
+        ), patch("literegistry.redis.supervise_endpoint") as supervise, patch(
             "literegistry.redis.socket.getfqdn", return_value="redis-host"
         ), patch("builtins.print") as print_mock:
             redis_wrapper.start_redis_server(
                 port=6382,
                 runtime="local",
                 foreground=True,
+                coordination_dir="/tmp/redis-foreground-test",
             )
 
         print_mock.assert_any_call("REDIS_URL=redis://redis-host:6382", flush=True)
@@ -304,22 +405,31 @@ class RuntimeCommandTest(unittest.TestCase):
             "Redis server running with URL: redis://redis-host:6382",
             flush=True,
         )
-        run.assert_called_once_with(
-            [
+        supervise.assert_called_once_with(
+            root="file:///tmp/redis-foreground-test",
+            name="redis",
+            uri="redis://redis-host:6382",
+            command_json=[
                 "/usr/bin/redis-server",
                 "--save",
                 "",
                 "--appendonly",
-                "no",
+                "yes",
+                "--appendfsync",
+                "everysec",
+                "--dir",
+                "/tmp/redis-foreground-test/redis-data",
                 "--port",
                 "6382",
                 "--protected-mode",
                 "no",
             ],
-            check=True,
+            healthcheck="redis",
+            startup_timeout=600.0,
+            healthcheck_timeout=2.0,
+            ttl_seconds=60.0,
+            refresh_interval=30.0,
         )
-        popen.assert_not_called()
-        sleep.assert_not_called()
 
     def test_apptainer_prepare_pulls_when_source_is_set(self):
         with tempfile.TemporaryDirectory() as image_dir:

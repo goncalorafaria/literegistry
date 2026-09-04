@@ -28,8 +28,9 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import fire
-import redis.asyncio as redis
 
+from literegistry import get_kvstore
+from literegistry.kvstore import KeyValueStore
 from literegistry.registry import ServerRegistry
 
 
@@ -139,42 +140,6 @@ async def probe_manifest(url: str, timeout: float) -> dict[str, Any]:
         }
 
 
-class AsyncRedisStore:
-    """KeyValueStore-compatible async Redis adapter for mirror registration."""
-
-    def __init__(self, url: str) -> None:
-        self.url = url.rstrip("\\")
-        self.client = redis.from_url(self.url, decode_responses=False)
-
-    async def ping(self) -> bool:
-        return bool(await self.client.ping())
-
-    async def get(self, key: str):
-        return await self.client.get(key)
-
-    async def set(self, key: str, value, ttl_seconds=None) -> bool:
-        options: dict[str, int] = {}
-        if ttl_seconds is not None:
-            options["px"] = max(1, int(float(ttl_seconds) * 1000))
-        return bool(await self.client.set(key, value, **options))
-
-    async def delete(self, key: str) -> bool:
-        return bool(await self.client.delete(key))
-
-    async def exists(self, key: str) -> bool:
-        return bool(await self.client.exists(key))
-
-    async def keys(self, prefix: Optional[str] = None) -> list[str]:
-        pattern = f"{prefix or ''}*"
-        return [
-            key.decode() if isinstance(key, bytes) else key
-            async for key in self.client.scan_iter(match=pattern)
-        ]
-
-    async def close(self) -> None:
-        await self.client.aclose()
-
-
 @dataclass(frozen=True)
 class DockerMirrorConfig:
     registry_url: str
@@ -267,11 +232,14 @@ class MirrorRegistration:
         self,
         config: DockerMirrorConfig,
         *,
-        store: Optional[AsyncRedisStore] = None,
+        store: Optional[KeyValueStore] = None,
         registry: Optional[ServerRegistry] = None,
     ) -> None:
         self.config = config
-        self.store = store or AsyncRedisStore(config.registry_url)
+        self.store = store or get_kvstore(
+            config.registry_url,
+            raise_on_error=True,
+        )
         self.registry = registry or ServerRegistry(store=self.store)
         self.registered = False
 
@@ -291,11 +259,18 @@ class MirrorRegistration:
                 "platform": self.config.warm_platform,
                 "workers": self.config.warm_workers,
             },
-            "authentication": {"type": "none"},
+            "authentication": {
+                "type": (
+                    "docker-hub-basic"
+                    if self.config.docker_hub_username
+                    else "none"
+                )
+            },
         }
 
     async def connect(self) -> None:
-        if not await self.store.ping():
+        ping = getattr(self.store, "ping", None)
+        if ping is not None and not await ping():
             raise RuntimeError(f"Redis PING failed for {self.config.registry_url}")
 
     async def healthy(self, data: dict[str, Any]) -> None:

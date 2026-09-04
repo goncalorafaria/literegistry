@@ -3,6 +3,7 @@
 from .client import (
     CommandResult,
     PodmanCommandError,
+    PodmanContainerLostError,
     PodmanClient,
     PodmanGatewayError,
     PodmanSession,
@@ -11,9 +12,10 @@ from .client import (
 __all__ = [
     "CommandResult",
     "PodmanCommandError",
+    "PodmanContainerLostError",
     "PodmanClient",
     "PodmanGatewayError",
     "PodmanSession",
 ]
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"

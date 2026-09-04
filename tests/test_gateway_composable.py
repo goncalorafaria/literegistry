@@ -38,6 +38,28 @@ class RecordingRouting:
         return RoutingResponse(self.body, server_index=0)
 
 
+class RecordingRegistration:
+    def __init__(self):
+        self.events = []
+
+    async def start(self):
+        self.events.append("start")
+
+    async def stop(self):
+        self.events.append("stop")
+
+
+class RecordingSessionManager:
+    def __init__(self):
+        self.is_initialized = False
+
+    async def initialize(self):
+        self.is_initialized = True
+
+    async def shutdown(self):
+        self.is_initialized = False
+
+
 def make_request(payload):
     body = json.dumps(payload).encode("utf-8")
 
@@ -198,6 +220,27 @@ def test_gateway_exposes_management_and_declarative_proxy_routes():
     } == paths
 
 
+def test_gateway_registration_follows_application_lifespan():
+    registration = RecordingRegistration()
+    session_manager = RecordingSessionManager()
+    gateway = Gateway(
+        FakeRegistry(),
+        routing=RecordingRouting(),
+        session_manager=session_manager,
+        registration=registration,
+    )
+
+    async def scenario():
+        async with gateway.app.router.lifespan_context(gateway.app):
+            assert registration.events == ["start"]
+            assert session_manager.is_initialized is True
+
+    asyncio.run(scenario())
+
+    assert registration.events == ["start", "stop"]
+    assert session_manager.is_initialized is False
+
+
 def test_gateway_model_list_still_forces_registry_refresh():
     registry = FakeRegistry()
     gateway = Gateway(registry, routing=RecordingRouting())
@@ -283,6 +326,26 @@ def test_main_uses_uvicorn_factory_for_multiple_workers():
     assert os.environ["HOST"] == "0.0.0.0"
     assert os.environ["PORT"] == "8081"
     assert os.environ["DOCKER_MIRROR_SOFT_AFFINITY"] == "True"
+    assert os.environ["GATEWAY_ADVERTISE_HOST"]
+    assert os.environ["GATEWAY_INSTANCE_ID"]
+    assert os.environ["GATEWAY_WORKERS"] == "3"
+    assert os.environ["GATEWAY_REGISTRATION_ENABLED"] == "True"
+    assert os.environ["GATEWAY_HEARTBEAT_INTERVAL"] == "10.0"
+
+
+def test_main_accepts_head_registry_directory():
+    with patch("literegistry.gateway.create_app", return_value=object()):
+        with patch("literegistry.gateway.uvicorn.run"):
+            main(
+                registry="redis://ignored.example:6379",
+                head_registry="/weka/shared/head-registry",
+                host="127.0.0.1",
+            )
+
+    assert (
+        os.environ["REGISTRY_PATH"]
+        == "head+file:///weka/shared/head-registry"
+    )
 
 
 def test_gateway_config_reads_mirror_soft_affinity_from_environment():
@@ -307,3 +370,21 @@ def test_gateway_config_separates_session_and_mirror_affinity_ttls():
 
     assert config.affinity_ttl_seconds == 900
     assert config.docker_mirror_affinity_ttl_seconds == 604800
+
+
+def test_gateway_config_reads_registration_from_environment():
+    with patch.dict(
+        os.environ,
+        {
+            "GATEWAY_ADVERTISE_HOST": "gateway.example",
+            "GATEWAY_INSTANCE_ID": "gateway-a",
+            "GATEWAY_REGISTRATION_ENABLED": "true",
+            "GATEWAY_HEARTBEAT_INTERVAL": "7.5",
+        },
+    ):
+        config = GatewayConfig.from_env()
+
+    assert config.advertise_host == "gateway.example"
+    assert config.registration_instance_id == "gateway-a"
+    assert config.registration_enabled is True
+    assert config.registration_heartbeat_interval == 7.5

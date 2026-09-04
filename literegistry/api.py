@@ -1,4 +1,4 @@
-from literegistry import ServerRegistry, FileSystemKVStore, RedisKVStore
+from literegistry import ServerRegistry, get_kvstore
 import asyncio
 from fastapi import FastAPI, HTTPException
 from typing import List, Optional, Dict, Any
@@ -36,10 +36,7 @@ class ServiceAPI(FastAPI):
         """
         super().__init__(*args, **kwargs)
 
-        if "redis://" in registry_path:
-            store = RedisKVStore(registry_path)
-        else:
-            store = FileSystemKVStore(registry_path)
+        store = get_kvstore(registry_path)
             
             
         self.registry_path = registry_path

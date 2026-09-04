@@ -31,6 +31,19 @@ class PodmanGatewayError(RuntimeError):
         self.response = response
 
 
+class PodmanContainerLostError(PodmanGatewayError):
+    """The affinity owner and its container are permanently unavailable."""
+
+    def __init__(self, *, status_code: int, response: Any) -> None:
+        super().__init__(
+            "the Podman container died with its affinity server and cannot be "
+            "recovered; create a new session and replay any required state",
+            status_code=status_code,
+            response=response,
+        )
+        self.recoverable = False
+
+
 class PodmanCommandError(PodmanGatewayError):
     """A command completed with a non-zero exit code."""
 
@@ -54,6 +67,8 @@ class CommandResult:
     exit_code: int
     execution_time: float
     timed_out: bool
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
 
     @classmethod
     def from_payload(cls, payload: JsonObject) -> "CommandResult":
@@ -64,13 +79,18 @@ class CommandResult:
             stderr = payload.get("stderr", "")
             success = payload["success"]
             timed_out = payload.get("timed_out", False)
+            stdout_truncated = payload.get("stdout_truncated", False)
+            stderr_truncated = payload.get("stderr_truncated", False)
             if not isinstance(container_id, str) or not container_id:
                 raise TypeError("invalid container_id")
             if not isinstance(affinity_id, str) or not affinity_id:
                 raise TypeError("invalid affinity_id")
             if not isinstance(stdout, str) or not isinstance(stderr, str):
                 raise TypeError("invalid output")
-            if not isinstance(success, bool) or not isinstance(timed_out, bool):
+            if not all(
+                isinstance(value, bool)
+                for value in (success, timed_out, stdout_truncated, stderr_truncated)
+            ):
                 raise TypeError("invalid status")
             return cls(
                 container_id=container_id,
@@ -81,6 +101,8 @@ class CommandResult:
                 exit_code=int(payload["exit_code"]),
                 execution_time=float(payload["execution_time"]),
                 timed_out=timed_out,
+                stdout_truncated=stdout_truncated,
+                stderr_truncated=stderr_truncated,
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise PodmanGatewayError(
@@ -204,6 +226,16 @@ class PodmanClient:
             ) as response:
                 result = self._decode_json(await response.text())
                 if response.status >= 400:
+                    if (
+                        response.status == 410
+                        and isinstance(result, dict)
+                        and result.get("code") == "affinity_owner_lost"
+                        and result.get("recoverable") is False
+                    ):
+                        raise PodmanContainerLostError(
+                            status_code=response.status,
+                            response=result,
+                        )
                     raise PodmanGatewayError(
                         f"gateway returned HTTP {response.status} for "
                         f"{endpoint}: {result!r}",

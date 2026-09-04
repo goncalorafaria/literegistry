@@ -499,8 +499,12 @@ def test_strict_affinity_confirms_dead_owner_before_forwarding():
                 "key": "key-0",
             },
         )
-        assert status == 503
-        assert "no longer registered" in response["error"]
+        assert status == 410
+        assert response == {
+            "error": "strict affinity server is no longer registered",
+            "code": "affinity_owner_lost",
+            "recoverable": False,
+        }
         assert len(transport.calls) == calls_before
         assert registry.model_forces == [False, True]
 

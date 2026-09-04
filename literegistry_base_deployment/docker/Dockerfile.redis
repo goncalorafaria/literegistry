@@ -3,6 +3,7 @@ FROM redis:7-bookworm
 ARG PIP_INDEX_URL
 ARG PIP_FIND_LINKS
 ARG PIP_TRUSTED_HOST
+ARG LITEREGISTRY_VERSION=1.0.47
 
 ENV VIRTUAL_ENV=/opt/literegistry-redis-venv \
     PATH=/opt/literegistry-redis-venv/bin:$PATH \
@@ -20,7 +21,8 @@ RUN apt-get update \
     && chown -R redis:redis /data
 
 COPY . /opt/literegistry-base-deployment
-RUN pip install --no-cache-dir /opt/literegistry-base-deployment \
+RUN pip install --no-cache-dir "literegistry==${LITEREGISTRY_VERSION}" \
+    && pip install --no-cache-dir --no-deps /opt/literegistry-base-deployment \
     && rm -rf /opt/literegistry-base-deployment
 
 USER redis

@@ -4,6 +4,7 @@ FROM quay.io/podman/stable:${PODMAN_VERSION}
 ARG PIP_INDEX_URL
 ARG PIP_FIND_LINKS
 ARG PIP_TRUSTED_HOST
+ARG LITEREGISTRY_VERSION=1.0.47
 
 USER root
 RUN dnf --assumeyes install ca-certificates python3-pip \
@@ -18,6 +19,8 @@ RUN sed -i 's/^podman:.*/podman:100000:65536/' /etc/subuid /etc/subgid
 
 COPY . /opt/literegistry-podman-beaker
 RUN /opt/literegistry-podman-venv/bin/pip install \
+        --no-cache-dir "literegistry==${LITEREGISTRY_VERSION}" \
+    && /opt/literegistry-podman-venv/bin/pip install \
         --no-cache-dir /opt/literegistry-podman-beaker \
     && rm -rf /opt/literegistry-podman-beaker
 

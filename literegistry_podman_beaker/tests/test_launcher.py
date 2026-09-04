@@ -6,10 +6,19 @@ import pytest
 
 from literegistry_podman_beaker import PodmanStackConfig, PodmanStackLauncher
 from literegistry_podman_beaker import cli
+from literegistry_podman_beaker import launcher as launcher_module
 
 
 def _tasks(spec):
     return {task["name"]: task for task in spec["tasks"]}
+
+
+def test_prepare_shared_directory_is_sticky_and_writable(tmp_path) -> None:
+    root = tmp_path / "managed" / "head"
+    launcher_module._prepare_shared_directory(str(root))
+
+    assert root.is_dir()
+    assert root.stat().st_mode & 0o7777 == 0o1777
 
 
 def test_single_cluster_stack_is_self_contained() -> None:
@@ -19,6 +28,7 @@ def test_single_cluster_stack_is_self_contained() -> None:
         docker_mirror_replicas=2,
         service_clusters=("ai2/jupiter",),
         gateway_cluster="ai2/phobos",
+        podman_max_sessions=64,
     )
     _, spec = PodmanStackLauncher(config).build_spec(experiment_name="test-stack")
     tasks = _tasks(spec)
@@ -41,6 +51,13 @@ def test_single_cluster_stack_is_self_contained() -> None:
     assert "podman_affinity_redis_server" not in tasks["podman"]["command"][2]
     assert "--host=0.0.0.0" in tasks["podman"]["command"][2]
     assert "--allow_non_loopback=True" in tasks["podman"]["command"][2]
+    assert "--session_memory=4g" in tasks["podman"]["command"][2]
+    assert "--max_sessions=64" in tasks["podman"]["command"][2]
+    assert "--session_pids_limit=2048" in tasks["podman"]["command"][2]
+    assert "--session_idle_timeout=7200" in tasks["podman"]["command"][2]
+    assert "--janitor_interval=300" in tasks["podman"]["command"][2]
+    assert "--resource_watchdog_interval=5" in tasks["podman"]["command"][2]
+    assert "--image_prune_until=24h" in tasks["podman"]["command"][2]
     assert '--registry_mirror=\\"$PODMAN_REGISTRY_MIRROR\\"' in tasks["podman"]["command"][2]
     assert "GATEWAY_URL=" in tasks["gateway"]["command"][2]
     assert "--docker_mirror_soft_affinity=True" in tasks["gateway"]["command"][2]
@@ -149,6 +166,12 @@ def test_fire_cli_previews_stack(capsys) -> None:
     output = capsys.readouterr().out
 
     assert "\"podman_replicas\": 2" in output
+    assert "\"podman_session_memory\": \"4g\"" in output
+    assert "\"podman_session_pids_limit\": 2048" in output
+    assert "\"podman_session_idle_timeout\": 7200.0" in output
+    assert "\"podman_janitor_interval\": 300.0" in output
+    assert "\"podman_resource_watchdog_interval\": 5.0" in output
+    assert "\"podman_image_prune_until\": \"24h\"" in output
     assert "ai2/jupiter" in output
     assert "ai2/ceres" in output
 
@@ -165,19 +188,34 @@ def test_managed_redis_stack_publishes_registry_url_to_all_services() -> None:
 
     assert set(tasks) == {"redis", "docker-mirror", "gateway", "podman"}
     assert tasks["redis"]["constraints"] == {"cluster": ["ai2/phobos"]}
-    assert tasks["redis"]["propagateFailure"] is True
-    assert tasks["redis"]["propagatePreemption"] is True
-    assert tasks["redis"]["context"]["autoResume"] is False
+    assert tasks["redis"]["propagateFailure"] is False
+    assert tasks["redis"]["propagatePreemption"] is False
+    assert tasks["redis"]["context"]["autoResume"] is True
     for service in ("docker-mirror", "gateway", "podman"):
         assert tasks[service]["propagateFailure"] is False
         assert tasks[service]["propagatePreemption"] is False
         assert tasks[service]["context"]["autoResume"] is True
-    assert "exec literegistry redis " in tasks["redis"]["command"][2]
-    assert "REDIS_URL=" in tasks["redis"]["command"][2]
-    for name in ("docker-mirror", "gateway", "podman"):
-        command = tasks[name]["command"][2]
-        assert "literegistry_podman_registry_managed-stack.url" in command
-        assert "literegistry.coop.redis wait" in command
+    redis_command = tasks["redis"]["command"][2]
+    assert "exec literegistry redis " in redis_command
+    assert "--head_registry=file:///weka/gfaria/literegistry/.coop/managed-stack" in redis_command
+    assert "--data_dir=/weka/gfaria/literegistry/.coop/managed-stack/redis-data" in redis_command
+    assert "--persistence=True" in redis_command
+    assert "--advertise_host=" in redis_command
+    assert "REDIS_ADVERTISE_HOST" in redis_command
+    assert "literegistry.coop.endpoints run" not in redis_command
+    for service in ("docker-mirror", "gateway", "podman"):
+        command = tasks[service]["command"][2]
+        assert "/.coop/managed-stack" in command
+        assert "REGISTRY=head+file:///weka/gfaria/literegistry/.coop/managed-stack" in command
+        assert "--name=redis" not in command
+        assert "literegistry_podman_registry_managed-stack.url" not in command
+    gateway_command = tasks["gateway"]["command"][2]
+    assert "literegistry.coop.endpoints run" in gateway_command
+    assert "--name=gateway" in gateway_command
+    podman_command = tasks["podman"]["command"][2]
+    assert "--name=gateway" in podman_command
+    assert "PODMAN_REGISTRY_MIRROR=" in podman_command
+    assert "literegistry.coop.endpoints wait" in podman_command
 
 
 def test_external_redis_does_not_create_redis_task() -> None:
@@ -188,6 +226,121 @@ def test_external_redis_does_not_create_redis_task() -> None:
     assert all(
         "REGISTRY=redis://registry.example:6379" in task["command"][2]
         for task in spec["tasks"]
+    )
+
+
+def test_registry_head_uri_is_passed_to_every_service_without_redis_task() -> None:
+    config = PodmanStackConfig(
+        registry="head:///weka/shared/head-registry",
+        podman_replicas=1,
+        docker_mirror_replicas=0,
+    )
+    _, spec = PodmanStackLauncher(config).build_spec(experiment_name="external-head")
+    tasks = _tasks(spec)
+
+    assert "redis" not in tasks
+    assert set(tasks) == {"gateway", "podman"}
+    assert all(
+        "REGISTRY=head+file:///weka/shared/head-registry" in task["command"][2]
+        for task in tasks.values()
+    )
+    assert all(
+        "literegistry.coop.redis wait" not in task["command"][2]
+        for task in tasks.values()
+    )
+
+
+def test_head_registry_option_normalizes_to_registry_uri() -> None:
+    config = PodmanStackConfig(head_registry="/weka/shared/head-registry").validate()
+    assert config.resolved_registry() == "head+file:///weka/shared/head-registry"
+
+
+def test_registry_and_head_registry_are_mutually_exclusive() -> None:
+    with pytest.raises(ValueError, match="only one"):
+        PodmanStackConfig(
+            registry="redis://registry.example:6379",
+            head_registry="/weka/shared/head-registry",
+        ).validate()
+    with pytest.raises(ValueError, match="absolute shared path"):
+        PodmanStackConfig(head_registry="relative/head").validate()
+    with pytest.raises(ValueError):
+        PodmanStackConfig(registry="head://relative/head").validate()
+
+
+@pytest.mark.parametrize(
+    ("head_registry", "resolved"),
+    [
+        (
+            "sqlite:///weka/shared/head.sqlite3",
+            "head+sqlite:///weka/shared/head.sqlite3",
+        ),
+        (
+            "redis://head.example:6379",
+            "head+redis://head.example:6379",
+        ),
+        (
+            "file:///weka/shared/head",
+            "head+file:///weka/shared/head",
+        ),
+    ],
+)
+def test_head_registry_backends_are_rendered(
+    head_registry: str,
+    resolved: str,
+) -> None:
+    config = PodmanStackConfig(head_registry=head_registry).validate()
+    assert config.resolved_registry() == resolved
+
+
+def test_explicit_sqlite_head_launches_managed_redis() -> None:
+    config = PodmanStackConfig(
+        head_registry="sqlite:///weka/shared/podman-head.sqlite3",
+        podman_replicas=1,
+        docker_mirror_replicas=0,
+    )
+    _, spec = PodmanStackLauncher(config).build_spec(
+        experiment_name="sqlite-managed-stack"
+    )
+    tasks = _tasks(spec)
+
+    assert set(tasks) == {"redis", "gateway", "podman"}
+    redis_command = tasks["redis"]["command"][2]
+    assert "--head_registry=sqlite:///weka/shared/podman-head.sqlite3" in redis_command
+    assert (
+        "--data_dir=/weka/gfaria/literegistry/.coop/"
+        "sqlite-managed-stack/redis-data"
+    ) in redis_command
+    for service in ("gateway", "podman"):
+        assert (
+            "REGISTRY=head+sqlite:///weka/shared/podman-head.sqlite3"
+            in tasks[service]["command"][2]
+        )
+
+
+def test_existing_cluster_expansion_can_launch_without_new_mirrors() -> None:
+    config = PodmanStackConfig(
+        registry="redis://registry.example:6379",
+        podman_replicas=4,
+        docker_mirror_replicas=0,
+        service_clusters=("ai2/jupiter", "ai2/ceres"),
+        podman_instance_prefix="podman-v1046",
+    )
+    _, spec = PodmanStackLauncher(config).build_spec(
+        experiment_name="existing-cluster-expansion"
+    )
+    tasks = _tasks(spec)
+
+    assert set(tasks) == {"gateway", "podman-ai2-jupiter", "podman-ai2-ceres"}
+    assert all(not name.startswith("docker-mirror") for name in tasks)
+    assert all(
+        "--name=gateway" in task["command"][2]
+        for name, task in tasks.items()
+        if name.startswith("podman-")
+    )
+    assert all(
+        'INSTANCE_ID=podman-v1046-\\"${GLOBAL_RANK}\\"' in task["command"][2]
+        for name, task in tasks.items()
+        if name.startswith("podman-")
     )
 
 
@@ -202,3 +355,45 @@ def test_gateway_can_disable_experimental_mirror_soft_affinity() -> None:
 
     command = _tasks(spec)["gateway"]["command"][2]
     assert "--docker_mirror_soft_affinity=False" in command
+
+
+def test_podman_hardening_can_be_disabled_or_overridden() -> None:
+    config = PodmanStackConfig(
+        registry="redis://registry.example:6379",
+        podman_session_memory=None,
+        podman_session_pids_limit=None,
+        podman_session_idle_timeout=None,
+        podman_janitor_interval=17,
+        podman_resource_watchdog_interval=None,
+        podman_image_prune_until=None,
+    )
+    _, spec = PodmanStackLauncher(config).build_spec(experiment_name="custom-hardening")
+    command = _tasks(spec)["podman"]["command"][2]
+
+    for option in (
+            "--session_memory=",
+            "--max_sessions=",
+        "--session_pids_limit=",
+        "--session_idle_timeout=",
+        "--resource_watchdog_interval=",
+        "--image_prune_until=",
+    ):
+        assert option not in command
+    assert "--janitor_interval=17" in command
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"podman_session_memory": ""},
+        {"podman_max_sessions": 0},
+        {"podman_session_pids_limit": 0},
+        {"podman_session_idle_timeout": 0},
+        {"podman_janitor_interval": 0},
+        {"podman_resource_watchdog_interval": 0},
+        {"podman_image_prune_until": ""},
+    ],
+)
+def test_podman_hardening_validation(kwargs) -> None:
+    with pytest.raises(ValueError):
+        PodmanStackConfig(**kwargs).validate()

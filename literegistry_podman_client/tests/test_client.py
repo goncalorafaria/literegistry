@@ -4,12 +4,14 @@ import asyncio
 import inspect
 from typing import Any
 
+from aiohttp import web
 import pytest
 
 from literegistry_podman_client import cli
 from literegistry_podman_client import (
     CommandResult,
     PodmanCommandError,
+    PodmanContainerLostError,
     PodmanClient,
     PodmanGatewayError,
     PodmanSession,
@@ -47,6 +49,8 @@ class RecordingClient(PodmanClient):
                 "exit_code": 0,
                 "execution_time": 0.01,
                 "timed_out": False,
+                "stdout_truncated": True,
+                "stderr_truncated": False,
             }
         if endpoint == "affinity/close":
             return {
@@ -75,6 +79,8 @@ def test_handshake_execute_and_idempotent_close() -> None:
         closed = await session.close()
 
         assert result.stdout == "ai2 hello\n"
+        assert result.stdout_truncated is True
+        assert result.stderr_truncated is False
         assert closed is not None and closed["removed"] is True
         assert await session.close() is None
         assert [endpoint for endpoint, _ in client.calls] == [
@@ -164,6 +170,43 @@ def test_command_error_is_opt_in() -> None:
 def test_invalid_command_response_is_rejected() -> None:
     with pytest.raises(PodmanGatewayError, match="invalid Podman"):
         CommandResult.from_payload({"success": True})
+
+
+def test_affinity_owner_loss_is_a_terminal_container_error() -> None:
+    async def scenario() -> None:
+        response = {
+            "error": "strict affinity server is no longer registered",
+            "code": "affinity_owner_lost",
+            "recoverable": False,
+        }
+
+        async def owner_lost(_request):
+            return web.json_response(response, status=410)
+
+        app = web.Application()
+        app.router.add_post("/affinity/podman", owner_lost)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        assert site._server is not None
+        port = site._server.sockets[0].getsockname()[1]
+        client = PodmanClient(f"http://127.0.0.1:{port}")
+        try:
+            with pytest.raises(PodmanContainerLostError) as exc_info:
+                await client.execute("a" * 64, "echo hello")
+        finally:
+            await client.aclose()
+            await runner.cleanup()
+
+        error = exc_info.value
+        assert error.status_code == 410
+        assert error.response == response
+        assert error.recoverable is False
+        assert "container died" in str(error)
+        assert "cannot be recovered" in str(error)
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize(

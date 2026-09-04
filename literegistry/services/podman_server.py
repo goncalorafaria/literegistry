@@ -10,9 +10,10 @@ import socket
 from typing import Any, Optional
 
 import fire
-import redis.asyncio as redis
 import uvicorn
 
+from literegistry import get_kvstore
+from literegistry.kvstore import KeyValueStore
 from literegistry.services.podman import (
     PodmanAffinityConfig,
     PodmanAffinityService,
@@ -24,42 +25,6 @@ from literegistry.registry import ServerRegistry
 
 logger = logging.getLogger(__name__)
 DEFAULT_REGISTRY_URL = "redis://127.0.0.1:6379"
-
-
-class AsyncRedisStore:
-    """Small KeyValueStore-compatible adapter used by ServerRegistry."""
-
-    def __init__(self, url: str) -> None:
-        self.url = url.rstrip("\\")
-        self.client = redis.from_url(self.url, decode_responses=False)
-
-    async def ping(self) -> bool:
-        return bool(await self.client.ping())
-
-    async def get(self, key: str):
-        return await self.client.get(key)
-
-    async def set(self, key: str, value, ttl_seconds=None) -> bool:
-        options = {}
-        if ttl_seconds is not None:
-            options["px"] = max(1, int(float(ttl_seconds) * 1000))
-        return bool(await self.client.set(key, value, **options))
-
-    async def delete(self, key: str) -> bool:
-        return bool(await self.client.delete(key))
-
-    async def exists(self, key: str) -> bool:
-        return bool(await self.client.exists(key))
-
-    async def keys(self, prefix: Optional[str] = None) -> list[str]:
-        pattern = f"{prefix or ''}*"
-        return [
-            key.decode() if isinstance(key, bytes) else key
-            async for key in self.client.scan_iter(match=pattern)
-        ]
-
-    async def close(self) -> None:
-        await self.client.aclose()
 
 
 class RedisRegistration:
@@ -74,11 +39,12 @@ class RedisRegistration:
         instance_id: str,
         image: str,
         registry_mirror: Optional[str] = None,
+        session_limits: Optional[dict] = None,
         heartbeat_interval: float = 10.0,
-        store: Optional[AsyncRedisStore] = None,
+        store: Optional[KeyValueStore] = None,
         registry: Optional[ServerRegistry] = None,
     ) -> None:
-        self.store = store or AsyncRedisStore(registry_url)
+        self.store = store or get_kvstore(registry_url, raise_on_error=True)
         self.registry = registry or ServerRegistry(store=self.store)
         self.registry_url = registry_url.rstrip("\\")
         self.url = f"http://{advertise_host}"
@@ -86,6 +52,7 @@ class RedisRegistration:
         self.instance_id = instance_id
         self.image = image
         self.registry_mirror = registry_mirror
+        self.session_limits = session_limits or {}
         self.heartbeat_interval = heartbeat_interval
         self._heartbeat_task: Optional[asyncio.Task] = None
 
@@ -96,6 +63,7 @@ class RedisRegistration:
             "instance_id": self.instance_id,
             "image": self.image,
             "registry_mirror": self.registry_mirror,
+            "session_limits": self.session_limits,
             "affinity": {
                 "enabled": True,
                 "handshake_endpoint": "handshake",
@@ -107,7 +75,8 @@ class RedisRegistration:
         }
 
     async def start(self) -> None:
-        if not await self.store.ping():
+        ping = getattr(self.store, "ping", None)
+        if ping is not None and not await ping():
             raise RuntimeError(f"Redis PING failed for {self.registry_url}")
         await self.registry.register_server(self.url, self.port, self.metadata())
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
@@ -149,9 +118,16 @@ def build_registered_app(
     async def lifespan(app):
         await backend.cleanup()
         await registration.start()
+        janitor_task = asyncio.create_task(backend.janitor_loop())
+        watchdog_task = asyncio.create_task(backend.resource_watchdog_loop())
         try:
             yield
         finally:
+            janitor_task.cancel()
+            watchdog_task.cancel()
+            await asyncio.gather(
+                janitor_task, watchdog_task, return_exceptions=True
+            )
             await registration.stop()
             await backend.cleanup()
 
@@ -179,6 +155,31 @@ def main(
     ),
     storage_driver: str = os.environ.get("PODMAN_STORAGE_DRIVER", "vfs"),
     registry_mirror: Optional[str] = os.environ.get("PODMAN_REGISTRY_MIRROR"),
+    max_sessions: Optional[int] = (
+        int(os.environ["PODMAN_AFFINITY_MAX_SESSIONS"])
+        if os.environ.get("PODMAN_AFFINITY_MAX_SESSIONS")
+        else None
+    ),
+    session_memory: Optional[str] = os.environ.get("PODMAN_AFFINITY_SESSION_MEMORY"),
+    session_pids_limit: Optional[int] = (
+        int(os.environ["PODMAN_AFFINITY_SESSION_PIDS_LIMIT"])
+        if os.environ.get("PODMAN_AFFINITY_SESSION_PIDS_LIMIT")
+        else None
+    ),
+    session_idle_timeout: Optional[float] = (
+        float(os.environ["PODMAN_AFFINITY_SESSION_IDLE_TIMEOUT"])
+        if os.environ.get("PODMAN_AFFINITY_SESSION_IDLE_TIMEOUT")
+        else None
+    ),
+    janitor_interval: float = float(
+        os.environ.get("PODMAN_AFFINITY_JANITOR_INTERVAL", "300")
+    ),
+    resource_watchdog_interval: Optional[float] = (
+        float(os.environ["PODMAN_AFFINITY_RESOURCE_WATCHDOG_INTERVAL"])
+        if os.environ.get("PODMAN_AFFINITY_RESOURCE_WATCHDOG_INTERVAL")
+        else 5.0
+    ),
+    image_prune_until: Optional[str] = os.environ.get("PODMAN_AFFINITY_IMAGE_PRUNE_UNTIL"),
     heartbeat_interval: float = float(
         os.environ.get("PODMAN_AFFINITY_HEARTBEAT_INTERVAL", "10")
     ),
@@ -198,6 +199,20 @@ def main(
         storage_driver: Podman storage driver in the outer Docker container.
         registry_mirror: Optional HTTP(S) gateway root used as the native
             docker.io pull-through mirror. Podman falls back to Docker Hub.
+        max_sessions: Maximum simultaneous session containers on this replica.
+            Concurrent handshakes reserve capacity before starting Podman.
+        session_memory: Optional per-container memory limit (e.g. ``4g``).
+            Applied with an equal ``--memory-swap`` so a runaway session is
+            OOM-killed instead of exhausting the replica host.
+        session_pids_limit: Optional per-container pids limit (fork-bomb guard).
+        session_idle_timeout: Seconds of inactivity after which a session
+            container is reaped by the janitor. Unset disables reaping;
+            clients that never call close then leak containers until restart.
+        janitor_interval: Seconds between janitor sweeps.
+        resource_watchdog_interval: Seconds between userspace memory/PID
+            checks. Set to ``None`` to rely only on native cgroup enforcement.
+        image_prune_until: Optional ``podman image prune --filter until=``
+            value (e.g. ``24h``) applied on each janitor sweep.
         heartbeat_interval: Seconds between Redis heartbeats.
         allow_non_loopback: Explicitly permit a managed cluster bind. This is
             required for Beaker host networking and must not be used casually.
@@ -213,6 +228,13 @@ def main(
         storage_driver=storage_driver,
         session_image=image,
         session_network=network,
+        max_sessions=max_sessions,
+        session_memory=session_memory,
+        session_pids_limit=session_pids_limit,
+        session_idle_timeout=session_idle_timeout,
+        janitor_interval=janitor_interval,
+        resource_watchdog_interval=resource_watchdog_interval,
+        image_prune_until=image_prune_until,
         instance_id=instance_id,
         registry_mirror=registry_mirror,
     )
@@ -223,6 +245,15 @@ def main(
         instance_id=instance_id,
         image=image,
         registry_mirror=registry_mirror,
+        session_limits={
+            "max_sessions": max_sessions,
+            "memory": session_memory,
+            "pids_limit": session_pids_limit,
+            "idle_timeout": session_idle_timeout,
+            "janitor_interval": janitor_interval,
+            "resource_watchdog_interval": resource_watchdog_interval,
+            "image_prune_until": image_prune_until,
+        },
         heartbeat_interval=heartbeat_interval,
     )
     uvicorn.run(

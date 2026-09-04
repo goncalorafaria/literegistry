@@ -37,7 +37,8 @@ Almost every command takes `--registry`:
 | Value | Backend |
 |-------|---------|
 | `redis://host:port` | Redis |
-| `/path/to/dir` (anything without `redis://`) | Filesystem KV store |
+| `sqlite:///absolute/path/registry.sqlite3` | SQLite database file |
+| `file:///absolute/path/to/dir` | Filesystem KV store |
 
 Pass the **same** `--registry` to workers, gateway, and inspect commands.
 
@@ -45,11 +46,14 @@ Pass the **same** `--registry` to workers, gateway, and inspect commands.
 
 ## `literegistry redis`
 
-Start a Redis server and print `REDIS_URL=redis://hostname:PORT`.
+Start a Redis server, publish a Redis-PING-verified endpoint, and print both
+`REDIS_URL=redis://hostname:PORT` and its head-registry URI.
 
 ```bash
 literegistry redis --port 6379
 literegistry redis --runtime local --foreground --port 6379
+literegistry redis --runtime local --foreground \
+  --head_registry=file:///shared/deployment/bootstrap
 ```
 
 | Argument | Default | Meaning |
@@ -62,10 +66,27 @@ literegistry redis --runtime local --foreground --port 6379
 | `image_source` | `docker://redis:7-alpine` | Pull source |
 | `pull_image` | `True` | Pull if SIF missing |
 | `redis_server_path` | `None` | Host binary when `runtime=local` |
+| `advertise_host` | node FQDN | Host stored in the Redis endpoint URL |
+| `head_registry` | unique `file://` registry in `/tmp` | Stable `file://`, `sqlite://`, or `redis://` registry containing the current Redis endpoint |
+| `coordination_dir` | `None` | Backward-compatible name for `head_registry` |
+| `coordination_ttl_seconds` | `60` | Endpoint TTL |
+| `coordination_refresh_interval` | `30` | PING/refresh interval |
+| `coordination_startup_timeout` | `600` | Startup health deadline |
+| `coordination_healthcheck_timeout` | `2` | Per-PING timeout |
+| `persistence` | `True` | Enable AOF persistence |
+| `data_dir` | derived for file/SQLite heads | AOF storage location; explicit shared path recommended with a Redis head |
+| `appendfsync` | `everysec` | `always`, `everysec`, or `no` |
 | `workdir` / `bind` / `env` | `None` | Apptainer workdir, binds, env |
 | `apptainer_cleanenv` | `True` | `--cleanenv` |
 | `apptainer_executable` | `apptainer` | Binary name |
 | `apptainer_extra_args` | `None` | Extra Apptainer flags |
+
+The head record is a bootstrap/liveness endpoint, not a normal routable
+service registration. On clean shutdown it is removed; after a crash its TTL
+expires.
+
+For cross-node Beaker resumption, put `head_registry` or `data_dir` on shared
+storage. Disable durable state explicitly with `--persistence=False`.
 
 ---
 

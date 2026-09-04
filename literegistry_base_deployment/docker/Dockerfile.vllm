@@ -4,13 +4,15 @@ FROM ${VLLM_BASE_IMAGE}
 ARG PIP_INDEX_URL
 ARG PIP_FIND_LINKS
 ARG PIP_TRUSTED_HOST
+ARG LITEREGISTRY_VERSION=1.0.47
 
 ENV PYTHONUNBUFFERED=1 \
     OTEL_TRACES_EXPORTER=none
 
 USER root
 COPY . /opt/literegistry-base-deployment
-RUN python3 -m pip install --no-cache-dir /opt/literegistry-base-deployment \
+RUN python3 -m pip install --no-cache-dir "literegistry==${LITEREGISTRY_VERSION}" \
+    && python3 -m pip install --no-cache-dir --no-deps /opt/literegistry-base-deployment \
     && rm -rf /opt/literegistry-base-deployment
 
 ENTRYPOINT ["literegistry", "vllm"]

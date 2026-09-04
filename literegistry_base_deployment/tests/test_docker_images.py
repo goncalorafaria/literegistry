@@ -42,7 +42,7 @@ def test_local_search_image_uses_literegistry_service_and_jtc_index_assets() -> 
     contents = (DOCKER_ROOT / "Dockerfile.local-search").read_text(encoding="utf-8")
     assert "FROM eclipse-temurin:21-jdk-jammy AS java" in contents
     assert '"pyserini==2.3.0"' in contents
-    assert "ARG LITEREGISTRY_VERSION=1.0.36" in contents
+    assert "ARG LITEREGISTRY_VERSION=1.0.47" in contents
     assert "COPY search /app/search" in contents
     assert "COPY datadev /app/datadev" not in contents
     assert "literegistry.services.bm25_server" in contents

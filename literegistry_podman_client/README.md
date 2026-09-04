@@ -169,6 +169,9 @@ finally:
 - `check=True` or `result.check_returncode()` raises `PodmanCommandError` for a
   non-zero command exit. Without it, stdout, stderr, and the exit code remain
   available on `CommandResult`.
+- `result.stdout_truncated` and `result.stderr_truncated` report whether the
+  server discarded output beyond its configured capture limits. Always check
+  these flags before treating captured output as complete.
 
 ## Concurrent trajectories
 

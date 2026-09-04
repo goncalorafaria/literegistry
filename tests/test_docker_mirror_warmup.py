@@ -69,7 +69,9 @@ def test_extract_ignores_everything_except_image_txt(tmp_path: Path) -> None:
 def test_bundled_open_instruct_default_image_list() -> None:
     asset = (
         Path(__file__).resolve().parents[1]
-        / "docker-mirror"
+        / "literegistry_podman_beaker"
+        / "src"
+        / "literegistry_podman_beaker"
         / "assets"
         / "allenai-tmax-15k-open-instruct-images.txt"
     )

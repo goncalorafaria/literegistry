@@ -37,6 +37,26 @@ The Beaker workspace, budget, clusters, and Weka source used below must be
 accessible to the active Beaker account. Replace the `ai2/*` values throughout
 if you are deploying elsewhere.
 
+### Beaker resource contract
+
+Every task in this stack is CPU-only. The launcher deliberately emits exactly
+this resource and scheduling shape for Redis, gateway, mirror, and Podman
+tasks:
+
+```yaml
+resources:
+  gpuCount: 0
+context:
+  minRuntime: "0h"
+```
+
+There is intentionally **no `cpuCount` field**. On GPU-shaped Beaker clusters,
+adding a CPU request can cause an otherwise CPU-only task to be assigned a GPU
+worker. Keep CPU omitted, keep `gpuCount: 0`, and keep the default
+`--min-runtime-hours=0`. Do not pass `--omit-resources=True` for normal Beaker
+deployments because that also removes the explicit zero-GPU request. Use
+`preview` before launch and verify these fields on every generated task.
+
 ### 2. Install the launcher
 
 For development from this checkout:
@@ -64,9 +84,9 @@ Datadev.
 
 ### 3. Make LiteRegistry available to Docker builds
 
-The gateway image pins `literegistry==1.0.40`; the other images install the
-Beaker package, whose dependency requires `literegistry>=1.0.35`. Make version
-1.0.40 available on the Python index used by Docker, or expose it through a
+The runtime images pin `literegistry==1.0.47`, including the gateway, Redis,
+Podman, mirror, warmup, and live-fire images. Make version 1.0.47 available on
+the Python index used by Docker, or expose it through a
 wheelhouse URL reachable from the Docker builder:
 
 ```bash
@@ -74,7 +94,7 @@ cd /weka/gfaria/literegistry
 python -m build
 python -m twine check dist/*
 # Publish to your configured index when appropriate:
-# python -m twine upload dist/literegistry-1.0.40*
+# python -m twine upload dist/literegistry-1.0.47*
 ```
 
 For a private index or HTTP wheelhouse:
@@ -96,17 +116,17 @@ Docker mirror images from the Dockerfiles bundled with this package:
 
 ```bash
 cd /weka/gfaria/literegistry/literegistry_podman_beaker
-export IMAGE_TAG=0.2.11
+export IMAGE_TAG=0.2.13
 ./scripts/build-images.sh "" "$IMAGE_TAG"
 ```
 
 This produces:
 
 ```text
-literegistry-redis:0.2.11
-literegistry-podman-gateway:0.2.11
-literegistry-podman-server:0.2.11
-literegistry-docker-mirror:0.2.11
+literegistry-redis:0.2.13
+literegistry-podman-gateway:0.2.13
+literegistry-podman-server:0.2.13
+literegistry-docker-mirror:0.2.13
 ```
 
 For an ordinary Docker registry, pass its repository prefix and set
@@ -169,8 +189,18 @@ literegistry-podman-beaker preview \
 ```
 
 With no `--registry`, the experiment contains exactly one managed Redis task.
-To reuse an existing registry, add `--registry=redis://HOST:PORT`; the launcher
-then omits the Redis task, although the `--redis-image` value is harmless.
+Every service receives an experiment-scoped `head+file://` Weka URI and reconnects
+through it if Redis moves. To reuse an existing registry, add
+`--registry=redis://HOST:PORT`. To use an externally managed Redis publisher,
+pass `--registry=head+file:///weka/shared/my-stack`. A SQLite or separate
+Redis head can use `head+sqlite:///...` or `head+redis://...`. Either option omits the Redis
+task, although the `--redis-image` value is harmless. `--head-registry` remains
+a convenience spelling for the same head URI.
+
+On `launch`, the managed per-experiment Weka directory is created before Beaker
+submission with sticky shared-write permissions, allowing the non-root service
+UID to publish endpoints and persist Redis data without opening the parent
+directory.
 
 ### 7. Launch and monitor the stack
 
@@ -202,18 +232,17 @@ beaker experiment logs "$EXPERIMENT_ID" --tail 100
 
 | Task | `context.autoResume` | `propagateFailure` | `propagatePreemption` |
 |---|---:|---:|---:|
-| Managed Redis | `false` | `true` | `true` |
+| Managed Redis | `true` | `false` | `false` |
 | Gateway | `true` | `false` | `false` |
 | Docker mirrors | `true` | `false` | `false` |
 | Podman replicas | `true` | `false` | `false` |
 
-Gateway, mirror, and Podman tasks are resumable: a task preemption does not
-propagate to the complete experiment, and an individual task failure does not
-tear down the other services. Managed Redis is intentionally the sole critical
-root. Redis is not resumable; if it fails or is preempted, Beaker fails the
-complete experiment rather than leaving workers attached to lost registry
-state. When `--registry` points to external Redis, no Redis task is created and
-all tasks in this experiment remain resumable.
+Gateway, mirror, Podman, and Redis tasks are resumable and non-propagating. If
+Redis disappears, workers keep running and registry operations wait on the
+shared head registry. When Redis resumes, its current URL is published there
+and workers reconnect. Redis AOF state lives under that same shared directory,
+so the resumed task loads the prior database. With an external `--registry`,
+whether direct or `head+...`, no Redis task is created.
 
 `autoResume` restores the service process, not an active affinity
 trajectory. If a Podman replica is preempted, its in-flight containers are
@@ -222,14 +251,18 @@ node starts with a cold local cache and warms again on demand.
 
 ### 8. Obtain the gateway URL and run a full smoke test
 
-The gateway logs `GATEWAY_URL=...` and atomically writes the same URL to Weka.
-Wait for that file, then test gateway health, the Docker Registry V2 route, and
-a stateful Podman session:
+The gateway logs its URL and publishes a TTL-backed `gateway` endpoint through
+the configured head backend. Resolve the healthy endpoint,
+then test gateway health, the Docker Registry V2 route, and a stateful Podman
+session:
 
 ```bash
-export GATEWAY_FILE="/weka/gfaria/literegistry_podman_gateway_${EXPERIMENT_NAME}.url"
-until [[ -s "$GATEWAY_FILE" ]]; do sleep 2; done
-export GATEWAY_URL="$(tail -n 1 "$GATEWAY_FILE")"
+export COOP_ROOT="/weka/gfaria/literegistry/.coop/${EXPERIMENT_NAME}"
+export GATEWAY_URL="$(python -m literegistry.coop.endpoints wait \
+  --root="file://$COOP_ROOT" \
+  --name=gateway \
+  --healthcheck=http \
+  --timeout=600)"
 echo "$GATEWAY_URL"
 
 curl -fsS "$GATEWAY_URL/health"
@@ -316,10 +349,11 @@ PodmanStackLauncher.stop(receipt["beaker"]["id"])
 
 With `registry` omitted, the experiment launches one Redis task. It publishes
 its dynamic host-network URL through Weka; the gateway, mirrors, and Podman
-replicas wait for that URL and a successful Redis PING before starting. To use
-an existing Redis server instead, set
+replicas use the Weka directory as a stable head registry, wait for Redis on
+startup, and reconnect if its URL changes. To use an existing Redis server, set
 `registry="redis://jupiter-cs-aus-183.reviz.ai2.in:59936"`; no Redis task is
-then created.
+then created. To use an externally managed head registry, set
+`registry="head+file:///weka/shared/my-stack"`.
 
 To force real placement across several CPU clusters, repeat clusters in the
 configuration. The package creates one constrained task group per cluster and
@@ -366,28 +400,24 @@ For multi-cluster placement, pass a comma-separated `--service-cluster`, for exa
 
 ## Obtain and test the gateway URL
 
-The gateway prints one machine-readable line at startup:
+The gateway prints a machine-readable endpoint line and keeps a TTL-backed
+record alive in the deployment's configured endpoint registry:
 
 ```text
-GATEWAY_URL=http://jupiter-cs-aus-NNN.reviz.ai2.in:PORT
+LITEREGISTRY_ENDPOINT_GATEWAY=http://jupiter-cs-aus-NNN.reviz.ai2.in:PORT
 ```
 
-The generated stack also atomically writes the same address to:
+For a managed stack, Redis similarly publishes the internal `redis` endpoint.
+Every consumer performs a health check before accepting either record. Podman
+uses the resolved gateway endpoint as its native `docker.io` mirror.
 
-```text
-/weka/gfaria/literegistry_podman_gateway_EXPERIMENT_NAME.url
-```
-
-For a managed Redis task, it also writes the internal service address to
-`/weka/gfaria/literegistry_podman_registry_EXPERIMENT_NAME.url`. That file is
-consumed by the other Beaker tasks; clients should continue to use only the
-gateway URL.
-
-Podman replicas read the gateway URL file and configure their native docker.io mirror.
-An operator can test both flows:
+An operator can resolve and test the gateway directly:
 
 ```bash
-GATEWAY_URL=$(cat /weka/gfaria/literegistry_podman_gateway_EXPERIMENT_NAME.url)
+EXPERIMENT_NAME=YOUR_EXPERIMENT_NAME
+COOP_ROOT="/weka/gfaria/literegistry/.coop/${EXPERIMENT_NAME}"
+GATEWAY_URL="$(python -m literegistry.coop.endpoints wait \
+  --root="file://$COOP_ROOT" --name=gateway --healthcheck=http --timeout=600)"
 
 curl -fsS "$GATEWAY_URL/health"
 curl -fsS "$GATEWAY_URL/v2/"
@@ -412,6 +442,18 @@ literegistry-podman-warm-gateway \
 Use `--images_file=/path/to/images.txt` to replace the bundled list. The
 optional `--limit=N` is intended only for smoke tests; without it the command
 warms the complete list through the gateway.
+
+To exercise the same path as a real rollout, use the async Podman client
+warmer. Each image follows `handshake -> execute("true") -> close`; successful
+images are checkpointed so a resumed Beaker task skips them:
+
+```bash
+literegistry-podman-warm-podman \
+  --gateway_url=http://gateway-host:port \
+  --expected_podman=32 \
+  --concurrency=64 \
+  --checkpoint_file=/weka/path/podman-warmup-complete.txt
+```
 
 For authenticated Docker Hub limits, put an organization access token or
 personal access token in a Beaker secret and pass only the secret name:
@@ -487,31 +529,33 @@ They do not reference `goncalof/*`, `~/basic_images`, Weka paths, or any
 other local image. Every image installs LiteRegistry. Its canonical
 `literegistry.coop` helpers provide collision-safe dynamic ports; the gateway itself invokes base LiteRegistry
 directly. The mirror also copies the unique 14,490-image warm list from this
-directory.
+directory, but does not warm it automatically. Run
+`literegistry-podman-warm-gateway` after the stack is ready so warmup is routed
+across the mirror pool and does not compete with startup traffic.
 
 Build all four with one command:
 
 ```bash
 cd /weka/gfaria/literegistry/literegistry_podman_beaker
-./scripts/build-images.sh YOUR_REGISTRY 0.2.11
+./scripts/build-images.sh YOUR_REGISTRY 0.2.13
 ```
 
-For example, build and push `goncalof/*:0.2.11`:
+For example, build and push `goncalof/*:0.2.13`:
 
 ```bash
-PUSH_IMAGES=1 ./scripts/build-images.sh goncalof 0.2.11
+PUSH_IMAGES=1 ./scripts/build-images.sh goncalof 0.2.13
 ```
 
 The script prints:
 
 ```text
-REDIS_IMAGE=YOUR_REGISTRY/literegistry-redis:0.2.11
-GATEWAY_IMAGE=YOUR_REGISTRY/literegistry-podman-gateway:0.2.11
-PODMAN_IMAGE=YOUR_REGISTRY/literegistry-podman-server:0.2.11
-DOCKER_MIRROR_IMAGE=YOUR_REGISTRY/literegistry-docker-mirror:0.2.11
+REDIS_IMAGE=YOUR_REGISTRY/literegistry-redis:0.2.13
+GATEWAY_IMAGE=YOUR_REGISTRY/literegistry-podman-gateway:0.2.13
+PODMAN_IMAGE=YOUR_REGISTRY/literegistry-podman-server:0.2.13
+DOCKER_MIRROR_IMAGE=YOUR_REGISTRY/literegistry-docker-mirror:0.2.13
 ```
 
-Publish `literegistry==1.0.40` to the
+Publish `literegistry==1.0.47` to the
 selected Python index before building the runtime images.
 
 If LiteRegistry is served by an internal Python index, export
@@ -523,10 +567,10 @@ Use the resulting installed-package images directly:
 
 ```python
 config = PodmanStackConfig(
-    redis_image="YOUR_REGISTRY/literegistry-redis:0.2.11",
-    gateway_image="YOUR_REGISTRY/literegistry-podman-gateway:0.2.11",
-    podman_image="YOUR_REGISTRY/literegistry-podman-server:0.2.11",
-    docker_mirror_image="YOUR_REGISTRY/literegistry-docker-mirror:0.2.11",
+    redis_image="YOUR_REGISTRY/literegistry-redis:0.2.13",
+    gateway_image="YOUR_REGISTRY/literegistry-podman-gateway:0.2.13",
+    podman_image="YOUR_REGISTRY/literegistry-podman-server:0.2.13",
+    docker_mirror_image="YOUR_REGISTRY/literegistry-docker-mirror:0.2.13",
 )
 ```
 
@@ -539,3 +583,49 @@ mirror runs as `USER mirror`; and the gateway runs as `USER gateway`.
 Mirror soft affinity is experimental and enabled by default. Disable it with
 `--docker-mirror-soft-affinity=False` when previewing or launching. The gateway
 otherwise infers repository affinity from `/v2/...`; no mirror handshake is added.
+### Podman hardening defaults
+
+Beaker Podman replicas enable resource and cleanup controls by default:
+
+| Fire CLI option | `PodmanStackConfig` field | Default |
+|---|---|---:|
+| `--podman-max-sessions` | `podman_max_sessions` | `None` |
+| `--podman-session-memory` | `podman_session_memory` | `4g` |
+| `--podman-session-pids-limit` | `podman_session_pids_limit` | `2048` |
+| `--podman-session-idle-timeout` | `podman_session_idle_timeout` | `7200` seconds |
+| `--podman-janitor-interval` | `podman_janitor_interval` | `300` seconds |
+| `--podman-resource-watchdog-interval` | `podman_resource_watchdog_interval` | `5` seconds |
+| `--podman-image-prune-until` | `podman_image_prune_until` | `24h` |
+
+Override them on either `preview` or `launch`:
+
+```bash
+literegistry-podman-beaker preview \
+  --podman-max-sessions=64 \
+  --podman-session-memory=8g \
+  --podman-session-pids-limit=4096 \
+  --podman-session-idle-timeout=14400 \
+  --podman-janitor-interval=600 \
+  --podman-image-prune-until=48h
+```
+
+Pass `None` to disable an optional control explicitly:
+
+```bash
+literegistry-podman-beaker preview \
+  --podman-session-memory=None \
+  --podman-session-pids-limit=None \
+  --podman-session-idle-timeout=None \
+  --podman-image-prune-until=None
+```
+
+Memory and PID limits use native cgroups where the corresponding controllers
+are delegated. On nested Beaker hosts, the separate 5-second userspace
+watchdog groups host processes by each container's Linux PID namespace and
+force-removes confirmed offenders, including reparented `podman exec`
+processes. Set `--podman-resource-watchdog-interval=None` to disable that
+fallback. Userspace RSS accounting is approximate and native cgroups
+remain preferable when available.
+Choose the idle timeout above the longest legitimate gap between commands in
+one trajectory. Image pruning removes only unused images, but an aggressive
+age can increase subsequent cold-pull traffic.

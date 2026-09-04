@@ -115,6 +115,8 @@ def test_registration_is_stateless_and_does_not_publish_credentials() -> None:
         metadata = register[3]
         assert metadata["model_path"] == "docker-mirror"
         assert metadata["protocol"] == "docker-registry-v2"
+        assert metadata["upstream_authenticated"] is True
+        assert metadata["authentication"] == {"type": "docker-hub-basic"}
         assert "affinity" not in metadata
         assert "private-token" not in json.dumps(metadata)
         assert registry.calls[-1] == ("deregister",)
@@ -122,14 +124,15 @@ def test_registration_is_stateless_and_does_not_publish_credentials() -> None:
     asyncio.run(check())
 
 
-def test_container_defaults_match_open_instruct_setup() -> None:
+def test_container_bundles_warm_list_without_implicitly_warming() -> None:
     dockerfile = (
-        Path(__file__).resolve().parents[1] / "docker-mirror" / "Dockerfile"
-    ).read_text()
-    assert (
-        "DOCKER_MIRROR_WARM_IMAGES_FILE=/opt/mirror-assets/"
-        "allenai-tmax-15k-open-instruct-images.txt" in dockerfile
-    )
+        Path(__file__).resolve().parents[1]
+        / "literegistry_podman_beaker"
+        / "docker"
+        / "Dockerfile.mirror"
+    ).read_text(encoding="utf-8")
+    assert "DOCKER_MIRROR_WARM_IMAGES_FILE=" not in dockerfile
+    assert "COPY --chown=mirror:mirror src/literegistry_podman_beaker/assets/" in dockerfile
     assert "DOCKER_MIRROR_WARM_WORKERS=8" in dockerfile
     assert "DOCKER_MIRROR_WARM_PLATFORM=linux/amd64" in dockerfile
 

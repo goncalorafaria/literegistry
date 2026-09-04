@@ -22,6 +22,7 @@ DOCKER_ROOT = PACKAGE_ROOT / "docker"
             True,
         ),
         ("Dockerfile.mirror", "FROM registry:3 AS distribution", True),
+        ("Dockerfile.warmup", "FROM python:3.12-slim-bookworm", True),
     ],
 )
 def test_images_use_upstream_bases_and_local_package_context(
@@ -47,6 +48,9 @@ def test_redis_image_uses_public_server_command_as_non_root() -> None:
     assert "USER redis" in contents
     assert 'ENTRYPOINT ["literegistry", "redis"]' in contents
     assert 'CMD ["--runtime=local", "--foreground=True", "--port=6379"]' in contents
+    assert "groupmod --gid 10001 redis" in contents
+    assert "usermod --uid 10001 --gid 10001 redis" in contents
+    assert "chown -R redis:redis /data" in contents
 
 
 def test_gateway_image_calls_literegistry_directly() -> None:
@@ -61,6 +65,12 @@ def test_mirror_image_uses_canonical_service_path() -> None:
     contents = (DOCKER_ROOT / "Dockerfile.mirror").read_text(encoding="utf-8")
 
     assert 'ENTRYPOINT ["python", "-m", "literegistry.services.docker_mirror_server"]' in contents
+
+
+def test_warmup_image_uses_public_podman_client_command() -> None:
+    contents = (DOCKER_ROOT / "Dockerfile.warmup").read_text(encoding="utf-8")
+    assert 'ENTRYPOINT ["literegistry-podman-warm-podman"]' in contents
+    assert "USER warmer" in contents
 
 
 def test_rootless_podman_image_restores_podman_user() -> None:
@@ -102,6 +112,7 @@ def test_build_all_script_is_valid_and_documents_all_images() -> None:
     assert "literegistry-podman-gateway" in script.read_text(encoding="utf-8")
     assert "literegistry-podman-server" in script.read_text(encoding="utf-8")
     assert "literegistry-docker-mirror" in script.read_text(encoding="utf-8")
+    assert "literegistry-podman-warmup" in script.read_text(encoding="utf-8")
     assert "PUSH_IMAGES" in help_result.stdout
 
 

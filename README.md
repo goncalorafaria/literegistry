@@ -15,7 +15,7 @@ Usage guides with argument reference live in [`docs/`](docs/README.md)
 (published at [goncalorafaria.github.io/literegistry](https://goncalorafaria.github.io/literegistry/)):
 
 - [CLI reference](docs/cli.md)
-- [Registry (Redis & filesystem)](docs/registry.md)
+- [Registry (Redis, SQLite & filesystem)](docs/registry.md)
 - [Gateway](docs/gateway.md)
 - [Package layout](docs/package-layout.md)
 - [vLLM & SGLang](docs/vllm-sglang.md)
@@ -67,11 +67,24 @@ literegistry redis --runtime local --foreground --port 6379
 ```
 
 Redis startup prints a machine-readable registry URL that includes the selected
-port:
+port and the head registry that tracks its health:
 
 ```text
+LITEREGISTRY_HEAD_REGISTRY=file:///tmp/literegistry-redis-coordination-...
+LITEREGISTRY_REDIS_DATA_DIR=/tmp/literegistry-redis-coordination-.../redis-data
 REDIS_URL=redis://hostname:6379
 ```
+
+For cross-node discovery, pass a shared location explicitly:
+
+```bash
+literegistry redis --runtime local --foreground --port 6379 \
+  --head_registry=file:///shared/my-deployment/registry-bootstrap
+```
+
+Redis uses AOF persistence with `appendfsync=everysec` by default. Its database
+is stored under `<head_registry>/redis-data`, allowing a resumed process to
+load the same registry state when that directory is on shared storage.
 
 **2. Launch vLLM/SGLang Instances** (supports all standard vLLM/SGLang arguments)
 ```bash
@@ -163,15 +176,28 @@ deployment details plus the handshake/command/close API.
 
 The search worker combines the live-web providers behind one registered
 `model_path="search"`: Serper handles `mode="query"`, while Jina Reader handles
-`mode="url"`. Successful responses are cached in a separate logical database
-on the registry Redis instance.
+`mode="url"`. Search workers discover a registered `model_path="cache"` service
+and use its HTTP `/cache` API; they never connect to the cache Redis directly.
+
+The cache service uses the existing Redis image and starts a private,
+loopback-only Redis child with no persistence, bounded memory, and LFU eviction.
+It registers and heartbeats against the controller Redis like other services.
 
 ```bash
 export SERPER_API_KEY=...
 export JINA_API_KEY=...
+
+# Start this from the existing Redis image (or any host with redis-server).
+literegistry cache \
+  --registry redis://login-node:6379 \
+  --port 1215 \
+  --backend-port 6380 \
+  --maxmemory 4gb \
+  --maxmemory-policy allkeys-lfu
+
 literegistry search \
   --registry redis://login-node:6379 \
-  --cache-db 1 \
+  --cache-service cache \
   --cache-ttl 3600
 ```
 
@@ -260,7 +286,7 @@ from literegistry import RegistryClient, get_kvstore
 import asyncio
 
 async def main():
-    # Auto-detect backend (redis:// or file path)
+    # Auto-detect backend (redis://, sqlite://, or file path)
     store = get_kvstore("redis://localhost:6379")
     client = RegistryClient(store, service_type="model_path")
     
@@ -300,7 +326,9 @@ LiteRegistry supports different backends depending on your deployment:
 from literegistry import FileSystemKVStore
 store = FileSystemKVStore("registry_data")
 ```
-Use when: Running on a single machine or when all nodes share a filesystem (common in HPC clusters with NFS). Note: Can bottleneck with high concurrency.
+Pass `--registry=file:///shared/registry` to services. A plain path remains a
+compatibility alias. Use when: Running on a single machine or when all nodes
+share a filesystem. Note: Can bottleneck with high concurrency.
 
 **Redis** - For distributed multi-node clusters
 ```python
@@ -308,6 +336,15 @@ from literegistry import RedisKVStore
 store = RedisKVStore("redis://localhost:6379")
 ```
 Use when: Running across multiple nodes without shared storage, or need high-concurrency access. Recommended for production HPC deployments.
+
+**SQLite** - For one durable registry database file
+```python
+from literegistry import SQLiteKVStore
+store = SQLiteKVStore("/shared/my-deployment/registry.sqlite3")
+```
+Or pass `--registry=sqlite:///shared/my-deployment/registry.sqlite3` to any
+LiteRegistry service. Use this for small, low/moderate-concurrency deployments;
+prefer Redis for busy multi-node clusters.
 
 
 

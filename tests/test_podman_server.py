@@ -44,6 +44,15 @@ def _registration(store=None, registry=None, heartbeat_interval=10):
         instance_id="replica-a",
         image="ubuntu:test",
         registry_mirror="http://gateway.example:8080",
+        session_limits={
+            "max_sessions": 64,
+            "memory": "4g",
+            "pids_limit": 2048,
+            "idle_timeout": 7200,
+            "janitor_interval": 300,
+            "resource_watchdog_interval": 5,
+            "image_prune_until": "24h",
+        },
         heartbeat_interval=heartbeat_interval,
         store=store,
         registry=registry,
@@ -56,6 +65,15 @@ def test_registry_metadata_describes_affinity_without_a_secret():
     assert metadata["model_path"] == "podman"
     assert metadata["instance_id"] == "replica-a"
     assert metadata["registry_mirror"] == "http://gateway.example:8080"
+    assert metadata["session_limits"] == {
+        "max_sessions": 64,
+        "memory": "4g",
+        "pids_limit": 2048,
+        "idle_timeout": 7200,
+        "janitor_interval": 300,
+        "resource_watchdog_interval": 5,
+        "image_prune_until": "24h",
+    }
     assert metadata["affinity"] == {
         "enabled": True,
         "handshake_endpoint": "handshake",

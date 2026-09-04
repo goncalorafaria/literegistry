@@ -39,7 +39,10 @@ seconds by default; bindings use a sliding seven-day TTL by default.
 From the repository root:
 
 ```bash
-docker build -f docker-mirror/Dockerfile -t literegistry-docker-mirror:latest .
+docker build \
+  -f literegistry_podman_beaker/docker/Dockerfile.mirror \
+  -t literegistry-docker-mirror:latest \
+  literegistry_podman_beaker
 ```
 
 The image contains the Distribution registry process, LiteRegistry supervisor,

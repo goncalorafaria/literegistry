@@ -9,8 +9,8 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     cat <<'USAGE'
 Usage: scripts/build-images.sh [IMAGE_REPOSITORY] [IMAGE_TAG]
 
-Builds Redis, gateway, rootless Podman server, and Docker mirror images from this
-package directory. IMAGE_REPOSITORY is optional (for example, goncalof or
+Builds Redis, gateway, rootless Podman server, Docker mirror, Podman-client
+warmup, and TMAX live-fire images from this package directory. IMAGE_REPOSITORY is optional (for example, goncalof or
 registry.example/team).
 
 Environment:
@@ -65,6 +65,8 @@ redis_image="${repository_prefix}literegistry-redis:${IMAGE_TAG}"
 gateway_image="${repository_prefix}literegistry-podman-gateway:${IMAGE_TAG}"
 podman_image="${repository_prefix}literegistry-podman-server:${IMAGE_TAG}"
 mirror_image="${repository_prefix}literegistry-docker-mirror:${IMAGE_TAG}"
+warmup_image="${repository_prefix}literegistry-podman-warmup:${IMAGE_TAG}"
+live_fire_image="${repository_prefix}literegistry-podman-live-fire:${IMAGE_TAG}"
 
 build_image() {
     local dockerfile="$1"
@@ -84,8 +86,12 @@ build_image Dockerfile.redis "$redis_image"
 build_image Dockerfile.gateway "$gateway_image"
 build_image Dockerfile.podman "$podman_image"
 build_image Dockerfile.mirror "$mirror_image"
+build_image Dockerfile.warmup "$warmup_image"
+build_image Dockerfile.live-fire "$live_fire_image"
 
 printf 'REDIS_IMAGE=%s\n' "$redis_image"
 printf 'GATEWAY_IMAGE=%s\n' "$gateway_image"
 printf 'PODMAN_IMAGE=%s\n' "$podman_image"
 printf 'DOCKER_MIRROR_IMAGE=%s\n' "$mirror_image"
+printf 'PODMAN_WARMUP_IMAGE=%s\n' "$warmup_image"
+printf 'PODMAN_LIVE_FIRE_IMAGE=%s\n' "$live_fire_image"

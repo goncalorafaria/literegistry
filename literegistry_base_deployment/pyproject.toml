@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "literegistry-base-deployment"
-version = "0.1.1"
+version = "0.1.2"
 description = "Deploy LiteRegistry gateway, Redis, tools, search, and vLLM services on Beaker."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,7 +12,7 @@ license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Goncalo Faria" }]
 dependencies = [
-  "literegistry>=1.0.36",
+  "literegistry>=1.0.47",
   "fire>=0.7,<1",
 ]
 

@@ -1,0 +1,405 @@
+"""Filesystem-backed endpoint discovery for deployment bootstrap.
+
+Redis cannot advertise its own address through Redis before clients know where
+Redis is. This module uses LiteRegistry's filesystem KV backend as that small
+bootstrap registry. Records are scoped to one deployment directory, carry a
+short TTL, and are published only while a supervised service is healthy.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import asdict, dataclass, field
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import socket
+import subprocess
+import threading
+import time
+from typing import Any, Mapping, Sequence
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
+from uuid import uuid4
+
+import fire
+
+from literegistry.coop.redis import redis_ping
+from literegistry.kvstore import FileSystemKVStore
+
+
+_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
+_SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True)
+class EndpointRecord:
+    """One live endpoint published by a deployment service."""
+
+    name: str
+    uri: str
+    publisher_id: str
+    published_at: float
+    metadata: dict[str, Any] = field(default_factory=dict)
+    schema_version: int = _SCHEMA_VERSION
+
+    @classmethod
+    def from_bytes(cls, payload: bytes) -> "EndpointRecord":
+        value = json.loads(payload.decode("utf-8"))
+        if not isinstance(value, dict) or value.get("schema_version") != _SCHEMA_VERSION:
+            raise ValueError("unsupported endpoint record schema")
+        record = cls(
+            name=value["name"],
+            uri=value["uri"],
+            publisher_id=value["publisher_id"],
+            published_at=float(value["published_at"]),
+            metadata=dict(value.get("metadata") or {}),
+            schema_version=int(value["schema_version"]),
+        )
+        _validate_name(record.name)
+        _validate_uri(record.uri)
+        if not record.publisher_id or not record.publisher_id.strip():
+            raise ValueError("publisher_id must be non-empty")
+        return record
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self), sort_keys=True, separators=(",", ":"))
+
+
+def _validate_name(name: str) -> str:
+    if not isinstance(name, str) or not _NAME_PATTERN.fullmatch(name):
+        raise ValueError(
+            "endpoint name must start with an alphanumeric character and contain "
+            "only alphanumerics, '.', '_', or '-'"
+        )
+    return name
+
+
+def _validate_uri(uri: str) -> str:
+    if not isinstance(uri, str) or not uri.strip() or any(char.isspace() for char in uri):
+        raise ValueError("endpoint URI must be a non-empty URI without whitespace")
+    parsed = urlparse(uri)
+    if not parsed.scheme or not parsed.hostname:
+        raise ValueError("endpoint URI must include a scheme and hostname")
+    return uri.rstrip("/")
+
+
+class FilesystemEndpointRegistry:
+    """Typed endpoint records stored through :class:`FileSystemKVStore`."""
+
+    def __init__(self, root: str | Path) -> None:
+        self.root = Path(root)
+        self.store = FileSystemKVStore(self.root)
+
+    @staticmethod
+    def prefix(name: str) -> str:
+        return f"endpoint_{_validate_name(name)}_"
+
+    @classmethod
+    def key(cls, name: str, publisher_id: str) -> str:
+        digest = hashlib.sha256(publisher_id.encode("utf-8")).hexdigest()
+        return f"{cls.prefix(name)}{digest}"
+
+    async def publish(
+        self,
+        name: str,
+        uri: str,
+        *,
+        publisher_id: str,
+        ttl_seconds: float = 30.0,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> EndpointRecord:
+        if ttl_seconds <= 0:
+            raise ValueError("ttl_seconds must be positive")
+        if not publisher_id or not publisher_id.strip():
+            raise ValueError("publisher_id must be non-empty")
+        record = EndpointRecord(
+            name=_validate_name(name),
+            uri=_validate_uri(uri),
+            publisher_id=publisher_id,
+            published_at=time.time(),
+            metadata=dict(metadata or {}),
+        )
+        await self.store.set(
+            self.key(name, publisher_id),
+            record.to_json(),
+            ttl_seconds=ttl_seconds,
+        )
+        return record
+
+    async def get(self, name: str) -> EndpointRecord | None:
+        records: list[EndpointRecord] = []
+        for key in await self.store.keys(prefix=self.prefix(name)):
+            payload = await self.store.get(key)
+            if payload is None:
+                continue
+            try:
+                record = EndpointRecord.from_bytes(payload)
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if record.name == name:
+                records.append(record)
+        return max(records, key=lambda record: record.published_at, default=None)
+
+    async def delete(self, name: str, *, publisher_id: str | None = None) -> bool:
+        if publisher_id is not None:
+            return await self.store.delete(self.key(name, publisher_id))
+        keys = await self.store.keys(prefix=self.prefix(name))
+        results = await asyncio.gather(*(self.store.delete(key) for key in keys))
+        return any(results)
+
+    async def close(self) -> None:
+        await self.store.close()
+
+
+def endpoint_healthy(
+    uri: str,
+    healthcheck: str = "none",
+    timeout: float = 2.0,
+) -> bool:
+    """Return whether an endpoint passes the requested lightweight probe."""
+
+    if timeout <= 0:
+        raise ValueError("healthcheck timeout must be positive")
+    kind = healthcheck.casefold()
+    if kind == "none":
+        return True
+    if kind == "redis":
+        try:
+            redis_ping(uri, timeout=timeout)
+            return True
+        except (OSError, ValueError, ConnectionError):
+            return False
+
+    parsed = urlparse(uri)
+    if kind == "tcp":
+        if not parsed.hostname or parsed.port is None:
+            return False
+        try:
+            with socket.create_connection((parsed.hostname, parsed.port), timeout):
+                return True
+        except OSError:
+            return False
+    if kind == "http":
+        health_uri = f"{uri.rstrip('/')}/health"
+        try:
+            with urlopen(Request(health_uri, method="GET"), timeout=timeout) as response:
+                return 200 <= response.status < 400
+        except OSError:
+            return False
+    raise ValueError("healthcheck must be one of: none, tcp, redis, http")
+
+
+async def wait_for_endpoint(
+    root: str | Path,
+    name: str,
+    *,
+    timeout: float = 600.0,
+    poll_interval: float = 1.0,
+    healthcheck: str = "none",
+    healthcheck_timeout: float = 2.0,
+) -> EndpointRecord:
+    """Wait for a published, healthy endpoint or raise at the deadline."""
+
+    if timeout <= 0 or poll_interval <= 0:
+        raise ValueError("timeout and poll_interval must be positive")
+    registry = FilesystemEndpointRegistry(root)
+    deadline = time.monotonic() + timeout
+    last_uri: str | None = None
+    try:
+        while time.monotonic() < deadline:
+            record = await registry.get(name)
+            if record is not None:
+                last_uri = record.uri
+                healthy = await asyncio.to_thread(
+                    endpoint_healthy,
+                    record.uri,
+                    healthcheck,
+                    healthcheck_timeout,
+                )
+                if healthy:
+                    return record
+            await asyncio.sleep(
+                min(poll_interval, max(0.0, deadline - time.monotonic()))
+            )
+    finally:
+        await registry.close()
+    detail = f"; last published URI was {last_uri}" if last_uri else ""
+    raise TimeoutError(f"timed out waiting for endpoint {name!r} in {root}{detail}")
+
+
+def publish(
+    root: str,
+    name: str,
+    uri: str,
+    publisher_id: str | None = None,
+    ttl_seconds: float = 30.0,
+) -> None:
+    """Publish one endpoint record (primarily useful for diagnostics)."""
+
+    async def operation() -> None:
+        registry = FilesystemEndpointRegistry(root)
+        try:
+            await registry.publish(
+                name,
+                uri,
+                publisher_id=publisher_id or f"manual-{uuid4().hex}",
+                ttl_seconds=ttl_seconds,
+            )
+        finally:
+            await registry.close()
+
+    asyncio.run(operation())
+
+
+def wait(
+    root: str,
+    name: str,
+    timeout: float = 600.0,
+    poll_interval: float = 1.0,
+    healthcheck: str = "none",
+    healthcheck_timeout: float = 2.0,
+) -> str:
+    """Wait for an endpoint and return only its URI for shell substitution."""
+
+    record = asyncio.run(
+        wait_for_endpoint(
+            root,
+            name,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            healthcheck=healthcheck,
+            healthcheck_timeout=healthcheck_timeout,
+        )
+    )
+    return record.uri
+
+
+def delete(root: str, name: str, publisher_id: str | None = None) -> bool:
+    """Delete an endpoint, optionally only when owned by ``publisher_id``."""
+
+    async def operation() -> bool:
+        registry = FilesystemEndpointRegistry(root)
+        try:
+            return await registry.delete(name, publisher_id=publisher_id)
+        finally:
+            await registry.close()
+
+    return asyncio.run(operation())
+
+
+def run(
+    root: str,
+    name: str,
+    uri: str,
+    command_json: str,
+    healthcheck: str = "none",
+    startup_timeout: float = 600.0,
+    healthcheck_timeout: float = 2.0,
+    ttl_seconds: float = 30.0,
+    refresh_interval: float = 10.0,
+    publisher_id: str | None = None,
+) -> None:
+    """Supervise a command and publish its endpoint only while it is healthy."""
+
+    if startup_timeout <= 0 or refresh_interval <= 0:
+        raise ValueError("startup_timeout and refresh_interval must be positive")
+    if ttl_seconds <= refresh_interval:
+        raise ValueError("ttl_seconds must be greater than refresh_interval")
+    command = json.loads(command_json)
+    if (
+        not isinstance(command, list)
+        or not command
+        or any(not isinstance(part, str) or not part for part in command)
+    ):
+        raise ValueError("command_json must encode a non-empty list of strings")
+
+    owner = publisher_id or f"{socket.gethostname()}-{os.getpid()}-{uuid4().hex}"
+    normalized_uri = _validate_uri(uri)
+    process = subprocess.Popen(command)
+    previous_handlers: dict[int, Any] = {}
+
+    def forward(signum: int, _frame: Any) -> None:
+        if process.poll() is None:
+            process.send_signal(signum)
+
+    if threading.current_thread() is threading.main_thread():
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            previous_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, forward)
+
+    registry = FilesystemEndpointRegistry(root)
+
+    async def publish_record() -> None:
+        await registry.publish(
+            name,
+            normalized_uri,
+            publisher_id=owner,
+            ttl_seconds=ttl_seconds,
+            metadata={"pid": os.getpid(), "hostname": socket.gethostname()},
+        )
+
+    try:
+        deadline = time.monotonic() + startup_timeout
+        while True:
+            return_code = process.poll()
+            if return_code is not None:
+                raise RuntimeError(
+                    f"managed command exited with status {return_code} "
+                    "before endpoint was healthy"
+                )
+            if endpoint_healthy(normalized_uri, healthcheck, healthcheck_timeout):
+                break
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"managed endpoint {name!r} did not become healthy within "
+                    f"{startup_timeout:g}s"
+                )
+            time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+
+        asyncio.run(publish_record())
+        variable = name.upper().replace("-", "_").replace(".", "_")
+        print(f"LITEREGISTRY_ENDPOINT_{variable}={normalized_uri}", flush=True)
+        while True:
+            try:
+                return_code = process.wait(timeout=refresh_interval)
+                if return_code != 0:
+                    raise subprocess.CalledProcessError(return_code, command)
+                return
+            except subprocess.TimeoutExpired:
+                if endpoint_healthy(
+                    normalized_uri,
+                    healthcheck,
+                    healthcheck_timeout,
+                ):
+                    asyncio.run(publish_record())
+                else:
+                    asyncio.run(registry.delete(name, publisher_id=owner))
+    finally:
+        try:
+            asyncio.run(registry.delete(name, publisher_id=owner))
+            asyncio.run(registry.close())
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+            for signum, previous in previous_handlers.items():
+                signal.signal(signum, previous)
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    fire.Fire(
+        {"publish": publish, "wait": wait, "delete": delete, "run": run},
+        command=argv,
+    )
+
+
+if __name__ == "__main__":
+    main()
