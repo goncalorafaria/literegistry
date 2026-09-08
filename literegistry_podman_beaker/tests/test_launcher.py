@@ -33,7 +33,7 @@ def test_single_cluster_stack_is_self_contained() -> None:
     _, spec = PodmanStackLauncher(config).build_spec(experiment_name="test-stack")
     tasks = _tasks(spec)
 
-    assert set(tasks) == {"docker-mirror", "gateway", "podman"}
+    assert set(tasks) == {"docker-mirror", "gateway", "podman", "podman-warmup"}
     assert tasks["docker-mirror"]["replicas"] == 2
     assert tasks["podman"]["replicas"] == 4
     assert tasks["podman"]["propagateFailure"] is False
@@ -42,6 +42,7 @@ def test_single_cluster_stack_is_self_contained() -> None:
     assert all(task["propagatePreemption"] is False for task in tasks.values())
     assert all(task["context"]["autoResume"] is True for task in tasks.values())
     assert tasks["gateway"]["constraints"] == {"cluster": ["ai2/phobos"]}
+    assert tasks["podman-warmup"]["constraints"] == {"cluster": ["ai2/phobos"]}
     assert all(task["hostNetworking"] for task in tasks.values())
     assert all(task["resources"] == {"gpuCount": 0} for task in tasks.values())
     assert all("datadev" not in " ".join(task["command"]) for task in tasks.values())
@@ -62,9 +63,17 @@ def test_single_cluster_stack_is_self_contained() -> None:
     assert "GATEWAY_URL=" in tasks["gateway"]["command"][2]
     assert "--docker_mirror_soft_affinity=True" in tasks["gateway"]["command"][2]
     assert "--docker_mirror_affinity_ttl_seconds=604800" in tasks["gateway"]["command"][2]
-    assert all("--command-json=" in task["command"][2] for task in tasks.values())
+    assert all(
+        "--command-json=" in task["command"][2]
+        for name, task in tasks.items()
+        if name != "podman-warmup"
+    )
     assert all("export PATH=\"${VIRTUAL_ENV}/bin:${PATH}\"" in task["command"][2] for task in tasks.values())
-    assert all("--lock_dir=/tmp/literegistry-port-locks" in task["command"][2] for task in tasks.values())
+    assert all(
+        "--lock_dir=/tmp/literegistry-port-locks" in task["command"][2]
+        for name, task in tasks.items()
+        if name != "podman-warmup"
+    )
     assert all(" -- bash -lc " not in task["command"][2] for task in tasks.values())
     assert all(
         not any(item["name"] == "PYTHONPATH" for item in task.get("envVars", []))
@@ -73,6 +82,20 @@ def test_single_cluster_stack_is_self_contained() -> None:
 
     for task in tasks.values():
         subprocess.run(["bash", "-n", "-c", task["command"][2]], check=True)
+
+    warmup = tasks["podman-warmup"]
+    assert warmup["image"]["beaker"] == "goncalof/literegistry-podman-warmup"
+    assert "literegistry.coop.endpoints wait" in warmup["command"][2]
+    assert "--name=gateway" in warmup["command"][2]
+    assert "exec literegistry-podman-warm-podman" in warmup["command"][2]
+    assert '--gateway_url="$GATEWAY_URL"' in warmup["command"][2]
+    assert "--images_file=/opt/images.txt" in warmup["command"][2]
+    assert "--expected_podman=4" in warmup["command"][2]
+    assert "--concurrency=64" in warmup["command"][2]
+    assert (
+        "--checkpoint_file=/weka/gfaria/literegistry/.coop/test-stack/"
+        "podman-warmup-complete.txt" in warmup["command"][2]
+    )
 
 
 def test_replicas_are_spread_into_cluster_specific_tasks() -> None:
@@ -84,7 +107,11 @@ def test_replicas_are_spread_into_cluster_specific_tasks() -> None:
         service_clusters=clusters,
     )
     _, spec = PodmanStackLauncher(config).build_spec(experiment_name="spread-stack")
-    podman = [task for task in spec["tasks"] if task["name"].startswith("podman-")]
+    podman = [
+        task
+        for task in spec["tasks"]
+        if task["name"].startswith("podman-") and task["name"] != "podman-warmup"
+    ]
     mirrors = [task for task in spec["tasks"] if task["name"].startswith("docker-mirror-")]
 
     assert [task.get("replicas", 1) for task in podman] == [3, 3, 2, 2]
@@ -172,6 +199,9 @@ def test_fire_cli_previews_stack(capsys) -> None:
     assert "\"podman_janitor_interval\": 300.0" in output
     assert "\"podman_resource_watchdog_interval\": 5.0" in output
     assert "\"podman_image_prune_until\": \"24h\"" in output
+    assert "\"warmup_enabled\": true" in output
+    assert "\"warmup_concurrency\": 64" in output
+    assert "\"podman-warmup\"" in output
     assert "ai2/jupiter" in output
     assert "ai2/ceres" in output
 
@@ -186,12 +216,18 @@ def test_managed_redis_stack_publishes_registry_url_to_all_services() -> None:
     _, spec = PodmanStackLauncher(config).build_spec(experiment_name="managed-stack")
     tasks = _tasks(spec)
 
-    assert set(tasks) == {"redis", "docker-mirror", "gateway", "podman"}
+    assert set(tasks) == {
+        "redis",
+        "docker-mirror",
+        "gateway",
+        "podman",
+        "podman-warmup",
+    }
     assert tasks["redis"]["constraints"] == {"cluster": ["ai2/phobos"]}
     assert tasks["redis"]["propagateFailure"] is False
     assert tasks["redis"]["propagatePreemption"] is False
     assert tasks["redis"]["context"]["autoResume"] is True
-    for service in ("docker-mirror", "gateway", "podman"):
+    for service in ("docker-mirror", "gateway", "podman", "podman-warmup"):
         assert tasks[service]["propagateFailure"] is False
         assert tasks[service]["propagatePreemption"] is False
         assert tasks[service]["context"]["autoResume"] is True
@@ -295,6 +331,7 @@ def test_head_registry_backends_are_rendered(
 def test_explicit_sqlite_head_launches_managed_redis() -> None:
     config = PodmanStackConfig(
         head_registry="sqlite:///weka/shared/podman-head.sqlite3",
+        coordination_root="/weka/shared/podman-deployments",
         podman_replicas=1,
         docker_mirror_replicas=0,
     )
@@ -307,7 +344,7 @@ def test_explicit_sqlite_head_launches_managed_redis() -> None:
     redis_command = tasks["redis"]["command"][2]
     assert "--head_registry=sqlite:///weka/shared/podman-head.sqlite3" in redis_command
     assert (
-        "--data_dir=/weka/gfaria/literegistry/.coop/"
+        "--data_dir=/weka/shared/podman-deployments/"
         "sqlite-managed-stack/redis-data"
     ) in redis_command
     for service in ("gateway", "podman"):
@@ -315,6 +352,11 @@ def test_explicit_sqlite_head_launches_managed_redis() -> None:
             "REGISTRY=head+sqlite:///weka/shared/podman-head.sqlite3"
             in tasks[service]["command"][2]
         )
+
+
+def test_coordination_root_must_be_absolute() -> None:
+    with pytest.raises(ValueError, match="coordination_root must be an absolute"):
+        PodmanStackConfig(coordination_root="relative/deployments").validate()
 
 
 def test_existing_cluster_expansion_can_launch_without_new_mirrors() -> None:
@@ -355,6 +397,47 @@ def test_gateway_can_disable_experimental_mirror_soft_affinity() -> None:
 
     command = _tasks(spec)["gateway"]["command"][2]
     assert "--docker_mirror_soft_affinity=False" in command
+
+
+def test_warmup_can_be_disabled_or_use_explicit_shared_checkpoint() -> None:
+    disabled = PodmanStackConfig(
+        registry="redis://registry.example:6379",
+        warmup_enabled=False,
+    )
+    _, disabled_spec = PodmanStackLauncher(disabled).build_spec(
+        experiment_name="cold-stack"
+    )
+    assert "podman-warmup" not in _tasks(disabled_spec)
+
+    configured = PodmanStackConfig(
+        registry="redis://registry.example:6379",
+        podman_replicas=8,
+        warmup_concurrency=17,
+        warmup_checkpoint_file="/weka/shared/checkpoints/images.txt",
+    )
+    _, configured_spec = PodmanStackLauncher(configured).build_spec(
+        experiment_name="warm-stack"
+    )
+    warmup = _tasks(configured_spec)["podman-warmup"]
+    assert "--expected_podman=8" in warmup["command"][2]
+    assert "--concurrency=17" in warmup["command"][2]
+    assert (
+        "--checkpoint_file=/weka/shared/checkpoints/images.txt"
+        in warmup["command"][2]
+    )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"warmup_image": ""},
+        {"warmup_concurrency": 0},
+        {"warmup_checkpoint_file": "relative/checkpoint.txt"},
+    ],
+)
+def test_warmup_validation(kwargs) -> None:
+    with pytest.raises(ValueError):
+        PodmanStackConfig(**kwargs).validate()
 
 
 def test_podman_hardening_can_be_disabled_or_overridden() -> None:

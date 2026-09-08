@@ -275,6 +275,10 @@ For search and URL retrieval, it routes `/search` requests to services registere
 ```bash
 # Summary view
 literegistry summary --registry redis://login-node:6379
+
+# Follow the currently healthy Redis advertised by a stable head registry
+literegistry summary --head_registry sqlite:///weka/shared/head.sqlite3
+literegistry detail --registry head+file:///weka/shared/head
 ```
 
 ## Using the Python API

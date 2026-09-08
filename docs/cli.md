@@ -305,11 +305,20 @@ Print `model_path : replica_count` for active servers.
 ```bash
 literegistry summary --registry redis://login-node:6379
 literegistry summary --registry /shared/fs/registry
+literegistry summary --head_registry sqlite:///weka/shared/head.sqlite3
+literegistry summary --registry head+file:///weka/shared/head
 ```
 
 | Argument | Default | Meaning |
 |----------|---------|---------|
 | `registry` | cluster Redis URL | Backend to inspect |
+| `head_registry` | `None` | Stable file, SQLite, or Redis head that advertises the live data-plane Redis |
+| `timeout` | `10` seconds | Maximum time to resolve and query the live registry |
+
+With a head registry, `summary` first resolves and verifies its current Redis
+publisher, then reads the roster from that live Redis. It prints the stable
+head URI, resolved live Redis URI, publisher ID, and publication age before
+the normal replica counts. Passwords in either URI are redacted.
 
 ---
 
@@ -319,11 +328,17 @@ Same grouping as `summary`, plus each replica’s `uri` and `metadata`.
 
 ```bash
 literegistry detail --registry redis://login-node:6379
+literegistry detail --head_registry file:///weka/shared/head
 ```
 
 | Argument | Default | Meaning |
 |----------|---------|---------|
 | `registry` | cluster Redis URL | Backend to inspect |
+| `head_registry` | `None` | Stable file, SQLite, or Redis head that advertises the live data-plane Redis |
+| `timeout` | `10` seconds | Maximum time to resolve and query the live registry |
+
+`detail` performs the same live resolution as `summary`, then prints each
+service URI and metadata from the resolved Redis roster.
 
 ---
 

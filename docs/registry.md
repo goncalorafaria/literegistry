@@ -301,6 +301,18 @@ The complete mapping is:
 The old `head:///shared/head` and raw filesystem paths remain accepted as
 compatibility aliases.
 
+Inspect the deployment through the stable head without manually discovering
+Redis first:
+
+```bash
+literegistry summary --head_registry=sqlite:///shared/head.sqlite3
+literegistry detail --registry=head+file:///shared/head
+```
+
+Both commands print the head location and the currently healthy Redis URL,
+publisher, and publication age, then query and display the service roster from
+that live Redis. Redis passwords are always redacted from these status lines.
+
 The resulting `HeadRegistryKVStore` keeps normal roster and affinity data in
 Redis. It checks the head record at most once every five seconds during
 healthy operation. If Redis fails, the operation remains cancellable but waits

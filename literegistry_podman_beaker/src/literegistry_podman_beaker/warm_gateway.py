@@ -149,7 +149,7 @@ async def warm_gateway(
     }
 
 
-def main(
+def run(
     gateway_url: str,
     images_file: str | None = None,
     concurrency: int = 32,
@@ -177,5 +177,10 @@ def main(
         raise SystemExit(1)
 
 
+def main() -> None:
+    """Expose :func:`run` through the package's standard Fire CLI."""
+    fire.Fire(run)
+
+
 if __name__ == "__main__":
-    fire.Fire(main)
+    main()

@@ -40,8 +40,8 @@ if you are deploying elsewhere.
 ### Beaker resource contract
 
 Every task in this stack is CPU-only. The launcher deliberately emits exactly
-this resource and scheduling shape for Redis, gateway, mirror, and Podman
-tasks:
+this resource and scheduling shape for Redis, gateway, mirror, Podman, and
+warmup tasks:
 
 ```yaml
 resources:
@@ -109,24 +109,27 @@ export PIP_INDEX_URL=https://python.example/simple
 `PIP_FIND_LINKS` must be reachable from inside the Docker build; a host-only
 filesystem path is not sufficient unless it is explicitly exposed to Docker.
 
-### 4. Build the four runtime images
+### 4. Build the runtime images
 
-The build script creates Redis infrastructure, gateway, rootless Podman, and
-Docker mirror images from the Dockerfiles bundled with this package:
+The build script creates Redis, gateway, rootless Podman, Docker mirror,
+Podman-client warmup, and live-fire images from the Dockerfiles bundled with
+this package:
 
 ```bash
 cd /weka/gfaria/literegistry/literegistry_podman_beaker
-export IMAGE_TAG=0.2.13
+export IMAGE_TAG=0.2.16
 ./scripts/build-images.sh "" "$IMAGE_TAG"
 ```
 
 This produces:
 
 ```text
-literegistry-redis:0.2.13
-literegistry-podman-gateway:0.2.13
-literegistry-podman-server:0.2.13
-literegistry-docker-mirror:0.2.13
+literegistry-redis:0.2.16
+literegistry-podman-gateway:0.2.16
+literegistry-podman-server:0.2.16
+literegistry-docker-mirror:0.2.16
+literegistry-podman-warmup:0.2.16
+literegistry-podman-live-fire:0.2.16
 ```
 
 For an ordinary Docker registry, pass its repository prefix and set
@@ -161,6 +164,14 @@ beaker image create \
 beaker image create \
   "$(docker image inspect --format '{{.Id}}' "literegistry-docker-mirror:$IMAGE_TAG")" \
   --name "literegistry-docker-mirror-$BEAKER_TAG" --workspace "$WORKSPACE"
+
+beaker image create \
+  "$(docker image inspect --format '{{.Id}}' "literegistry-podman-warmup:$IMAGE_TAG")" \
+  --name "literegistry-podman-warmup-$BEAKER_TAG" --workspace "$WORKSPACE"
+
+beaker image create \
+  "$(docker image inspect --format '{{.Id}}' "literegistry-podman-live-fire:$IMAGE_TAG")" \
+  --name "literegistry-podman-live-fire-$BEAKER_TAG" --workspace "$WORKSPACE"
 ```
 
 Beaker prints each image ID. An ID can be used instead of its name in every
@@ -185,7 +196,8 @@ literegistry-podman-beaker preview \
   --redis-image="literegistry-redis-$BEAKER_TAG" \
   --gateway-image="literegistry-podman-gateway-$BEAKER_TAG" \
   --podman-image="literegistry-podman-server-$BEAKER_TAG" \
-  --docker-mirror-image="literegistry-docker-mirror-$BEAKER_TAG"
+  --docker-mirror-image="literegistry-docker-mirror-$BEAKER_TAG" \
+  --warmup-image="literegistry-podman-warmup-$BEAKER_TAG"
 ```
 
 With no `--registry`, the experiment contains exactly one managed Redis task.
@@ -201,6 +213,12 @@ On `launch`, the managed per-experiment Weka directory is created before Beaker
 submission with sticky shared-write permissions, allowing the non-root service
 UID to publish endpoints and persist Redis data without opening the parent
 directory.
+
+Set `--coordination-root=/weka/shared/podman-deployments` to place each managed
+Redis AOF directory under that shared root. Combine it with an explicit
+`--head-registry=sqlite:///weka/shared/podman-deployments/head.sqlite3` when the
+SQLite bootstrap database and Redis persistence must share the same deployment
+tree.
 
 ### 7. Launch and monitor the stack
 
@@ -317,10 +335,11 @@ python -m build
 python -m twine check dist/*
 ```
 
-All four service images contain the small `literegistry-podman-beaker` runtime
-helper used for collision-safe host-port selection. The gateway application and
-proxy routes still come directly from `literegistry`. No image imports code from
-a Weka checkout or injects `PYTHONPATH`.
+The long-running service images contain the small
+`literegistry-podman-beaker` runtime helper used for collision-safe host-port
+selection. The gateway application and proxy routes still come directly from
+`literegistry`. No image imports code from a Weka checkout or injects
+`PYTHONPATH`.
 
 ## Launch from Python
 
@@ -427,10 +446,35 @@ Users only need GATEWAY_URL. They do not need Redis or individual replica URLs.
 
 ## Docker Hub credentials and mirror warmup
 
-Warm the cluster through the gateway so every Registry V2 object creates a
-Redis soft-affinity binding to the mirror that cached it. The command waits
-until all expected mirrors are registered and displays a live `tqdm` progress
-bar over the bundled 14,490 unique Open Instruct/Tmax images:
+Warmup is a first-class part of every mirror-enabled Podman deployment. The
+launcher adds one `podman-warmup` task using `warmup_image`. It starts alongside
+the services, waits until the gateway is published and every expected Podman
+replica is registered, and then uses the async `PodmanClient` for each image:
+
+```text
+handshake(image) -> execute("true") -> close()
+```
+
+That is deliberately the same gateway, affinity, Podman pull, and mirror path
+used by a real rollout. The task is CPU-only (`gpuCount: 0`, CPU omitted), has
+`minRuntime=0`, and is auto-resumable. Successful images are appended to
+`<coordination_root>/<experiment>/podman-warmup-complete.txt` on Weka, so a
+resumed task skips completed work. Defaults are:
+
+| Fire CLI option | `PodmanStackConfig` field | Default |
+|---|---|---:|
+| `--warmup-image` | `warmup_image` | `goncalof/literegistry-podman-warmup` |
+| `--warmup-enabled` | `warmup_enabled` | `True` |
+| `--warmup-concurrency` | `warmup_concurrency` | `64` |
+| `--warmup-checkpoint-file` | `warmup_checkpoint_file` | deployment Weka path |
+
+Disable it only for an intentionally cold-cache experiment with
+`--warmup-enabled=False`. If `docker_mirror_replicas=0` and no explicit
+`podman_registry_mirror` is configured, the launcher omits the task because
+there is no mirror to warm.
+
+The lower-level direct Registry V2 warmer remains available for diagnostics.
+It creates soft-affinity bindings but does not create Podman sessions:
 
 ```bash
 literegistry-podman-warm-gateway \
@@ -443,9 +487,8 @@ Use `--images_file=/path/to/images.txt` to replace the bundled list. The
 optional `--limit=N` is intended only for smoke tests; without it the command
 warms the complete list through the gateway.
 
-To exercise the same path as a real rollout, use the async Podman client
-warmer. Each image follows `handshake -> execute("true") -> close`; successful
-images are checkpointed so a resumed Beaker task skips them:
+The deployment invokes the equivalent Podman client command automatically;
+it can also be run manually:
 
 ```bash
 literegistry-podman-warm-podman \
@@ -454,6 +497,12 @@ literegistry-podman-warm-podman \
   --concurrency=64 \
   --checkpoint_file=/weka/path/podman-warmup-complete.txt
 ```
+
+`Dockerfile.warmup` contains no local Python source. It installs published,
+pinned `literegistry` and `literegistry-podman-beaker` releases; the latter
+uses the async `PodmanClient`. The image copies only the unique `images.txt`
+asset to `/opt/images.txt`. That file is the default input, so callers only
+need to supply the gateway and deployment options.
 
 For authenticated Docker Hub limits, put an organization access token or
 personal access token in a Beaker secret and pass only the secret name:
@@ -518,44 +567,45 @@ container and its affinity binding.
 
 ## Build self-contained runtime images
 
-The four Dockerfiles build directly from official upstream bases:
+The six Dockerfiles build directly from official upstream bases:
 
 - `redis:7-bookworm` for Redis
 - `python:3.12-slim-bookworm` for the gateway
 - `quay.io/podman/stable` for the rootless Podman server
 - `registry:3` plus `python:3.12-slim-bookworm` for the mirror
+- `python:3.12-slim-bookworm` for the Podman-client warmup and live-fire tasks
 
 They do not reference `goncalof/*`, `~/basic_images`, Weka paths, or any
 other local image. Every image installs LiteRegistry. Its canonical
 `literegistry.coop` helpers provide collision-safe dynamic ports; the gateway itself invokes base LiteRegistry
-directly. The mirror also copies the unique 14,490-image warm list from this
-directory, but does not warm it automatically. Run
-`literegistry-podman-warm-gateway` after the stack is ready so warmup is routed
-across the mirror pool and does not compete with startup traffic.
+directly. The source-free warmup image copies the unique 14,490-image list and
+the launcher includes it automatically in every mirror-enabled deployment.
 
-Build all four with one command:
+Build all six with one command:
 
 ```bash
 cd /weka/gfaria/literegistry/literegistry_podman_beaker
-./scripts/build-images.sh YOUR_REGISTRY 0.2.13
+./scripts/build-images.sh YOUR_REGISTRY 0.2.16
 ```
 
-For example, build and push `goncalof/*:0.2.13`:
+For example, build and push `goncalof/*:0.2.16`:
 
 ```bash
-PUSH_IMAGES=1 ./scripts/build-images.sh goncalof 0.2.13
+PUSH_IMAGES=1 ./scripts/build-images.sh goncalof 0.2.16
 ```
 
 The script prints:
 
 ```text
-REDIS_IMAGE=YOUR_REGISTRY/literegistry-redis:0.2.13
-GATEWAY_IMAGE=YOUR_REGISTRY/literegistry-podman-gateway:0.2.13
-PODMAN_IMAGE=YOUR_REGISTRY/literegistry-podman-server:0.2.13
-DOCKER_MIRROR_IMAGE=YOUR_REGISTRY/literegistry-docker-mirror:0.2.13
+REDIS_IMAGE=YOUR_REGISTRY/literegistry-redis:0.2.16
+GATEWAY_IMAGE=YOUR_REGISTRY/literegistry-podman-gateway:0.2.16
+PODMAN_IMAGE=YOUR_REGISTRY/literegistry-podman-server:0.2.16
+DOCKER_MIRROR_IMAGE=YOUR_REGISTRY/literegistry-docker-mirror:0.2.16
+PODMAN_WARMUP_IMAGE=YOUR_REGISTRY/literegistry-podman-warmup:0.2.16
+PODMAN_LIVE_FIRE_IMAGE=YOUR_REGISTRY/literegistry-podman-live-fire:0.2.16
 ```
 
-Publish `literegistry==1.0.47` to the
+Publish `literegistry==1.0.47` and `literegistry-podman-beaker==0.2.16` to the
 selected Python index before building the runtime images.
 
 If LiteRegistry is served by an internal Python index, export
@@ -567,10 +617,11 @@ Use the resulting installed-package images directly:
 
 ```python
 config = PodmanStackConfig(
-    redis_image="YOUR_REGISTRY/literegistry-redis:0.2.13",
-    gateway_image="YOUR_REGISTRY/literegistry-podman-gateway:0.2.13",
-    podman_image="YOUR_REGISTRY/literegistry-podman-server:0.2.13",
-    docker_mirror_image="YOUR_REGISTRY/literegistry-docker-mirror:0.2.13",
+    redis_image="YOUR_REGISTRY/literegistry-redis:0.2.16",
+    gateway_image="YOUR_REGISTRY/literegistry-podman-gateway:0.2.16",
+    podman_image="YOUR_REGISTRY/literegistry-podman-server:0.2.16",
+    docker_mirror_image="YOUR_REGISTRY/literegistry-docker-mirror:0.2.16",
+    warmup_image="YOUR_REGISTRY/literegistry-podman-warmup:0.2.16",
 )
 ```
 

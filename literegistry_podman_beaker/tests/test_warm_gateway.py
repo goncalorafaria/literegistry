@@ -77,3 +77,16 @@ def test_active_mirror_count_reads_gateway_models(monkeypatch) -> None:
     monkeypatch.setattr(json, "load", lambda stream: payload)
 
     assert warm_gateway._active_mirror_count("http://gateway.example") == 2
+
+
+def test_console_main_delegates_argument_parsing_to_fire(monkeypatch) -> None:
+    captured = {}
+    monkeypatch.setattr(
+        warm_gateway.fire,
+        "Fire",
+        lambda command: captured.setdefault("command", command),
+    )
+
+    warm_gateway.main()
+
+    assert captured["command"] is warm_gateway.run

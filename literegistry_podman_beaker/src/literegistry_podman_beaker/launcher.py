@@ -79,6 +79,7 @@ class PodmanStackConfig:
     # unconstrained.
     omit_resources: bool = False
     name_prefix: str = "literegistry-podman"
+    coordination_root: str = "/weka/gfaria/literegistry/.coop"
     podman_image: str = "goncalof/literegistry-podman-immediate-rm-20260819"
     podman_instance_prefix: str = "podman"
     podman_session_image: str = "docker.io/library/ubuntu:24.04"
@@ -90,6 +91,10 @@ class PodmanStackConfig:
     podman_resource_watchdog_interval: float | None = 5.0
     podman_image_prune_until: str | None = "24h"
     docker_mirror_image: str = "goncalof/literegistry-docker-mirror"
+    warmup_image: str = "goncalof/literegistry-podman-warmup"
+    warmup_enabled: bool = True
+    warmup_concurrency: int = 64
+    warmup_checkpoint_file: str | None = None
     gateway_image: str = "goncalof/literegistry-basic"
     redis_image: str = "goncalof/literegistry-redis"
     redis_cluster: str | None = None
@@ -185,16 +190,26 @@ class PodmanStackConfig:
             "podman_instance_prefix",
             "podman_session_image",
             "docker_mirror_image",
+            "warmup_image",
             "gateway_image",
             "redis_image",
             "docker_mirror_storage_root",
             "workspace",
             "budget",
             "name_prefix",
+            "coordination_root",
             "weka_source",
         ):
             if not getattr(self, name).strip():
                 raise ValueError(f"{name} must be non-empty")
+        if not Path(self.coordination_root).expanduser().is_absolute():
+            raise ValueError("coordination_root must be an absolute shared path")
+        if self.warmup_concurrency < 1:
+            raise ValueError("warmup_concurrency must be positive")
+        if self.warmup_checkpoint_file is not None and not Path(
+            self.warmup_checkpoint_file
+        ).expanduser().is_absolute():
+            raise ValueError("warmup_checkpoint_file must be an absolute shared path")
         if self.docker_mirror_affinity_ttl_seconds <= 0:
             raise ValueError("docker mirror affinity TTL must be positive")
         if self.affinity_ttl_seconds <= 0 or self.gateway_timeout <= 0:
@@ -359,7 +374,9 @@ class PodmanStackLauncher:
     def build_spec(self, *, experiment_name: str | None = None) -> tuple[str, dict[str, Any]]:
         name = experiment_name or self._identity()
         configured_registry = self.config.resolved_registry()
-        default_coordination_path = f"/weka/gfaria/literegistry/.coop/{name}"
+        default_coordination_path = str(
+            Path(self.config.coordination_root).expanduser() / name
+        )
         endpoint_registry = self.config.resolved_head_registry()
         tasks: list[dict[str, Any]] = []
         clusters = self.config.resolved_service_clusters()
@@ -576,9 +593,47 @@ class PodmanStackLauncher:
                 )
             )
 
+        run_warmup = self.config.warmup_enabled and (
+            self.config.docker_mirror_replicas > 0
+            or self.config.podman_registry_mirror is not None
+        )
+        if run_warmup:
+            checkpoint_file = self.config.warmup_checkpoint_file or (
+                default_coordination_path + "/podman-warmup-complete.txt"
+            )
+            warmup_command = (
+                wait
+                + _wait_for_endpoint_command(
+                    endpoint_registry,
+                    "gateway",
+                    "GATEWAY_URL",
+                    "http",
+                )
+                + "exec literegistry-podman-warm-podman "
+                + '--gateway_url="$GATEWAY_URL" '
+                + "--images_file=/opt/images.txt "
+                + f"--expected_podman={self.config.podman_replicas} "
+                + f"--concurrency={self.config.warmup_concurrency} "
+                + f"--checkpoint_file={shlex.quote(checkpoint_file)}"
+            )
+            tasks.append(
+                self._task(
+                    "podman-warmup",
+                    self.config.warmup_image,
+                    warmup_command,
+                    cluster=self.config.resolved_gateway_cluster(),
+                    critical=False,
+                    auto_resume=True,
+                    propagate_preemption=False,
+                )
+            )
+
         return name, {
             "version": "v2",
-            "description": f"LiteRegistry Podman + Docker mirror + Redis stack: {name}",
+            "description": (
+                "LiteRegistry Podman + Docker mirror + warmup + Redis stack: "
+                f"{name}"
+            ),
             "budget": self.config.budget,
             "tasks": tasks,
         }
@@ -591,8 +646,13 @@ class PodmanStackLauncher:
 
     def submit(self) -> dict[str, Any]:
         name, spec = self.build_spec()
+        if self.config.registry is None or any(
+            task["name"] == "podman-warmup" for task in spec["tasks"]
+        ):
+            _prepare_shared_directory(
+                str(Path(self.config.coordination_root).expanduser() / name)
+            )
         if self.config.registry is None:
-            _prepare_shared_directory(f"/weka/gfaria/literegistry/.coop/{name}")
             head = self.config.resolved_head_registry()
             if head is not None:
                 prepare_endpoint_registry_storage(head)
