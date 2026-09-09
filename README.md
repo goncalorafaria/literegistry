@@ -31,6 +31,7 @@ Usage guides with argument reference live in [`docs/`](docs/README.md)
 > install the separately versioned companions through an extra:
 >
 > ```bash
+> pip install "literegistry[tool_client]"      # Search, fetch, code, terminal, judge clients
 > pip install "literegistry[podman_client]"    # Async PodmanClient
 > pip install "literegistry[podman_beaker]"    # Podman + mirror Beaker stack
 > pip install "literegistry[base_deployment]"  # General tools/model Beaker stack
@@ -38,6 +39,7 @@ Usage guides with argument reference live in [`docs/`](docs/README.md)
 > ```
 >
 > Their detailed setup guides live in
+> [`literegistry_tool_client/`](literegistry_tool_client/README.md),
 > [`literegistry_podman_client/`](literegistry_podman_client/README.md),
 > [`literegistry_podman_beaker/`](literegistry_podman_beaker/README.md), and
 > [`literegistry_base_deployment/`](literegistry_base_deployment/README.md).

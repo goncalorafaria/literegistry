@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "literegistry-tool-client"
+version = "0.1.0"
+description = "Standalone asynchronous clients for LiteRegistry tool services."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = ["aiohttp>=3.9,<4"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+publish = ["build>=1.2", "twine>=5"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+literegistry_tool_client = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["src"]
