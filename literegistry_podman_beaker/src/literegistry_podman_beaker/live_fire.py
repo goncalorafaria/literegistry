@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections import Counter
 import hashlib
+from importlib.resources import files
 import json
 from pathlib import Path
 import random
@@ -20,6 +21,13 @@ from tqdm import tqdm
 from literegistry_podman_client import PodmanClient
 
 from .warm_podman import _normalize_gateway_url, _wait_for_podman
+
+
+ASSET_NAME = "tmax_deployment_workloads.jsonl"
+
+
+def _default_manifest_path() -> Path:
+    return Path(str(files("literegistry_podman_beaker.assets").joinpath(ASSET_NAME)))
 
 
 def _qualified_image(image: str) -> str:
@@ -178,7 +186,7 @@ async def _replay_one(
 
 async def live_fire(
     gateway_url: str,
-    manifest_path: str,
+    manifest_path: str | None = None,
     *,
     concurrency: int = 1000,
     total: int = 4000,
@@ -211,7 +219,10 @@ async def live_fire(
     podman_count = await _wait_for_podman(
         gateway_url, expected_podman, wait_timeout
     )
-    workloads = _load_workloads(Path(manifest_path))
+    resolved_manifest_path = (
+        Path(manifest_path) if manifest_path is not None else _default_manifest_path()
+    )
+    workloads = _load_workloads(resolved_manifest_path)
     random.Random(shuffle_seed).shuffle(workloads)
     selected = workloads[:total]
     if len(selected) < total:
@@ -366,7 +377,7 @@ async def live_fire(
     elapsed = time.perf_counter() - started
     result = {
         "gateway_url": gateway_url,
-        "manifest_path": manifest_path,
+        "manifest_path": str(resolved_manifest_path),
         "podman_replicas": podman_count,
         "selected": len(selected),
         "resumed": len(selected) - len(pending),
@@ -400,7 +411,7 @@ async def live_fire(
 
 def run(
     gateway_url: str,
-    manifest_path: str,
+    manifest_path: str | None = None,
     concurrency: int = 1000,
     total: int = 4000,
     expected_podman: int = 32,

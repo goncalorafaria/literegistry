@@ -55,7 +55,7 @@ package-dir = { "" = "src" }
 where = ["src"]
 
 [tool.setuptools.package-data]
-literegistry_podman_beaker = ["py.typed", "assets/*.txt"]
+literegistry_podman_beaker = ["py.typed", "assets/*.txt", "assets/*.jsonl"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -105,6 +105,17 @@ def test_live_fire_replays_commands_and_closes_sessions(
     }
 
 
+def test_bundled_tmax_manifest_is_available() -> None:
+    manifest = live_fire._default_manifest_path()
+
+    assert manifest.name == "tmax_deployment_workloads.jsonl"
+    assert manifest.is_file()
+    with manifest.open(encoding="utf-8") as stream:
+        first = json.loads(next(stream))
+    assert first["task_id"]
+    assert first["container_image"]
+    assert first["commands"]
+
+
 async def _async_value(value):
     return value
-

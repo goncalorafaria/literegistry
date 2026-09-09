@@ -605,6 +605,21 @@ PODMAN_WARMUP_IMAGE=YOUR_REGISTRY/literegistry-podman-warmup:0.2.16
 PODMAN_LIVE_FIRE_IMAGE=YOUR_REGISTRY/literegistry-podman-live-fire:0.2.16
 ```
 
+The live-fire image includes the complete TMAX deployment workload manifest as
+package data. Run against the bundled manifest by passing only the gateway URL:
+
+```bash
+literegistry-podman-live-fire http://gateway-host:port \
+  --concurrency=1000 \
+  --connection_limit=1000 \
+  --total=4000 \
+  --expected_podman=64
+```
+
+The bundled file is
+`literegistry_podman_beaker/assets/tmax_deployment_workloads.jsonl`. An explicit
+second positional `manifest_path` still overrides it for custom workloads.
+
 Publish `literegistry==1.0.47` and `literegistry-podman-beaker==0.2.16` to the
 selected Python index before building the runtime images.
 
