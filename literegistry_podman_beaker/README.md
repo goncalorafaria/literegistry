@@ -84,8 +84,8 @@ Datadev.
 
 ### 3. Make LiteRegistry available to Docker builds
 
-The runtime images pin `literegistry==1.0.47`, including the gateway, Redis,
-Podman, mirror, warmup, and live-fire images. Make version 1.0.47 available on
+The runtime images pin `literegistry==1.0.49`, including the gateway, Redis,
+Podman, mirror, warmup, and live-fire images. Make version 1.0.49 available on
 the Python index used by Docker, or expose it through a
 wheelhouse URL reachable from the Docker builder:
 
@@ -94,7 +94,7 @@ cd /weka/gfaria/literegistry
 python -m build
 python -m twine check dist/*
 # Publish to your configured index when appropriate:
-# python -m twine upload dist/literegistry-1.0.47*
+# python -m twine upload dist/literegistry-1.0.49*
 ```
 
 For a private index or HTTP wheelhouse:
@@ -620,7 +620,7 @@ The bundled file is
 `literegistry_podman_beaker/assets/tmax_deployment_workloads.jsonl`. An explicit
 second positional `manifest_path` still overrides it for custom workloads.
 
-Publish `literegistry==1.0.47` and `literegistry-podman-beaker==0.2.16` to the
+Publish `literegistry==1.0.49` and `literegistry-podman-beaker==0.2.16` to the
 selected Python index before building the runtime images.
 
 If LiteRegistry is served by an internal Python index, export

@@ -4,9 +4,12 @@ import asyncio
 import json
 from pathlib import Path
 import socket
+import sqlite3
 import sys
 
 import pytest
+
+import literegistry.coop.endpoints as endpoint_module
 
 from literegistry.client import RegistryClient
 from literegistry.coop.artifacts import (
@@ -369,3 +372,50 @@ def test_endpoint_supervisor_accepts_empty_non_executable_arguments(
         ttl_seconds=1,
         refresh_interval=0.1,
     )
+
+
+def test_endpoint_supervisor_survives_registry_publish_and_delete_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class FlakyEndpointRegistry:
+        def __init__(self) -> None:
+            self.publish_calls = 0
+            self.delete_calls = 0
+            self.closed = False
+
+        async def publish(self, *_args, **_kwargs) -> None:
+            self.publish_calls += 1
+            if self.publish_calls <= 2:
+                raise sqlite3.OperationalError("database is locked")
+
+        async def delete(self, *_args, **_kwargs) -> bool:
+            self.delete_calls += 1
+            raise sqlite3.OperationalError("database is locked")
+
+        async def close(self) -> None:
+            self.closed = True
+
+    registry = FlakyEndpointRegistry()
+    monkeypatch.setattr(
+        endpoint_module,
+        "get_endpoint_registry",
+        lambda _root: registry,
+    )
+
+    run(
+        str(tmp_path),
+        "redis",
+        "redis://127.0.0.1:6379",
+        [sys.executable, "-c", "import time; time.sleep(0.25)"],
+        healthcheck="none",
+        ttl_seconds=0.2,
+        refresh_interval=0.05,
+    )
+
+    assert registry.publish_calls >= 3
+    assert registry.delete_calls >= 1
+    assert registry.closed
+    assert "will retry" in caplog.text
+    assert "TTL expiry will clean it" in caplog.text

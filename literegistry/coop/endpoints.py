@@ -12,6 +12,7 @@ import asyncio
 from dataclasses import asdict, dataclass, field
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -38,6 +39,7 @@ from literegistry.kvstore import (
 
 _NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _SCHEMA_VERSION = 1
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -416,8 +418,10 @@ def run(
     normalized_uri = _validate_uri(uri)
     process = subprocess.Popen(command)
     previous_handlers: dict[int, Any] = {}
+    stopping = threading.Event()
 
     def forward(signum: int, _frame: Any) -> None:
+        stopping.set()
         if process.poll() is None:
             process.send_signal(signum)
 
@@ -437,6 +441,33 @@ def run(
             metadata={"pid": os.getpid(), "hostname": socket.gethostname()},
         )
 
+    def publish_best_effort() -> bool:
+        try:
+            asyncio.run(publish_record())
+            return True
+        except Exception as error:
+            logger.warning(
+                "Cannot publish endpoint %s to %s; will retry: %s",
+                name,
+                root,
+                error,
+            )
+            return False
+
+    def delete_best_effort() -> None:
+        try:
+            asyncio.run(registry.delete(name, publisher_id=owner))
+        except Exception as error:
+            # Endpoint records have a TTL, so a failed explicit delete is safe:
+            # discovery will discard the stale record without killing the
+            # supervised service during a coordination-store outage.
+            logger.warning(
+                "Cannot delete endpoint %s from %s; TTL expiry will clean it: %s",
+                name,
+                root,
+                error,
+            )
+
     try:
         deadline = time.monotonic() + startup_timeout
         while True:
@@ -455,7 +486,16 @@ def run(
                 )
             time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
 
-        asyncio.run(publish_record())
+        # A coordination-store outage must not kill an otherwise healthy
+        # service. Keep the child alive and retry publication until either the
+        # registry recovers or the child exits.
+        while not publish_best_effort():
+            return_code = process.poll()
+            if return_code is not None:
+                if return_code != 0:
+                    raise subprocess.CalledProcessError(return_code, command)
+                return
+            time.sleep(refresh_interval)
         variable = name.upper().replace("-", "_").replace(".", "_")
         print(f"LITEREGISTRY_ENDPOINT_{variable}={normalized_uri}", flush=True)
         while True:
@@ -465,18 +505,27 @@ def run(
                     raise subprocess.CalledProcessError(return_code, command)
                 return
             except subprocess.TimeoutExpired:
+                if stopping.is_set():
+                    continue
                 if endpoint_healthy(
                     normalized_uri,
                     healthcheck,
                     healthcheck_timeout,
                 ):
-                    asyncio.run(publish_record())
+                    publish_best_effort()
                 else:
-                    asyncio.run(registry.delete(name, publisher_id=owner))
+                    delete_best_effort()
     finally:
         try:
-            asyncio.run(registry.delete(name, publisher_id=owner))
-            asyncio.run(registry.close())
+            delete_best_effort()
+            try:
+                asyncio.run(registry.close())
+            except Exception as error:
+                logger.warning(
+                    "Cannot close endpoint registry %s cleanly: %s",
+                    root,
+                    error,
+                )
         finally:
             if process.poll() is None:
                 process.terminate()

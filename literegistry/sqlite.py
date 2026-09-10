@@ -119,6 +119,20 @@ class SQLiteKVStore(KeyValueStore):
         connection.execute(f"PRAGMA busy_timeout = {math.ceil(self.timeout * 1000)}")
         return connection
 
+    def _read_connect(self) -> sqlite3.Connection:
+        """Open a connection that SQLite itself guarantees cannot write."""
+
+        if self._closed:
+            raise RuntimeError("SQLiteKVStore is closed")
+        connection = sqlite3.connect(
+            f"{self.path.as_uri()}?mode=ro",
+            uri=True,
+            timeout=self.timeout,
+        )
+        connection.execute(f"PRAGMA busy_timeout = {math.ceil(self.timeout * 1000)}")
+        connection.execute("PRAGMA query_only = ON")
+        return connection
+
     def _initialize_sync(self) -> None:
         with self._connect() as connection:
             # DELETE journaling avoids WAL's shared-memory requirement and is
@@ -291,31 +305,24 @@ class SQLiteKVStore(KeyValueStore):
     async def get(self, key: str) -> Optional[bytes]:
         def operation() -> Optional[bytes]:
             now = time.time()
-            with self._connect() as connection:
+            with self._read_connect() as connection:
                 tables = (
                     (_AFFINITY_TABLE, _TABLE)
                     if key.startswith(_AFFINITY_PREFIX)
                     else (_TABLE,)
                 )
                 row = None
-                row_table = _TABLE
                 for table in tables:
                     row = connection.execute(
                         f"SELECT value, expires_at FROM {table} WHERE key = ?",
                         (key,),
                     ).fetchone()
                     if row is not None:
-                        row_table = table
                         break
                 if row is None:
                     return None
                 if row[1] is None or float(row[1]) > now:
                     return bytes(row[0])
-                connection.execute(
-                    f"DELETE FROM {row_table} "
-                    "WHERE key = ? AND expires_at IS NOT NULL AND expires_at <= ?",
-                    (key, now),
-                )
                 return None
 
         return await asyncio.to_thread(operation)
@@ -378,6 +385,11 @@ class SQLiteKVStore(KeyValueStore):
                             f"DELETE FROM {_AFFINITY_TABLE} WHERE key = ?",
                             (key,),
                         )
+                # Physical TTL cleanup only piggybacks on an operation that is
+                # already a writer. Read paths must never create write locks:
+                # many services commonly read the shared head registry on the
+                # same refresh cadence.
+                self._cleanup_expired_if_due(connection, time.time())
 
         await asyncio.to_thread(operation)
         return True
@@ -405,9 +417,7 @@ class SQLiteKVStore(KeyValueStore):
 
     async def keys(self, prefix: Optional[str] = None) -> list[str]:
         def operation() -> list[str]:
-            now = time.time()
-            with self._connect() as connection:
-                self._cleanup_expired_if_due(connection, now)
+            with self._read_connect() as connection:
                 keys: set[str] = set()
                 for table in (_TABLE, _AFFINITY_TABLE):
                     query, parameters = self._live_key_query(
@@ -430,9 +440,7 @@ class SQLiteKVStore(KeyValueStore):
         """Return matching live rows with one indexed SQLite query."""
 
         def operation() -> list[tuple[str, bytes]]:
-            now = time.time()
-            with self._connect() as connection:
-                self._cleanup_expired_if_due(connection, now)
+            with self._read_connect() as connection:
                 items: dict[str, bytes] = {}
                 for table in (_TABLE, _AFFINITY_TABLE):
                     query, parameters = self._live_key_query(
@@ -477,8 +485,7 @@ class SQLiteKVStore(KeyValueStore):
                 + " AND ".join(clauses)
                 + " ORDER BY key"
             )
-            with self._connect() as connection:
-                self._cleanup_expired_if_due(connection, now)
+            with self._read_connect() as connection:
                 rows = connection.execute(query, parameters).fetchall()
                 return [(str(key), bytes(value)) for key, value in rows]
 

@@ -73,6 +73,54 @@ def test_sqlite_store_expires_ttl_records(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
+def test_sqlite_reads_never_delete_expired_rows(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        database = tmp_path / "registry.sqlite3"
+        store = SQLiteKVStore(database, cleanup_interval=60)
+        await store.set("short", "value", ttl_seconds=0.02)
+        await asyncio.sleep(0.04)
+
+        # Make cleanup due and fail loudly if any lookup tries to invoke it.
+        store._next_cleanup = 0
+
+        def forbidden_cleanup(*_args, **_kwargs) -> None:
+            raise AssertionError("a SQLite read attempted physical TTL cleanup")
+
+        store._cleanup_expired_if_due = forbidden_cleanup  # type: ignore[method-assign]
+        assert await store.get("short") is None
+        assert await store.keys() == []
+        assert await store.items() == []
+        assert await store.affinity_items() == []
+        await store.close()
+
+        # Logical expiration must not turn a reader into a writer. The expired
+        # row remains until a later write transaction performs maintenance.
+        with sqlite3.connect(database) as connection:
+            assert connection.execute(
+                "SELECT count(*) FROM literegistry_kv WHERE key = 'short'"
+            ).fetchone()[0] == 1
+
+    asyncio.run(scenario())
+
+
+def test_sqlite_write_piggybacks_expired_row_cleanup(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        database = tmp_path / "registry.sqlite3"
+        store = SQLiteKVStore(database, cleanup_interval=60)
+        await store.set("short", "value", ttl_seconds=0.02)
+        await asyncio.sleep(0.04)
+        store._next_cleanup = 0
+        await store.set("durable", "value")
+        await store.close()
+
+        with sqlite3.connect(database) as connection:
+            assert connection.execute(
+                "SELECT count(*) FROM literegistry_kv WHERE key = 'short'"
+            ).fetchone()[0] == 0
+
+    asyncio.run(scenario())
+
+
 def test_sqlite_prefix_is_literal(tmp_path: Path) -> None:
     async def scenario() -> None:
         store = SQLiteKVStore(tmp_path / "registry.sqlite3")
