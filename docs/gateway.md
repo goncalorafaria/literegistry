@@ -189,3 +189,40 @@ Details: [Load balancing](load-balancing.md).
   `model` / `code` returns 400.
 
 Next: [vLLM & SGLang](vllm-sglang.md) · [Load balancing](load-balancing.md)
+
+
+## Strict-affinity transport failures
+
+A pinned command is sent once. If its response is lost, the gateway does not
+replay it: side effects may already have occurred. Upstream disconnects and
+incomplete responses return structured HTTP 502 (`affinity_upstream_disconnected`),
+timeouts return 504 (`affinity_upstream_timeout`), and connection failures return
+503 (`affinity_owner_unavailable`). `execution_outcome` is `unknown` unless a
+connection was never established or the request was blocked before forwarding.
+An upstream application's HTTP error, including 503, is preserved without
+triggering transport-failure probes.
+
+After a transport failure, the gateway confirms registration and probes the
+exact owner's `/health`. Each registry/HTTP probe has a one-second budget.
+Concurrent requests for one owner share its probe, and completed results have a
+two-second cooldown. During a confirmed reachability failure, later requests
+return 503 with `execution_outcome=not_sent` without hitting the owner. A failed
+health check alone never declares the session permanently lost. Probe state is
+bounded to 256 owners per gateway process; at capacity, additional checks remain
+inconclusive rather than guessing that an owner is dead.
+
+If the owner is reachable, Podman command/close failures also trigger the
+read-only `GET /sessions/{container_id}` endpoint. It reports whether the exact
+container exists and is running; it does not execute a command, restart a
+container, or create a replacement. Session checks share a 16-request concurrency
+limit and a one-second budget including queue time. Confirmed loss returns 410
+with `code=sandbox_lost` and `recoverable=false`; a stopped container has reason
+`container_stopped`, an absent container has reason `unknown`, and retained
+watchdog reasons are preserved. Loss of the registered owner retains the existing
+`410 affinity_owner_lost` contract.
+
+Old servers without the session endpoint, registry failures, ambiguous responses,
+and probe timeouts remain inconclusive. The original transport error is returned.
+Strict affinity never changes owners. These checks do not diagnose filesystem
+corruption or choose a training reward/episode policy. The client exception is the
+boundary for callers handling confirmed loss.

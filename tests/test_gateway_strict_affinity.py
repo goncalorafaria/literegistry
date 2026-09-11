@@ -565,7 +565,7 @@ def test_strict_affinity_rechecks_registration_after_request_failure():
 
         assert status == 503
         assert "unavailable" in response["error"]
-        assert len(transport.calls) == calls_before + 2
+        assert len(transport.calls) == calls_before + 1
         assert registry.model_forces == [False, True]
 
     with tempfile.TemporaryDirectory() as root:

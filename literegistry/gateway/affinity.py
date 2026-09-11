@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
+import json
 import logging
 import os
 import re
@@ -12,6 +14,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Protocol
 from urllib.parse import urlsplit, urlunsplit
+
+import aiohttp
 
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -131,6 +135,29 @@ class RegistryPinnedTransport:
             )
 
 
+    async def probe(self, server_uri: str, endpoint: str, timeout: float) -> tuple[int, Any]:
+        """Bounded read-only request to the same owner; never follow redirects."""
+        request_uri = same_host_loopback_uri(
+            server_uri, aliases=self.host_aliases, loopback_host=self.loopback_host
+        )
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+            async with session.get(
+                f"{request_uri.rstrip('/')}/{endpoint}", allow_redirects=False
+            ) as response:
+                raw = await response.content.read(16_385)
+                if len(raw) > 16_384:
+                    return response.status, None
+                try:
+                    body = json.loads(raw)
+                except (ValueError, UnicodeDecodeError):
+                    body = None
+                return response.status, body
+
+
+class _TransportFailure(GatewayRequestError):
+    """No upstream application response; execution may already have happened."""
+
+
 @dataclass(frozen=True)
 class SelectedServer:
     server_id: str
@@ -146,11 +173,26 @@ class StrictAffinityGateway:
         bindings: StrictAffinityBindingStore,
         retry: Optional[RetryConfig] = None,
         transport: Optional[PinnedTransport] = None,
+        *,
+        probe_timeout: float = 1.0,
+        probe_cooldown: float = 2.0,
+        max_owner_probes: int = 256,
     ) -> None:
         self.registry = registry
         self.bindings = bindings
         self.retry = retry or RetryConfig()
         self.transport = transport or RegistryPinnedTransport(registry)
+        if not (0 < probe_timeout < float("inf") and 0 < probe_cooldown < float("inf")):
+            raise ValueError("probe timeout and cooldown must be positive and finite")
+        if max_owner_probes < 1:
+            raise ValueError("max_owner_probes must be positive")
+        self.probe_timeout = probe_timeout
+        self.probe_cooldown = probe_cooldown
+        self.max_owner_probes = max_owner_probes
+        self._owner_probes: OrderedDict[
+            tuple[str, str, str], tuple[float, asyncio.Task[str]]
+        ] = OrderedDict()
+        self._session_probe_slots = asyncio.Semaphore(16)
 
     @staticmethod
     async def _payload(request: Request) -> dict[str, Any]:
@@ -253,11 +295,130 @@ class StrictAffinityGateway:
             )
         except HTTPResponseError:
             raise
-        except (asyncio.TimeoutError, OSError, RuntimeError) as exc:
-            raise GatewayRequestError(
-                "strict affinity server is unavailable",
-                status_code=503,
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+            if isinstance(exc, asyncio.TimeoutError):
+                status, code = 504, "affinity_upstream_timeout"
+            elif isinstance(exc, aiohttp.ClientConnectorError) or not isinstance(exc, aiohttp.ClientError):
+                status, code = 503, "affinity_owner_unavailable"
+            else:
+                status, code = 502, "affinity_upstream_disconnected"
+            raise _TransportFailure(
+                "strict affinity upstream is unavailable",
+                status_code=status,
+                response_body={
+                    "error": "strict affinity upstream is unavailable",
+                    "code": code,
+                    "execution_outcome": (
+                        "not_sent" if isinstance(exc, aiohttp.ClientConnectorError) else "unknown"
+                    ),
+                },
             ) from exc
+
+    @staticmethod
+    def _owner_key(service: str, binding: StrictAffinityBinding) -> tuple[str, str, str]:
+        return service, binding.server_id, binding.server_uri
+
+    @staticmethod
+    def _owner_lost() -> GatewayRequestError:
+        return GatewayRequestError(
+            "strict affinity server is no longer registered", status_code=410,
+            response_body={"error": "strict affinity server is no longer registered",
+                           "code": "affinity_owner_lost", "recoverable": False},
+        )
+
+    def _cached_owner_state(self, service: str, binding: StrictAffinityBinding) -> Optional[str]:
+        entry = self._owner_probes.get(self._owner_key(service, binding))
+        if entry is not None:
+            expires, task = entry
+            if expires > time.monotonic() and task.done() and not task.cancelled():
+                return task.result()
+        return None
+
+    async def _probe_owner(self, service: str, binding: StrictAffinityBinding) -> str:
+        key = self._owner_key(service, binding)
+        now = time.monotonic()
+        entry = self._owner_probes.get(key)
+        if entry is not None and (entry[0] > now or not entry[1].done()):
+            return await asyncio.shield(entry[1])
+        self._owner_probes.pop(key, None)
+        # Never evict a running probe: waiters must share the same operation.
+        for old_key, (expires, task) in list(self._owner_probes.items()):
+            if task.done() and (expires <= now or len(self._owner_probes) >= self.max_owner_probes):
+                self._owner_probes.pop(old_key)
+        if len(self._owner_probes) >= self.max_owner_probes:
+            return "unknown"
+
+        async def check() -> str:
+            try:
+                await asyncio.wait_for(
+                    self._ensure_active(service, binding, force=True), self.probe_timeout
+                )
+            except GatewayRequestError as exc:
+                if exc.status_code == 410:
+                    return "lost"
+                raise
+            probe = getattr(self.transport, "probe", None)
+            if probe is None:
+                return "unknown"  # Compatibility with custom POST-only transports.
+            try:
+                status, _ = await asyncio.wait_for(
+                    probe(binding.server_uri, "health", self.probe_timeout), self.probe_timeout
+                )
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+                return "unavailable"
+            if status == 200:
+                return "healthy"
+            return "unavailable" if status == 503 else "unknown"
+
+        async def bounded_check() -> str:
+            try:
+                outcome = await asyncio.wait_for(check(), 2 * self.probe_timeout)
+            except Exception:
+                # A failed/slow registry read cannot prove permanent owner loss.
+                outcome = "unknown"
+            # Cooldown starts on completion, not while the probe is running.
+            self._owner_probes[key] = (time.monotonic() + self.probe_cooldown, asyncio.current_task())
+            logger.warning(
+                "gateway_affinity mode=strict event=owner_probe service=%r "
+                "server_id=%r server_uri=%r outcome=%s",
+                service, binding.server_id, binding.server_uri, outcome,
+            )
+            return outcome
+
+        task = asyncio.create_task(bounded_check())
+        self._owner_probes[key] = (now + self.probe_cooldown, task)
+        return await asyncio.shield(task)
+
+    async def _probe_session(
+        self, binding: StrictAffinityBinding, container_id: str
+    ) -> Optional[dict[str, Any]]:
+        probe = getattr(self.transport, "probe", None)
+        # Podman IDs are canonical; never interpolate arbitrary affinity IDs into URLs.
+        if probe is None or re.fullmatch(r"[0-9a-f]{64}", container_id) is None:
+            return None
+
+        async def check():
+            async with self._session_probe_slots:
+                return await probe(binding.server_uri, f"sessions/{container_id}", self.probe_timeout)
+
+        try:
+            status, body = await asyncio.wait_for(check(), self.probe_timeout)
+        except Exception:
+            return None
+        if not isinstance(body, dict):
+            return None
+        detail = body.get("detail", body)
+        if not isinstance(detail, dict):
+            return None
+        if (status == 410 and detail.get("code") == "sandbox_lost"
+                and detail.get("recoverable") is False
+                and detail.get("container_id") == container_id):
+            return detail
+        if (status == 404 and detail.get("error") == "container_not_found"
+                and detail.get("container_id") == container_id):
+            return {"code": "sandbox_lost", "reason": "unknown",
+                    "container_id": container_id, "recoverable": False}
+        return None
 
     async def handshake(self, request: Request) -> Response:
         request_id = _request_id(request)
@@ -422,53 +583,33 @@ class StrictAffinityGateway:
                 raise
             liveness_check = "forced_refresh"
 
+        owner_state = self._cached_owner_state(service, binding)
+        if owner_state == "lost":
+            raise self._owner_lost()
+        if owner_state == "unavailable":
+            raise GatewayRequestError(
+                "strict affinity owner is temporarily unavailable", status_code=503,
+                response_body={"error": "strict affinity owner is temporarily unavailable",
+                               "code": "affinity_owner_unavailable",
+                               "execution_outcome": "not_sent", "request_id": request_id},
+            )
         try:
-            # The binding supplies the exact URI after the cached liveness check.
-            # Strict affinity never substitutes another replica.
-            result = await self._post(
-                service,
-                binding.server_uri,
-                endpoint,
-                forwarded,
-            )
-        except GatewayRequestError as exc:
-            if exc.status_code != 503:
-                raise
-            # Only a failed cached route forces fresh discovery. If the
-            # replica is still registered, retry once for transient failures.
-            logger.warning(
-                "gateway_affinity mode=strict event=route_retry "
-                "request_id=%s service=%r affinity_id=%r endpoint=%r "
-                "server_id=%r server_uri=%r reason=backend_unavailable",
-                request_id,
-                service,
-                affinity_id,
-                endpoint,
-                binding.server_id,
-                binding.server_uri,
-            )
-            liveness_check = "forced_refresh"
-            try:
-                await self._ensure_active(service, binding, force=True)
-                result = await self._post(
-                    service,
-                    binding.server_uri,
-                    endpoint,
-                    forwarded,
-                )
-            except GatewayRequestError:
-                logger.warning(
-                    "gateway_affinity mode=strict event=route_failed "
-                    "request_id=%s service=%r affinity_id=%r endpoint=%r "
-                    "server_id=%r server_uri=%r",
-                    request_id,
-                    service,
-                    affinity_id,
-                    endpoint,
-                    binding.server_id,
-                    binding.server_uri,
-                )
-                raise
+            # A pinned command is sent once. A lost response is not permission
+            # to replay a potentially side-effecting command.
+            result = await self._post(service, binding.server_uri, endpoint, forwarded)
+        except _TransportFailure as exc:
+            owner_state = await self._probe_owner(service, binding)
+            if owner_state == "lost":
+                raise self._owner_lost() from exc
+            if owner_state == "healthy" and endpoint.strip("/") in {"podman", "close"}:
+                loss = await self._probe_session(binding, affinity_id)
+                if loss is not None:
+                    raise GatewayRequestError(
+                        "strict affinity sandbox is lost", status_code=410,
+                        response_body=loss,
+                    ) from exc
+            exc.response_body["request_id"] = request_id
+            raise
 
         if endpoint.strip("/") == "close":
             await self.bindings.release(service, affinity_id)

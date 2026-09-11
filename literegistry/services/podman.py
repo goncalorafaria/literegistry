@@ -1144,6 +1144,43 @@ def create_app(
             "image_prune_until": service.backend.config.image_prune_until,
         }
 
+    @app.get("/sessions/{container_id}")
+    async def session_status(container_id: str) -> dict[str, Any]:
+        """Read-only liveness check; never restart or replace a container."""
+        try:
+            SessionRequest(container_id=container_id).selected_container_id()
+            await service.backend._require_owned(container_id)
+            exists = await service.backend._run(
+                [*service.backend._podman, "container", "exists", container_id], timeout=15.0
+            )
+            if exists.returncode == 1:
+                raise SessionNotFound(container_id)
+            if exists.returncode != 0:
+                raise PodmanBackendError("could not check container existence")
+            state = await service.backend._run(
+                [*service.backend._podman, "inspect", "--format", "{{.State.Running}}", container_id],
+                timeout=15.0,
+            )
+            await service.backend._require_owned(container_id)
+            if state.returncode != 0 or state.stdout.strip() not in {b"true", b"false"}:
+                raise PodmanBackendError("could not check container state")
+            if state.stdout.strip() == b"false":
+                raise HTTPException(status_code=410, detail={
+                    "code": "sandbox_lost", "reason": "container_stopped",
+                    "container_id": container_id, "recoverable": False,
+                })
+            return {"container_id": container_id, "status": "active"}
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="invalid container ID") from exc
+        except SessionLost as exc:
+            raise HTTPException(status_code=410, detail=exc.termination.response_body()) from exc
+        except SessionNotFound as exc:
+            raise HTTPException(status_code=404, detail={
+                "error": "container_not_found", "container_id": container_id,
+            }) from exc
+        except (PodmanBackendError, asyncio.TimeoutError) as exc:
+            raise HTTPException(status_code=503, detail="session state is unavailable") from exc
+
     @app.post("/handshake", response_model=HandshakeResponse)
     async def handshake(request: Optional[HandshakeRequest] = None) -> HandshakeResponse:
         try:
