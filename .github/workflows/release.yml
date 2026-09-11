@@ -1,8 +1,27 @@
-name: Publish LiteRegistry packages to PyPI
+name: Release LiteRegistry package
 
 on:
-  release:
-    types: [published]
+  workflow_dispatch:
+    inputs:
+      package:
+        description: Package to release
+        required: true
+        type: choice
+        options:
+          - literegistry
+          - literegistry-tool-client
+          - literegistry-podman-client
+          - literegistry-podman-beaker
+          - literegistry-base-deployment
+      bump:
+        description: Version component to increment
+        required: true
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
 
 permissions:
   contents: read
@@ -12,15 +31,159 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
-    name: Build distribution
+  prepare:
+    name: Bump version and create tag
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     outputs:
-      project: ${{ steps.package.outputs.project }}
+      commit: ${{ steps.commit.outputs.commit }}
+      directory: ${{ steps.version.outputs.directory }}
+      project: ${{ steps.version.outputs.project }}
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
 
     steps:
-      - name: Checkout
+      - name: Checkout default branch
         uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Bump selected package version
+        id: version
+        env:
+          PACKAGE: ${{ inputs.package }}
+          BUMP: ${{ inputs.bump }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          packages = {
+              "literegistry": {
+                  "directory": ".",
+                  "metadata_file": "setup.py",
+                  "tag_prefix": "v",
+              },
+              "literegistry-tool-client": {
+                  "directory": "literegistry_tool_client",
+                  "metadata_file": "literegistry_tool_client/pyproject.toml",
+                  "tag_prefix": "literegistry-tool-client-v",
+              },
+              "literegistry-podman-client": {
+                  "directory": "literegistry_podman_client",
+                  "metadata_file": "literegistry_podman_client/pyproject.toml",
+                  "tag_prefix": "literegistry-podman-client-v",
+              },
+              "literegistry-podman-beaker": {
+                  "directory": "literegistry_podman_beaker",
+                  "metadata_file": "literegistry_podman_beaker/pyproject.toml",
+                  "tag_prefix": "literegistry-podman-beaker-v",
+              },
+              "literegistry-base-deployment": {
+                  "directory": "literegistry_base_deployment",
+                  "metadata_file": "literegistry_base_deployment/pyproject.toml",
+                  "tag_prefix": "literegistry-base-deployment-v",
+              },
+          }
+
+          project = os.environ["PACKAGE"]
+          bump = os.environ["BUMP"]
+          package = packages[project]
+          metadata_path = Path(package["metadata_file"])
+          contents = metadata_path.read_text()
+          version_pattern = re.compile(
+              r'(?m)^(\s*version\s*=\s*")([^"]+)(".*)$'
+          )
+          match = version_pattern.search(contents)
+          if match is None:
+              raise SystemExit(f"Could not find version in {metadata_path}")
+
+          current_version = match.group(2)
+          parts = current_version.split(".")
+          if len(parts) != 3 or not all(part.isdigit() for part in parts):
+              raise SystemExit(
+                  f"Automatic bumps require X.Y.Z versions; found {current_version}"
+              )
+
+          major, minor, patch = map(int, parts)
+          if bump == "major":
+              next_version = f"{major + 1}.0.0"
+          elif bump == "minor":
+              next_version = f"{major}.{minor + 1}.0"
+          elif bump == "patch":
+              next_version = f"{major}.{minor}.{patch + 1}"
+          else:
+              raise SystemExit(f"Unsupported bump: {bump}")
+
+          updated_contents, replacements = version_pattern.subn(
+              lambda version_match: (
+                  version_match.group(1)
+                  + next_version
+                  + version_match.group(3)
+              ),
+              contents,
+              count=1,
+          )
+          if replacements != 1:
+              raise SystemExit(
+                  f"Expected one version replacement in {metadata_path}; "
+                  f"made {replacements}"
+              )
+          metadata_path.write_text(updated_contents)
+
+          tag = f"{package['tag_prefix']}{next_version}"
+          outputs = {
+              "directory": package["directory"],
+              "metadata_file": package["metadata_file"],
+              "project": project,
+              "tag": tag,
+              "version": next_version,
+          }
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              for key, value in outputs.items():
+                  print(f"{key}={value}", file=output)
+
+          print(f"Preparing {project} {current_version} -> {next_version}")
+          PY
+
+      - name: Commit version and push tag
+        id: commit
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          METADATA_FILE: ${{ steps.version.outputs.metadata_file }}
+          PROJECT: ${{ steps.version.outputs.project }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "${METADATA_FILE}"
+          git commit -m "Release ${PROJECT} ${RELEASE_VERSION}"
+          git tag -a "${RELEASE_TAG}" -m "${PROJECT} ${RELEASE_VERSION}"
+          git push --atomic origin "HEAD:${DEFAULT_BRANCH}" "refs/tags/${RELEASE_TAG}"
+          echo "commit=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+
+  build:
+    name: Build and validate distribution
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          persist-credentials: false
 
       - name: Setup Python
         uses: actions/setup-python@v6
@@ -30,62 +193,16 @@ jobs:
       - name: Install build tools
         run: python -m pip install --upgrade build twine
 
-      - name: Select package from release tag
-        id: package
-        shell: bash
-        run: |
-          case "${GITHUB_REF_NAME}" in
-            literegistry-tool-client-v*)
-              project="literegistry-tool-client"
-              directory="literegistry_tool_client"
-              tag_prefix="literegistry-tool-client-v"
-              ;;
-            literegistry-podman-client-v*)
-              project="literegistry-podman-client"
-              directory="literegistry_podman_client"
-              tag_prefix="literegistry-podman-client-v"
-              ;;
-            literegistry-podman-beaker-v*)
-              project="literegistry-podman-beaker"
-              directory="literegistry_podman_beaker"
-              tag_prefix="literegistry-podman-beaker-v"
-              ;;
-            literegistry-base-deployment-v*)
-              project="literegistry-base-deployment"
-              directory="literegistry_base_deployment"
-              tag_prefix="literegistry-base-deployment-v"
-              ;;
-            literegistry-v*)
-              project="literegistry"
-              directory="."
-              tag_prefix="literegistry-v"
-              ;;
-            v*)
-              project="literegistry"
-              directory="."
-              tag_prefix="v"
-              ;;
-            *)
-              echo "Unsupported release tag: ${GITHUB_REF_NAME}"
-              echo "See .github/workflows/release.yml for the accepted tag prefixes."
-              exit 1
-              ;;
-          esac
-
-          echo "project=${project}" >> "${GITHUB_OUTPUT}"
-          echo "directory=${directory}" >> "${GITHUB_OUTPUT}"
-          echo "tag_version=${GITHUB_REF_NAME#${tag_prefix}}" >> "${GITHUB_OUTPUT}"
-
       - name: Build package
-        run: python -m build --outdir dist "${{ steps.package.outputs.directory }}"
+        run: python -m build --outdir dist "${{ needs.prepare.outputs.directory }}"
 
       - name: Validate package metadata
         run: python -m twine check dist/*
 
-      - name: Verify release tag matches built package
+      - name: Verify built package
         env:
-          EXPECTED_PROJECT: ${{ steps.package.outputs.project }}
-          EXPECTED_VERSION: ${{ steps.package.outputs.tag_version }}
+          EXPECTED_PROJECT: ${{ needs.prepare.outputs.project }}
+          EXPECTED_VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           python - <<'PY'
           import email
@@ -114,7 +231,7 @@ jobs:
 
           if actual_project != expected_project or actual_version != expected_version:
               raise SystemExit(
-                  "Release tag does not match the built distribution: "
+                  "Built distribution does not match the requested release: "
                   f"expected {expected_project}=={expected_version}, "
                   f"built {actual_project}=={actual_version}"
               )
@@ -131,11 +248,13 @@ jobs:
 
   publish:
     name: Publish to PyPI
-    needs: build
+    needs:
+      - prepare
+      - build
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/project/${{ needs.build.outputs.project }}/
+      url: https://pypi.org/project/${{ needs.prepare.outputs.project }}/
     permissions:
       id-token: write
 
@@ -148,3 +267,26 @@ jobs:
 
       - name: Publish package distributions to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    name: Create GitHub Release
+    needs:
+      - prepare
+      - publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROJECT: ${{ needs.prepare.outputs.project }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          gh release create "${RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --title "${PROJECT} ${RELEASE_VERSION}" \
+            --generate-notes
