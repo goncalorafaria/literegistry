@@ -1,0 +1,150 @@
+name: Publish LiteRegistry packages to PyPI
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pypi-publish
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build distribution
+    runs-on: ubuntu-latest
+    outputs:
+      project: ${{ steps.package.outputs.project }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: python -m pip install --upgrade build twine
+
+      - name: Select package from release tag
+        id: package
+        shell: bash
+        run: |
+          case "${GITHUB_REF_NAME}" in
+            literegistry-tool-client-v*)
+              project="literegistry-tool-client"
+              directory="literegistry_tool_client"
+              tag_prefix="literegistry-tool-client-v"
+              ;;
+            literegistry-podman-client-v*)
+              project="literegistry-podman-client"
+              directory="literegistry_podman_client"
+              tag_prefix="literegistry-podman-client-v"
+              ;;
+            literegistry-podman-beaker-v*)
+              project="literegistry-podman-beaker"
+              directory="literegistry_podman_beaker"
+              tag_prefix="literegistry-podman-beaker-v"
+              ;;
+            literegistry-base-deployment-v*)
+              project="literegistry-base-deployment"
+              directory="literegistry_base_deployment"
+              tag_prefix="literegistry-base-deployment-v"
+              ;;
+            literegistry-v*)
+              project="literegistry"
+              directory="."
+              tag_prefix="literegistry-v"
+              ;;
+            v*)
+              project="literegistry"
+              directory="."
+              tag_prefix="v"
+              ;;
+            *)
+              echo "Unsupported release tag: ${GITHUB_REF_NAME}"
+              echo "See .github/workflows/release.yml for the accepted tag prefixes."
+              exit 1
+              ;;
+          esac
+
+          echo "project=${project}" >> "${GITHUB_OUTPUT}"
+          echo "directory=${directory}" >> "${GITHUB_OUTPUT}"
+          echo "tag_version=${GITHUB_REF_NAME#${tag_prefix}}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build package
+        run: python -m build --outdir dist "${{ steps.package.outputs.directory }}"
+
+      - name: Validate package metadata
+        run: python -m twine check dist/*
+
+      - name: Verify release tag matches built package
+        env:
+          EXPECTED_PROJECT: ${{ steps.package.outputs.project }}
+          EXPECTED_VERSION: ${{ steps.package.outputs.tag_version }}
+        run: |
+          python - <<'PY'
+          import email
+          import glob
+          import os
+          import zipfile
+
+          wheels = glob.glob("dist/*.whl")
+          if len(wheels) != 1:
+              raise SystemExit(f"Expected one wheel, found: {wheels}")
+
+          with zipfile.ZipFile(wheels[0]) as wheel:
+              metadata_paths = [
+                  name for name in wheel.namelist() if name.endswith(".dist-info/METADATA")
+              ]
+              if len(metadata_paths) != 1:
+                  raise SystemExit(
+                      f"Expected one METADATA file, found: {metadata_paths}"
+                  )
+              metadata = email.message_from_bytes(wheel.read(metadata_paths[0]))
+
+          actual_project = metadata["Name"]
+          actual_version = metadata["Version"]
+          expected_project = os.environ["EXPECTED_PROJECT"]
+          expected_version = os.environ["EXPECTED_VERSION"]
+
+          if actual_project != expected_project or actual_version != expected_version:
+              raise SystemExit(
+                  "Release tag does not match the built distribution: "
+                  f"expected {expected_project}=={expected_version}, "
+                  f"built {actual_project}=={actual_version}"
+              )
+
+          print(f"Verified {actual_project}=={actual_version}")
+          PY
+
+      - name: Upload distribution artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: python-distributions
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/${{ needs.build.outputs.project }}/
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download distribution artifact
+        uses: actions/download-artifact@v6
+        with:
+          name: python-distributions
+          path: dist/
+
+      - name: Publish package distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
