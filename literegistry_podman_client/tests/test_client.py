@@ -250,3 +250,105 @@ def test_fire_cli_dispatches_ai2_hello(monkeypatch) -> None:
     assert calls == [
         ("http://gateway.example:8080", "ubuntu:24.04", "/work", "fire-test")
     ]
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("code,reason,status", [
+    ("sandbox_lost", "memory_limit", 410),
+    ("sandbox_lost", "pids_limit", 410),
+    ("affinity_owner_lost", "affinity_owner_lost", 410),
+    ("container_not_found", "unknown", 404),
+])
+def test_loss_envelopes_close_session_without_retry_or_rehandshake(nested, code, reason, status):
+    async def scenario():
+        detail = ({"error": code, "container_id": "a"*64} if status == 404 else
+                  {"code": code, "reason": reason, "recoverable": False,
+                   "container_id": "a"*64, "limit": 4, "observed": 5,
+                   "unit": "tasks", "enforcement": "userspace_watchdog"})
+        body = {"detail": detail} if nested else detail
+        calls = []
+        async def respond(request):
+            calls.append(request.path)
+            if request.path.endswith("handshake"):
+                return web.json_response({"affinity_id": "a"*64, "container_id": "a"*64,
+                                          "instance_id": "replica", "image": "ubuntu"})
+            return web.json_response(body, status=status)
+        app = web.Application()
+        app.router.add_post("/affinity/{endpoint}", respond)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        client = PodmanClient(f"http://127.0.0.1:{port}")
+        try:
+            async with client.session() as session:
+                with pytest.raises(PodmanContainerLostError) as first:
+                    await session.execute("allocate")
+                assert first.value.reason == reason
+                assert first.value.container_id == "a"*64
+                assert first.value.response == body
+                assert first.value.recoverable is False
+                assert session.closed
+                if status == 410:
+                    assert (first.value.limit, first.value.observed) == (4, 5)
+                with pytest.raises(PodmanContainerLostError) as second:
+                    await session.execute("echo continue")
+                assert second.value is first.value
+                assert await session.close() is None
+            assert calls == ["/affinity/handshake", "/affinity/podman"]
+        finally:
+            await client.aclose()
+            await runner.cleanup()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("status,body", [
+    (503, {"detail": "unavailable"}),
+    (404, {"error": "strict affinity binding was not found or has expired"}),
+    (410, {"code": "sandbox_lost", "recoverable": True}),
+    (410, {"code": "something_else", "recoverable": False}),
+])
+def test_unconfirmed_errors_do_not_become_terminal_loss(status, body):
+    async def scenario():
+        async def respond(request):
+            return web.json_response(body, status=status)
+        app = web.Application()
+        app.router.add_post("/affinity/podman", respond)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        client = PodmanClient(f"http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}")
+        session = PodmanSession(client=client, affinity_id="a"*64, container_id="a"*64,
+                                instance_id="replica", image="ubuntu")
+        try:
+            with pytest.raises(PodmanGatewayError) as error:
+                await session.execute("hello")
+            assert not isinstance(error.value, PodmanContainerLostError)
+            assert not session.closed
+        finally:
+            await client.aclose()
+            await runner.cleanup()
+    asyncio.run(scenario())
+
+
+def test_loss_during_close_does_not_mask_episode_error():
+    class LostCloseClient(RecordingClient):
+        async def close(self, affinity_id):
+            self.calls.append(("affinity/close", {}))
+            raise PodmanContainerLostError(status_code=410, response={
+                "code": "sandbox_lost", "reason": "pids_limit", "recoverable": False,
+            })
+    async def scenario():
+        client = LostCloseClient()
+        with pytest.raises(ValueError, match="episode failed"):
+            async with client.session() as session:
+                raise ValueError("episode failed")
+        assert session.closed
+        assert await session.close() is None
+        with pytest.raises(PodmanContainerLostError) as error:
+            await session.execute("hello")
+        assert error.value.reason == "pids_limit"
+        assert [call[0] for call in client.calls] == ["affinity/handshake", "affinity/close"]
+    asyncio.run(scenario())

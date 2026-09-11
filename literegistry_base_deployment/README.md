@@ -96,7 +96,7 @@ pip install literegistry-base-deployment
 
 ### 2. Make LiteRegistry available to Docker
 
-Every runtime image pins `literegistry==1.0.50` and installs this package.
+Every runtime image pins `literegistry==1.0.52` and installs this package.
 Publish that LiteRegistry version to the Python index
 used by Docker, or expose its wheel through an HTTP wheelhouse reachable from
 inside Docker:
@@ -105,7 +105,7 @@ inside Docker:
 cd /weka/gfaria/literegistry
 python -m build
 python -m twine check dist/*
-# python -m twine upload dist/literegistry-1.0.50*
+# python -m twine upload dist/literegistry-1.0.52*
 
 export PIP_INDEX_URL=https://python.example/simple
 # Or: export PIP_FIND_LINKS=https://python.example/wheels
@@ -137,7 +137,7 @@ literegistry-base-vllm:0.1.0
 The services image runs gateway, Python, or web search depending on its Beaker
 command. Terminal has every binary allowed by the restricted pipeline server.
 Local search is not rebuilt by default: the launcher targets the Beaker image
-`goncalof/jtc-local-search-lucene-bm25`, which must contain LiteRegistry 1.0.50
+`goncalof/jtc-local-search-lucene-bm25`, which must contain LiteRegistry 1.0.52
 or newer. vLLM uses
 `vllm/vllm-openai:latest` by default; pin or replace it when reproducibility
 requires a specific vLLM/CUDA combination. When web search is enabled, the

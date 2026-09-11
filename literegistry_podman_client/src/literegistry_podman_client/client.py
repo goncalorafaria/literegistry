@@ -31,13 +31,30 @@ class PodmanGatewayError(RuntimeError):
         self.response = response
 
 
+def _error_detail(response: Any) -> JsonObject:
+    if not isinstance(response, dict):
+        return {}
+    detail = response.get("detail")
+    return detail if isinstance(detail, dict) else response
+
+
 class PodmanContainerLostError(PodmanGatewayError):
-    """The affinity owner and its container are permanently unavailable."""
+    """A container is permanently unavailable; its episode cannot continue."""
 
     def __init__(self, *, status_code: int, response: Any) -> None:
+        detail = _error_detail(response)
+        self.code = detail.get("code", "sandbox_lost")
+        self.reason = detail.get("reason") or (
+            "affinity_owner_lost" if self.code == "affinity_owner_lost" else "unknown"
+        )
+        self.container_id = detail.get("container_id")
+        self.limit = detail.get("limit")
+        self.observed = detail.get("observed")
+        self.unit = detail.get("unit")
+        self.enforcement = detail.get("enforcement")
         super().__init__(
-            "the Podman container died with its affinity server and cannot be "
-            "recovered; create a new session and replay any required state",
+            f"the Podman container died or was lost ({self.reason}) and cannot be recovered; "
+            "end this episode before creating a new session",
             status_code=status_code,
             response=response,
         )
@@ -226,12 +243,17 @@ class PodmanClient:
             ) as response:
                 result = self._decode_json(await response.text())
                 if response.status >= 400:
-                    if (
+                    detail = _error_detail(result)
+                    confirmed_loss = (
                         response.status == 410
-                        and isinstance(result, dict)
-                        and result.get("code") == "affinity_owner_lost"
-                        and result.get("recoverable") is False
-                    ):
+                        and detail.get("code") in ("affinity_owner_lost", "sandbox_lost")
+                        and detail.get("recoverable") is False
+                    )
+                    legacy_missing = (
+                        response.status == 404
+                        and detail.get("error") == "container_not_found"
+                    )
+                    if confirmed_loss or legacy_missing:
                         raise PodmanContainerLostError(
                             status_code=response.status,
                             response=result,
@@ -387,6 +409,7 @@ class PodmanSession:
         self.instance_id = instance_id
         self.image = image
         self._closed = False
+        self._loss: PodmanContainerLostError | None = None
         self._close_lock = asyncio.Lock()
 
     @property
@@ -403,15 +426,24 @@ class PodmanSession:
         check: bool = False,
     ) -> CommandResult:
         """Execute one command in this session's container."""
+        if self._loss is not None:
+            raise self._loss
         if self.closed:
             raise PodmanGatewayError("cannot execute on a closed Podman session")
-        result = await self.client.execute(
-            self.affinity_id,
-            command,
-            stdin=stdin,
-            timeout=timeout,
-            workdir=workdir,
-        )
+        try:
+            result = await self.client.execute(
+                self.affinity_id,
+                command,
+                stdin=stdin,
+                timeout=timeout,
+                workdir=workdir,
+            )
+        except PodmanContainerLostError as exc:
+            self._loss = exc
+            self._closed = True
+            raise
+        if self._loss is not None:
+            raise self._loss
         return result.check_returncode() if check else result
 
     async def close(self) -> JsonObject | None:
@@ -419,7 +451,13 @@ class PodmanSession:
         async with self._close_lock:
             if self._closed:
                 return None
-            response = await self.client.close(self.affinity_id)
+            try:
+                response = await self.client.close(self.affinity_id)
+            except PodmanContainerLostError as exc:
+                # Already gone: cleanup must not hide the episode's original error.
+                self._loss = exc
+                self._closed = True
+                return None
             self._closed = True
             return response
 

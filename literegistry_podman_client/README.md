@@ -137,6 +137,47 @@ python literegistry_podman_client/examples/ai2_hello.py \
   --gateway "$PODMAN_GATEWAY_URL"
 ```
 
+## Terminal sandbox loss
+
+With client 0.1.4, `PodmanContainerLostError` signals that the current sandbox
+cannot be used again. Catch it at the episode boundary; do not silently create a
+replacement container and continue the same episode. The client does not
+re-handshake automatically.
+
+```python
+from literegistry_podman_client import PodmanContainerLostError
+
+try:
+    result = await session.execute(command)
+except PodmanContainerLostError as exc:
+    # End or discard this episode according to the training policy.
+    # A fresh session belongs to a new episode.
+    print(exc.reason, exc.limit, exc.observed, exc.enforcement)
+    raise
+```
+
+A confirmed loss marks `PodmanSession.closed` true. Later `execute()` calls raise
+the same typed error locally, and `close()` is a no-op. An already-lost response
+during close is also treated as successful cleanup. Low-level
+`client.execute(affinity_id, ...)` raises the typed error but retains no per-session
+state; callers using that API must stop submitting commands for the lost ID.
+
+LiteRegistry 1.0.52 returns HTTP 410 with a `detail` object containing
+`code="sandbox_lost"`, `recoverable=false`, the container ID, and the watchdog
+reason (`memory_limit` or `pids_limit`). `limit`, `observed`, and `unit` carry the
+confirmed measurement; `enforcement="userspace_watchdog"` distinguishes this from
+a kernel OOM. Memory observations are approximate aggregate RSS, not native
+cgroup accounting.
+
+Reasons are retained in memory on the owning replica for one hour, capped at
+10,000 records. They are lost on replica restart or eviction. The client also
+recognizes gateway `410 affinity_owner_lost` and legacy structured
+`404 container_not_found` responses, including FastAPI's `detail` envelope.
+Legacy missing-container responses have reason `unknown`, not `memory_limit`.
+Generic 404/503 responses and ordinary command failures remain gateway/command
+errors; they do not prove permanent sandbox loss. In-flight requests already
+sent before a loss is observed cannot be recalled.
+
 ## Explicit lifecycle
 
 Handshake, execute, and close are all async. The affinity ID returned by the
