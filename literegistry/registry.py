@@ -34,23 +34,25 @@ class ServerRegistry:
         servers = []
         now = time.time()
 
-        # Get all server keys
-        try:
-            server_keys = await self.store.keys(prefix="server_")
-        except TypeError:
-            # Compatibility with third-party stores implementing the original
-            # no-argument keys() contract.
-            server_keys = [
-                key for key in await self.store.keys()
-                if key.startswith("server_")
-            ]
+        indexed_keys = getattr(self.store, "active_server_keys", None)
+        if indexed_keys is not None:
+            server_keys = await indexed_keys(now - self.max_heartbeat_interval)
+        else:
+            try:
+                server_keys = await self.store.keys(prefix="server_")
+            except TypeError:
+                # Compatibility with the original no-argument keys() contract.
+                server_keys = [
+                    key for key in await self.store.keys()
+                    if key.startswith("server_")
+                ]
 
         for key in server_keys:
             try:
                 info_bytes = await self.store.get(key)
                 if info_bytes:
                     info = json.loads(info_bytes.decode("utf-8"))
-                    # Mark servers that haven't sent heartbeat in 30 seconds as inactive
+                    # Recheck liveness in case the record changed after index lookup.
                     if now - info["last_heartbeat"] > self.max_heartbeat_interval:
                         info["status"] = "inactive"
                         # Optionally delete inactive servers
@@ -61,6 +63,12 @@ class ServerRegistry:
                 continue
 
         return {"servers": servers}
+
+    async def _write_server(self, key: str, info: Dict[str, Any]):
+        indexed_set = getattr(self.store, "set_server", None)
+        if indexed_set is not None:
+            return await indexed_set(key, json.dumps(info), info["last_heartbeat"])
+        return await self.store.set(key, json.dumps(info))
 
     async def register_server(
         self, url: str, port: int, metadata: Optional[Dict] = None,
@@ -80,7 +88,7 @@ class ServerRegistry:
         }
 
         key = f"server_{self.server_id}"
-        await self.store.set(key, json.dumps(info))
+        await self._write_server(key, info)
         return self.server_id
 
     async def heartbeat(self, url: str, port: int, data: Optional[Dict] = None):
@@ -94,7 +102,7 @@ class ServerRegistry:
                 if data:
                     info["data"] = data
                 info["last_heartbeat"] = time.time()
-                await self.store.set(key, json.dumps(info))
+                await self._write_server(key, info)
             else:
                 # Re-register if key disappeared
                 await self.register_server(url, port, self._metadata)
@@ -105,7 +113,8 @@ class ServerRegistry:
     async def deregister(self):
         """Remove server from registry"""
         key = f"server_{self.server_id}"
-        await self.store.delete(key)
+        delete_server = getattr(self.store, "delete_server", self.store.delete)
+        await delete_server(key)
 
 
 # Example usage

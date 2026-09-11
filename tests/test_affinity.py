@@ -60,7 +60,8 @@ class FakeRedis:
         self.values[key.encode()] = value
         return True
 
-    async def scan_iter(self, match):
+    async def scan_iter(self, match, count):
+        assert count == 64
         self.scan_matches.append(match)
         prefix = match.removesuffix("*").encode()
         for key in self.values:

@@ -58,7 +58,8 @@ class _MemoryRedis:
         self._expire(key)
         return int(key in self.values)
 
-    async def scan_iter(self, match: str = "*"):
+    async def scan_iter(self, match: str = "*", count: int = 64):
+        assert count == 64
         prefix = match[:-1] if match.endswith("*") else match
         for key in list(self.values):
             self._expire(key)

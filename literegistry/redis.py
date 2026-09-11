@@ -44,6 +44,8 @@ def redact_redis_url(url: str) -> str:
 
 class RedisKVStore(KeyValueStore):
     """Redis-based key-value store"""
+    SERVER_HEARTBEATS_KEY = "literegistry:server_heartbeats:v1"
+
     #  http://klone-login01.hyak.local:8080/v1/models
     def __init__(
         self,
@@ -142,6 +144,51 @@ class RedisKVStore(KeyValueStore):
                 raise
             return False
 
+    async def set_server(self, key: str, value: str, last_heartbeat: float) -> bool:
+        """Atomically persist a server record and its heartbeat index entry."""
+        redis_client = await self._get_redis()
+        try:
+            async with redis_client.pipeline(transaction=True) as pipe:
+                pipe.set(key, value.encode("utf-8"))
+                pipe.zadd(self.SERVER_HEARTBEATS_KEY, {key: last_heartbeat})
+                await pipe.execute()
+            return True
+        except Exception:
+            if self.raise_on_error:
+                raise
+            return False
+
+    async def delete_server(self, key: str) -> bool:
+        """Atomically remove a server record and its heartbeat index entry."""
+        redis_client = await self._get_redis()
+        try:
+            async with redis_client.pipeline(transaction=True) as pipe:
+                pipe.delete(key)
+                pipe.zrem(self.SERVER_HEARTBEATS_KEY, key)
+                result = await pipe.execute()
+            return result[0] > 0
+        except Exception:
+            if self.raise_on_error:
+                raise
+            return False
+
+    async def active_server_keys(self, min_heartbeat: float) -> List[str]:
+        """Select active servers without traversing unrelated Redis keys.
+
+        Retain older entries: different readers can use different heartbeat
+        intervals. Registration and every heartbeat populate the index.
+        """
+        redis_client = await self._get_redis()
+        try:
+            keys = await redis_client.zrangebyscore(
+                self.SERVER_HEARTBEATS_KEY, min_heartbeat, "+inf"
+            )
+            return [key.decode("utf-8") if isinstance(key, bytes) else key for key in keys]
+        except Exception:
+            if self.raise_on_error:
+                raise
+            return []
+
     async def exists(self, key: str) -> bool:
         """Check if key exists in Redis"""
         redis_client = await self._get_redis()
@@ -159,7 +206,7 @@ class RedisKVStore(KeyValueStore):
         try:
             pattern = f"{prefix}*" if prefix is not None else "*"
             keys = []
-            async for key in redis_client.scan_iter(match=pattern):
+            async for key in redis_client.scan_iter(match=pattern, count=64):
                 keys.append(key.decode("utf-8") if isinstance(key, bytes) else key)
             return keys
         except Exception:
