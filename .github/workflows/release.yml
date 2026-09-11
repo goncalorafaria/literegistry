@@ -1,6 +1,39 @@
-name: Release LiteRegistry package
+name: Release LiteRegistry packages
 
 on:
+  push:
+    branches: [master]
+    paths:
+      - literegistry/**
+      - setup.py
+      - requirements.txt
+      - MANIFEST.in
+      - README.md
+      - LICENSE
+      - literegistry_tool_client/src/**
+      - literegistry_tool_client/pyproject.toml
+      - literegistry_tool_client/MANIFEST.in
+      - literegistry_tool_client/README.md
+      - literegistry_tool_client/LICENSE
+      - literegistry_podman_client/src/**
+      - literegistry_podman_client/pyproject.toml
+      - literegistry_podman_client/MANIFEST.in
+      - literegistry_podman_client/README.md
+      - literegistry_podman_client/LICENSE
+      - literegistry_podman_beaker/src/**
+      - literegistry_podman_beaker/docker/**
+      - literegistry_podman_beaker/scripts/**
+      - literegistry_podman_beaker/pyproject.toml
+      - literegistry_podman_beaker/MANIFEST.in
+      - literegistry_podman_beaker/README.md
+      - literegistry_podman_beaker/LICENSE
+      - literegistry_base_deployment/src/**
+      - literegistry_base_deployment/docker/**
+      - literegistry_base_deployment/scripts/**
+      - literegistry_base_deployment/pyproject.toml
+      - literegistry_base_deployment/MANIFEST.in
+      - literegistry_base_deployment/README.md
+      - literegistry_base_deployment/LICENSE
   workflow_dispatch:
     inputs:
       package:
@@ -32,22 +65,20 @@ concurrency:
 
 jobs:
   prepare:
-    name: Bump version and create tag
+    name: Prepare releases
+    if: github.event_name != 'push' || github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     outputs:
       commit: ${{ steps.commit.outputs.commit }}
-      directory: ${{ steps.version.outputs.directory }}
-      project: ${{ steps.version.outputs.project }}
-      tag: ${{ steps.version.outputs.tag }}
-      version: ${{ steps.version.outputs.version }}
+      releases: ${{ steps.version.outputs.releases }}
 
     steps:
-      - name: Checkout default branch
+      - name: Checkout release source
         uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.repository.default_branch }}
+          ref: ${{ github.event_name == 'push' && github.sha || github.event.repository.default_branch }}
           fetch-depth: 0
 
       - name: Setup Python
@@ -55,15 +86,20 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Bump selected package version
+      - name: Select packages and versions
         id: version
         env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
           PACKAGE: ${{ inputs.package }}
           BUMP: ${{ inputs.bump }}
         run: |
           python - <<'PY'
+          import json
           import os
           import re
+          import subprocess
           from pathlib import Path
 
           packages = {
@@ -71,108 +107,275 @@ jobs:
                   "directory": ".",
                   "metadata_file": "setup.py",
                   "tag_prefix": "v",
+                  "paths": [
+                      "literegistry/",
+                      "setup.py",
+                      "requirements.txt",
+                      "MANIFEST.in",
+                      "README.md",
+                      "LICENSE",
+                  ],
               },
               "literegistry-tool-client": {
                   "directory": "literegistry_tool_client",
                   "metadata_file": "literegistry_tool_client/pyproject.toml",
                   "tag_prefix": "literegistry-tool-client-v",
+                  "paths": [
+                      "literegistry_tool_client/src/",
+                      "literegistry_tool_client/pyproject.toml",
+                      "literegistry_tool_client/MANIFEST.in",
+                      "literegistry_tool_client/README.md",
+                      "literegistry_tool_client/LICENSE",
+                  ],
               },
               "literegistry-podman-client": {
                   "directory": "literegistry_podman_client",
                   "metadata_file": "literegistry_podman_client/pyproject.toml",
                   "tag_prefix": "literegistry-podman-client-v",
+                  "paths": [
+                      "literegistry_podman_client/src/",
+                      "literegistry_podman_client/pyproject.toml",
+                      "literegistry_podman_client/MANIFEST.in",
+                      "literegistry_podman_client/README.md",
+                      "literegistry_podman_client/LICENSE",
+                  ],
               },
               "literegistry-podman-beaker": {
                   "directory": "literegistry_podman_beaker",
                   "metadata_file": "literegistry_podman_beaker/pyproject.toml",
                   "tag_prefix": "literegistry-podman-beaker-v",
+                  "paths": [
+                      "literegistry_podman_beaker/src/",
+                      "literegistry_podman_beaker/docker/",
+                      "literegistry_podman_beaker/scripts/",
+                      "literegistry_podman_beaker/pyproject.toml",
+                      "literegistry_podman_beaker/MANIFEST.in",
+                      "literegistry_podman_beaker/README.md",
+                      "literegistry_podman_beaker/LICENSE",
+                  ],
               },
               "literegistry-base-deployment": {
                   "directory": "literegistry_base_deployment",
                   "metadata_file": "literegistry_base_deployment/pyproject.toml",
                   "tag_prefix": "literegistry-base-deployment-v",
+                  "paths": [
+                      "literegistry_base_deployment/src/",
+                      "literegistry_base_deployment/docker/",
+                      "literegistry_base_deployment/scripts/",
+                      "literegistry_base_deployment/pyproject.toml",
+                      "literegistry_base_deployment/MANIFEST.in",
+                      "literegistry_base_deployment/README.md",
+                      "literegistry_base_deployment/LICENSE",
+                  ],
               },
           }
-
-          project = os.environ["PACKAGE"]
-          bump = os.environ["BUMP"]
-          package = packages[project]
-          metadata_path = Path(package["metadata_file"])
-          contents = metadata_path.read_text()
           version_pattern = re.compile(
               r'(?m)^(\s*version\s*=\s*")([^"]+)(".*)$'
           )
-          match = version_pattern.search(contents)
-          if match is None:
-              raise SystemExit(f"Could not find version in {metadata_path}")
 
-          current_version = match.group(2)
-          parts = current_version.split(".")
-          if len(parts) != 3 or not all(part.isdigit() for part in parts):
-              raise SystemExit(
-                  f"Automatic bumps require X.Y.Z versions; found {current_version}"
-              )
+          def parse_version(contents, metadata_file):
+              match = version_pattern.search(contents)
+              if match is None:
+                  raise SystemExit(f"Could not find version in {metadata_file}")
+              version = match.group(2)
+              parts = version.split(".")
+              if len(parts) != 3 or not all(part.isdigit() for part in parts):
+                  raise SystemExit(
+                      f"Automatic releases require X.Y.Z versions; found "
+                      f"{version} in {metadata_file}"
+                  )
+              return version, tuple(map(int, parts))
 
-          major, minor, patch = map(int, parts)
-          if bump == "major":
-              next_version = f"{major + 1}.0.0"
-          elif bump == "minor":
-              next_version = f"{major}.{minor + 1}.0"
-          elif bump == "patch":
-              next_version = f"{major}.{minor}.{patch + 1}"
-          else:
+          def bump_version(parts, bump):
+              major, minor, patch = parts
+              if bump == "major":
+                  return f"{major + 1}.0.0"
+              if bump == "minor":
+                  return f"{major}.{minor + 1}.0"
+              if bump == "patch":
+                  return f"{major}.{minor}.{patch + 1}"
               raise SystemExit(f"Unsupported bump: {bump}")
 
-          updated_contents, replacements = version_pattern.subn(
-              lambda version_match: (
-                  version_match.group(1)
-                  + next_version
-                  + version_match.group(3)
-              ),
-              contents,
-              count=1,
-          )
-          if replacements != 1:
-              raise SystemExit(
-                  f"Expected one version replacement in {metadata_path}; "
-                  f"made {replacements}"
+          event_name = os.environ["EVENT_NAME"]
+          if event_name == "push":
+              base_sha = os.environ["BASE_SHA"]
+              head_sha = os.environ["HEAD_SHA"]
+              changed_files = subprocess.check_output(
+                  ["git", "diff", "--name-only", base_sha, head_sha],
+                  text=True,
+              ).splitlines()
+              selected_projects = [
+                  project
+                  for project, package in packages.items()
+                  if any(
+                      changed_path == watched_path
+                      or (
+                          watched_path.endswith("/")
+                          and changed_path.startswith(watched_path)
+                      )
+                      for changed_path in changed_files
+                      for watched_path in package["paths"]
+                  )
+              ]
+              bump = "patch"
+              print("Changed release files:")
+              for changed_file in changed_files:
+                  print(f"  {changed_file}")
+          else:
+              selected_projects = [os.environ["PACKAGE"]]
+              bump = os.environ["BUMP"]
+              base_sha = None
+              changed_files = []
+
+          if not selected_projects:
+              raise SystemExit("No releasable package changes were detected")
+
+          releases = []
+          for project in selected_projects:
+              package = packages[project]
+              metadata_path = Path(package["metadata_file"])
+              contents = metadata_path.read_text()
+              current_version, current_parts = parse_version(
+                  contents, package["metadata_file"]
               )
-          metadata_path.write_text(updated_contents)
 
-          tag = f"{package['tag_prefix']}{next_version}"
-          outputs = {
-              "directory": package["directory"],
-              "metadata_file": package["metadata_file"],
-              "project": project,
-              "tag": tag,
-              "version": next_version,
-          }
+              use_existing_bump = False
+              if event_name == "push" and base_sha:
+                  previous = subprocess.run(
+                      ["git", "show", f"{base_sha}:{package['metadata_file']}"],
+                      text=True,
+                      capture_output=True,
+                  )
+                  if previous.returncode == 0:
+                      previous_version, previous_parts = parse_version(
+                          previous.stdout, package["metadata_file"]
+                      )
+                      if current_version != previous_version:
+                          if current_parts <= previous_parts:
+                              raise SystemExit(
+                                  f"{project} version must increase: "
+                                  f"{previous_version} -> {current_version}"
+                              )
+                          next_version = current_version
+                          use_existing_bump = True
+
+              if not use_existing_bump:
+                  next_version = bump_version(current_parts, bump)
+                  updated_contents, replacements = version_pattern.subn(
+                      lambda match: (
+                          match.group(1) + next_version + match.group(3)
+                      ),
+                      contents,
+                      count=1,
+                  )
+                  if replacements != 1:
+                      raise SystemExit(
+                          f"Expected one version replacement in {metadata_path}; "
+                          f"made {replacements}"
+                      )
+                  metadata_path.write_text(updated_contents)
+
+              tag = f"{package['tag_prefix']}{next_version}"
+              tag_exists = subprocess.run(
+                  ["git", "rev-parse", "--quiet", "--verify", f"refs/tags/{tag}"],
+                  capture_output=True,
+              ).returncode == 0
+              if tag_exists:
+                  raise SystemExit(f"Release tag already exists: {tag}")
+
+              releases.append(
+                  {
+                      "directory": package["directory"],
+                      "metadata_file": package["metadata_file"],
+                      "project": project,
+                      "tag": tag,
+                      "version": next_version,
+                  }
+              )
+              print(f"Preparing {project} {current_version} -> {next_version}")
+
+          releases_json = json.dumps(releases, separators=(",", ":"))
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-              for key, value in outputs.items():
-                  print(f"{key}={value}", file=output)
-
-          print(f"Preparing {project} {current_version} -> {next_version}")
+              print(f"releases={releases_json}", file=output)
           PY
 
-      - name: Commit version and push tag
+      - name: Commit versions and push tags
         id: commit
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          METADATA_FILE: ${{ steps.version.outputs.metadata_file }}
-          PROJECT: ${{ steps.version.outputs.project }}
-          RELEASE_TAG: ${{ steps.version.outputs.tag }}
-          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          RELEASES_JSON: ${{ steps.version.outputs.releases }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add "${METADATA_FILE}"
-          git commit -m "Release ${PROJECT} ${RELEASE_VERSION}"
-          git tag -a "${RELEASE_TAG}" -m "${PROJECT} ${RELEASE_VERSION}"
-          git push --atomic origin "HEAD:${DEFAULT_BRANCH}" "refs/tags/${RELEASE_TAG}"
-          echo "commit=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          releases = json.loads(os.environ["RELEASES_JSON"])
+          metadata_files = sorted(
+              {
+                  release["metadata_file"]
+                  for release in releases
+                  if subprocess.run(
+                      ["git", "diff", "--quiet", "--", release["metadata_file"]]
+                  ).returncode != 0
+              }
+          )
+
+          subprocess.run(
+              ["git", "config", "user.name", "github-actions[bot]"], check=True
+          )
+          subprocess.run(
+              [
+                  "git",
+                  "config",
+                  "user.email",
+                  "41898282+github-actions[bot]@users.noreply.github.com",
+              ],
+              check=True,
+          )
+
+          if metadata_files:
+              subprocess.run(["git", "add", "--", *metadata_files], check=True)
+              projects = ", ".join(
+                  f"{release['project']} {release['version']}"
+                  for release in releases
+              )
+              subprocess.run(
+                  ["git", "commit", "-m", f"Release {projects}"], check=True
+              )
+
+          for release in releases:
+              subprocess.run(
+                  [
+                      "git",
+                      "tag",
+                      "-a",
+                      release["tag"],
+                      "-m",
+                      f"{release['project']} {release['version']}",
+                  ],
+                  check=True,
+              )
+
+          commit = subprocess.check_output(
+              ["git", "rev-parse", "HEAD"], text=True
+          ).strip()
+          push_command = [
+              "git",
+              "push",
+              "--atomic",
+              "origin",
+              f"HEAD:{os.environ['DEFAULT_BRANCH']}",
+              *[f"refs/tags/{release['tag']}" for release in releases],
+          ]
+          subprocess.run(push_command, check=True)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              print(f"commit={commit}", file=output)
+          PY
 
   build:
-    name: Build and validate distribution
+    name: Build and validate distributions
     needs: prepare
     runs-on: ubuntu-latest
     permissions:
@@ -193,50 +396,74 @@ jobs:
       - name: Install build tools
         run: python -m pip install --upgrade build twine
 
-      - name: Build package
-        run: python -m build --outdir dist "${{ needs.prepare.outputs.directory }}"
+      - name: Build packages
+        env:
+          RELEASES_JSON: ${{ needs.prepare.outputs.releases }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+
+          for release in json.loads(os.environ["RELEASES_JSON"]):
+              subprocess.run(
+                  [
+                      sys.executable,
+                      "-m",
+                      "build",
+                      "--outdir",
+                      "dist",
+                      release["directory"],
+                  ],
+                  check=True,
+              )
+          PY
 
       - name: Validate package metadata
         run: python -m twine check dist/*
 
-      - name: Verify built package
+      - name: Verify built packages
         env:
-          EXPECTED_PROJECT: ${{ needs.prepare.outputs.project }}
-          EXPECTED_VERSION: ${{ needs.prepare.outputs.version }}
+          RELEASES_JSON: ${{ needs.prepare.outputs.releases }}
         run: |
           python - <<'PY'
           import email
           import glob
+          import json
           import os
           import zipfile
 
-          wheels = glob.glob("dist/*.whl")
-          if len(wheels) != 1:
-              raise SystemExit(f"Expected one wheel, found: {wheels}")
-
-          with zipfile.ZipFile(wheels[0]) as wheel:
-              metadata_paths = [
-                  name for name in wheel.namelist() if name.endswith(".dist-info/METADATA")
-              ]
-              if len(metadata_paths) != 1:
-                  raise SystemExit(
-                      f"Expected one METADATA file, found: {metadata_paths}"
+          expected = {
+              release["project"]: release["version"]
+              for release in json.loads(os.environ["RELEASES_JSON"])
+          }
+          actual = {}
+          for wheel_path in glob.glob("dist/*.whl"):
+              with zipfile.ZipFile(wheel_path) as wheel:
+                  metadata_paths = [
+                      name
+                      for name in wheel.namelist()
+                      if name.endswith(".dist-info/METADATA")
+                  ]
+                  if len(metadata_paths) != 1:
+                      raise SystemExit(
+                          f"Expected one METADATA file in {wheel_path}; "
+                          f"found {metadata_paths}"
+                      )
+                  metadata = email.message_from_bytes(
+                      wheel.read(metadata_paths[0])
                   )
-              metadata = email.message_from_bytes(wheel.read(metadata_paths[0]))
+              actual[metadata["Name"]] = metadata["Version"]
 
-          actual_project = metadata["Name"]
-          actual_version = metadata["Version"]
-          expected_project = os.environ["EXPECTED_PROJECT"]
-          expected_version = os.environ["EXPECTED_VERSION"]
-
-          if actual_project != expected_project or actual_version != expected_version:
+          if actual != expected:
               raise SystemExit(
-                  "Built distribution does not match the requested release: "
-                  f"expected {expected_project}=={expected_version}, "
-                  f"built {actual_project}=={actual_version}"
+                  f"Built distributions do not match releases: "
+                  f"expected {expected}, built {actual}"
               )
 
-          print(f"Verified {actual_project}=={actual_version}")
+          for project, version in actual.items():
+              print(f"Verified {project}=={version}")
           PY
 
       - name: Upload distribution artifact
@@ -254,7 +481,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/project/${{ needs.prepare.outputs.project }}/
+      url: https://pypi.org/
     permissions:
       id-token: write
 
@@ -269,7 +496,7 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
 
   github-release:
-    name: Create GitHub Release
+    name: Create GitHub Releases
     needs:
       - prepare
       - publish
@@ -278,15 +505,34 @@ jobs:
       contents: write
 
     steps:
-      - name: Create release
+      - name: Create releases
         env:
           GH_TOKEN: ${{ github.token }}
-          PROJECT: ${{ needs.prepare.outputs.project }}
-          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
-          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          RELEASES_JSON: ${{ needs.prepare.outputs.releases }}
         run: |
-          gh release create "${RELEASE_TAG}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --verify-tag \
-            --title "${PROJECT} ${RELEASE_VERSION}" \
-            --generate-notes
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          for release in json.loads(os.environ["RELEASES_JSON"]):
+              subprocess.run(
+                  [
+                      "gh",
+                      "release",
+                      "create",
+                      release["tag"],
+                      "--repo",
+                      os.environ["GITHUB_REPOSITORY"],
+                      "--verify-tag",
+                      "--title",
+                      f"{release['project']} {release['version']}",
+                      "--notes",
+                      (
+                          f"Automated PyPI release of "
+                          f"{release['project']} {release['version']}."
+                      ),
+                  ],
+                  check=True,
+              )
+          PY
