@@ -281,6 +281,19 @@ class HeadRegistryKVStore(KeyValueStore):
     async def delete(self, key: str) -> bool:
         return await self._execute(lambda client: client.delete(key))
 
+    async def set_server(self, key: str, value: str, last_heartbeat: float) -> bool:
+        return await self._execute(
+            lambda client: client.set_server(key, value, last_heartbeat)
+        )
+
+    async def delete_server(self, key: str) -> bool:
+        return await self._execute(lambda client: client.delete_server(key))
+
+    async def active_server_keys(self, min_heartbeat: float) -> list[str]:
+        return await self._execute(
+            lambda client: client.active_server_keys(min_heartbeat)
+        )
+
     async def exists(self, key: str) -> bool:
         return await self._execute(lambda client: client.exists(key))
 

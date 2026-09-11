@@ -28,6 +28,22 @@ client = RegistryClient(store, service_type="model_path")
 
 ### Redis
 
+Redis roster reads use the sorted set `literegistry:server_heartbeats:v1` to
+select server keys by heartbeat timestamp, then read only those server records.
+Registration and heartbeats update the existing `server_<id>` record and index
+in one transaction; deregistration removes both. Inactive entries remain in the
+index so readers with different heartbeat intervals can query it correctly.
+Affinity keys do not participate in roster lookup. Other key enumeration uses
+`SCAN COUNT 64` (a Redis batch-size hint, not a hard limit).
+
+When upgrading an existing deployment, upgrade all server/heartbeat writers
+first and allow each to register or heartbeat before upgrading roster readers
+such as gateways. Old writers do not populate the index, and new readers do not
+fall back to a database scan, even when the index is empty. Existing server keys
+stay readable by old readers. If the index is deleted, upgraded writers rebuild
+their entries on their next heartbeat. Direct `store.set("server_...", ...)`
+writes bypass indexing; use `ServerRegistry` to manage registrations.
+
 Start Redis with the CLI (see also [Runtimes](runtimes.md)):
 
 ```bash

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from tests.redis_fakes import HeartbeatIndexMixin
 from fnmatch import fnmatch
 import json
 from unittest.mock import patch
@@ -29,7 +30,7 @@ class FakeServerRegistry:
         self.deregistrations += 1
 
 
-class FakeRedis:
+class FakeRedis(HeartbeatIndexMixin):
     def __init__(self) -> None:
         self.values = {}
         self.closed = False
@@ -50,7 +51,7 @@ class FakeRedis:
     async def exists(self, key):
         return int(key in self.values)
 
-    async def scan_iter(self, match="*"):
+    async def scan_iter(self, match="*", count=64):
         for key in list(self.values):
             if fnmatch(key, match):
                 yield key.encode()

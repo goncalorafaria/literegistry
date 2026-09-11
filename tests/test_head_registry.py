@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from tests.redis_fakes import HeartbeatIndexMixin
 
 import pytest
 
@@ -22,7 +23,7 @@ from literegistry.affinity import StrictAffinityBindingStore
 from literegistry.registry import ServerRegistry
 
 
-class _FakeRedis:
+class _FakeRedis(HeartbeatIndexMixin):
     def __init__(self, state: dict) -> None:
         self.state = state
         self.closed = False
@@ -52,7 +53,7 @@ class _FakeRedis:
         self._check()
         return int(key in self.state["values"])
 
-    async def scan_iter(self, match="*"):
+    async def scan_iter(self, match="*", count=64):
         self._check()
         prefix = match[:-1] if match.endswith("*") else match
         for key in list(self.state["values"]):
@@ -237,6 +238,7 @@ def test_server_heartbeat_reregisters_after_failover(monkeypatch, tmp_path) -> N
             await registry.register_server("http://worker", 8000, {"model_path": "x"})
             key = f"server_{registry.server_id}"
             assert key in states[old_url]["values"]
+            assert [s["server_id"] for s in (await registry.roster())["servers"]] == [registry.server_id]
 
             states[old_url]["online"] = False
             heartbeat = asyncio.create_task(registry.heartbeat("http://worker", 8000))
@@ -247,6 +249,9 @@ def test_server_heartbeat_reregisters_after_failover(monkeypatch, tmp_path) -> N
             )
             await asyncio.wait_for(heartbeat, timeout=1)
             assert key in states[new_url]["values"]
+            assert [s["server_id"] for s in (await registry.roster())["servers"]] == [registry.server_id]
+            await registry.deregister()
+            assert (await registry.roster())["servers"] == []
         finally:
             await store.close()
             await endpoints.close()
