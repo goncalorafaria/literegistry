@@ -21,6 +21,33 @@ def test_prepare_shared_directory_is_sticky_and_writable(tmp_path) -> None:
     assert root.stat().st_mode & 0o7777 == 0o1777
 
 
+def test_submit_prepares_explicit_redis_data_dir(tmp_path, monkeypatch) -> None:
+    redis_data_dir = tmp_path / "stable" / "redis-data"
+    config = PodmanStackConfig(
+        coordination_root=str(tmp_path / "deployments"),
+        redis_data_dir=str(redis_data_dir),
+        podman_replicas=1,
+        docker_mirror_replicas=0,
+        warmup_enabled=False,
+    )
+
+    def fake_run(command, **kwargs):
+        return subprocess.CompletedProcess(
+            command,
+            returncode=0,
+            stdout='{"id":"experiment-id"}',
+            stderr="",
+        )
+
+    monkeypatch.setattr(launcher_module.subprocess, "run", fake_run)
+
+    receipt = PodmanStackLauncher(config).submit()
+
+    assert receipt["beaker"]["id"] == "experiment-id"
+    assert redis_data_dir.is_dir()
+    assert redis_data_dir.stat().st_mode & 0o7777 == 0o1777
+
+
 def test_single_cluster_stack_is_self_contained() -> None:
     config = PodmanStackConfig(
         registry="redis://jupiter.example:59936",
@@ -206,6 +233,23 @@ def test_fire_cli_previews_stack(capsys) -> None:
     assert "ai2/ceres" in output
 
 
+def test_fire_cli_accepts_explicit_redis_data_dir(capsys) -> None:
+    cli.main(
+        [
+            "preview",
+            "--head-registry=sqlite:///weka/shared/my-stack/head.sqlite3",
+            "--redis-data-dir=/weka/shared/my-stack/redis-data",
+            "--podman-replicas=1",
+            "--docker-mirror-replicas=0",
+            "--warmup-enabled=False",
+        ]
+    )
+    output = capsys.readouterr().out
+
+    assert '"redis_data_dir": "/weka/shared/my-stack/redis-data"' in output
+    assert "--data_dir=/weka/shared/my-stack/redis-data" in output
+
+
 def test_managed_redis_stack_publishes_registry_url_to_all_services() -> None:
     config = PodmanStackConfig(
         podman_replicas=1,
@@ -352,6 +396,42 @@ def test_explicit_sqlite_head_launches_managed_redis() -> None:
             "REGISTRY=head+sqlite:///weka/shared/podman-head.sqlite3"
             in tasks[service]["command"][2]
         )
+
+
+def test_explicit_redis_data_dir_is_passed_unchanged() -> None:
+    config = PodmanStackConfig(
+        head_registry="sqlite:///weka/shared/podman-head.sqlite3",
+        coordination_root="/weka/shared/generated-deployments",
+        redis_data_dir="/weka/shared/stable-redis/aof",
+        podman_replicas=1,
+        docker_mirror_replicas=0,
+    )
+    _, spec = PodmanStackLauncher(config).build_spec(
+        experiment_name="replacement-stack"
+    )
+
+    redis_command = _tasks(spec)["redis"]["command"][2]
+    assert "--data_dir=/weka/shared/stable-redis/aof" in redis_command
+    assert "replacement-stack/redis-data" not in redis_command
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"redis_data_dir": ""}, "non-empty"),
+        ({"redis_data_dir": "relative/redis-data"}, "absolute shared path"),
+        (
+            {
+                "registry": "redis://registry.example:6379",
+                "redis_data_dir": "/weka/shared/redis-data",
+            },
+            "managed Redis",
+        ),
+    ],
+)
+def test_redis_data_dir_validation(kwargs, message) -> None:
+    with pytest.raises(ValueError, match=message):
+        PodmanStackConfig(**kwargs).validate()
 
 
 def test_coordination_root_must_be_absolute() -> None:

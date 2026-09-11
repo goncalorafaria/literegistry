@@ -80,6 +80,7 @@ class PodmanStackConfig:
     omit_resources: bool = False
     name_prefix: str = "literegistry-podman"
     coordination_root: str = "/weka/gfaria/literegistry/.coop"
+    redis_data_dir: str | None = None
     podman_image: str = "goncalof/literegistry-podman-immediate-rm-20260819"
     podman_instance_prefix: str = "podman"
     podman_session_image: str = "docker.io/library/ubuntu:24.04"
@@ -127,6 +128,17 @@ class PodmanStackConfig:
     def resolved_registry(self) -> str | None:
         head = self.resolved_head_registry()
         return head_registry_uri(head) if head is not None else self.registry
+
+    def resolved_redis_data_dir(self, experiment_name: str) -> str:
+        """Return the exact AOF directory for the managed Redis task."""
+
+        if self.redis_data_dir is not None:
+            return str(Path(self.redis_data_dir).expanduser())
+        return str(
+            Path(self.coordination_root).expanduser()
+            / experiment_name
+            / "redis-data"
+        )
 
     def validate(self) -> "PodmanStackConfig":
         if self.registry is not None and self.head_registry is not None:
@@ -204,6 +216,15 @@ class PodmanStackConfig:
                 raise ValueError(f"{name} must be non-empty")
         if not Path(self.coordination_root).expanduser().is_absolute():
             raise ValueError("coordination_root must be an absolute shared path")
+        if self.redis_data_dir is not None:
+            if not self.redis_data_dir.strip():
+                raise ValueError("redis_data_dir must be non-empty when supplied")
+            if not Path(self.redis_data_dir).expanduser().is_absolute():
+                raise ValueError("redis_data_dir must be an absolute shared path")
+            if self.registry is not None:
+                raise ValueError(
+                    "redis_data_dir configures managed Redis; omit registry to use it"
+                )
         if self.warmup_concurrency < 1:
             raise ValueError("warmup_concurrency must be positive")
         if self.warmup_checkpoint_file is not None and not Path(
@@ -377,6 +398,7 @@ class PodmanStackLauncher:
         default_coordination_path = str(
             Path(self.config.coordination_root).expanduser() / name
         )
+        redis_data_dir = self.config.resolved_redis_data_dir(name)
         endpoint_registry = self.config.resolved_head_registry()
         tasks: list[dict[str, Any]] = []
         clusters = self.config.resolved_service_clusters()
@@ -389,7 +411,7 @@ class PodmanStackLauncher:
                 'exec literegistry redis --runtime=local --foreground=True '
                 '--port="$PORT" --advertise_host="$REDIS_ADVERTISE_HOST" '
                 f"--head_registry={shlex.quote(endpoint_registry)} "
-                f"--data_dir={shlex.quote(default_coordination_path + '/redis-data')} "
+                f"--data_dir={shlex.quote(redis_data_dir)} "
                 "--persistence=True"
             )
             redis_child = (
@@ -653,6 +675,7 @@ class PodmanStackLauncher:
                 str(Path(self.config.coordination_root).expanduser() / name)
             )
         if self.config.registry is None:
+            _prepare_shared_directory(self.config.resolved_redis_data_dir(name))
             head = self.config.resolved_head_registry()
             if head is not None:
                 prepare_endpoint_registry_storage(head)

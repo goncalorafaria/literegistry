@@ -220,6 +220,23 @@ Redis AOF directory under that shared root. Combine it with an explicit
 SQLite bootstrap database and Redis persistence must share the same deployment
 tree.
 
+To control the Redis AOF location exactly, pass an absolute shared Weka path:
+
+```bash
+literegistry-podman-beaker launch \
+  --head-registry=sqlite:///weka/shared/my-stack/head.sqlite3 \
+  --redis-data-dir=/weka/shared/my-stack/redis-data \
+  ...
+```
+
+`--redis-data-dir` is passed unchanged to the managed Redis task and is created
+with shared-write permissions before Beaker submission. Reusing it in a later
+deployment restores the existing AOF state. Only one Redis process may use a
+given data directory at a time. When this option is omitted, the existing
+`<coordination_root>/<generated-experiment-name>/redis-data` behavior remains.
+It cannot be combined with `--registry`, because that selects an external Redis
+deployment and suppresses creation of the managed Redis task.
+
 ### 7. Launch and monitor the stack
 
 Change `preview` to `launch` and save the JSON launch receipt:
