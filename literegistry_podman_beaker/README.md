@@ -117,19 +117,19 @@ this package:
 
 ```bash
 cd /weka/gfaria/literegistry/literegistry_podman_beaker
-export IMAGE_TAG=0.2.16
+export IMAGE_TAG=0.2.17
 ./scripts/build-images.sh "" "$IMAGE_TAG"
 ```
 
 This produces:
 
 ```text
-literegistry-redis:0.2.16
-literegistry-podman-gateway:0.2.16
-literegistry-podman-server:0.2.16
-literegistry-docker-mirror:0.2.16
-literegistry-podman-warmup:0.2.16
-literegistry-podman-live-fire:0.2.16
+literegistry-redis:0.2.17
+literegistry-podman-gateway:0.2.17
+literegistry-podman-server:0.2.17
+literegistry-docker-mirror:0.2.17
+literegistry-podman-warmup:0.2.17
+literegistry-podman-live-fire:0.2.17
 ```
 
 For an ordinary Docker registry, pass its repository prefix and set
@@ -602,24 +602,24 @@ Build all six with one command:
 
 ```bash
 cd /weka/gfaria/literegistry/literegistry_podman_beaker
-./scripts/build-images.sh YOUR_REGISTRY 0.2.16
+./scripts/build-images.sh YOUR_REGISTRY 0.2.17
 ```
 
-For example, build and push `goncalof/*:0.2.16`:
+For example, build and push `goncalof/*:0.2.17`:
 
 ```bash
-PUSH_IMAGES=1 ./scripts/build-images.sh goncalof 0.2.16
+PUSH_IMAGES=1 ./scripts/build-images.sh goncalof 0.2.17
 ```
 
 The script prints:
 
 ```text
-REDIS_IMAGE=YOUR_REGISTRY/literegistry-redis:0.2.16
-GATEWAY_IMAGE=YOUR_REGISTRY/literegistry-podman-gateway:0.2.16
-PODMAN_IMAGE=YOUR_REGISTRY/literegistry-podman-server:0.2.16
-DOCKER_MIRROR_IMAGE=YOUR_REGISTRY/literegistry-docker-mirror:0.2.16
-PODMAN_WARMUP_IMAGE=YOUR_REGISTRY/literegistry-podman-warmup:0.2.16
-PODMAN_LIVE_FIRE_IMAGE=YOUR_REGISTRY/literegistry-podman-live-fire:0.2.16
+REDIS_IMAGE=YOUR_REGISTRY/literegistry-redis:0.2.17
+GATEWAY_IMAGE=YOUR_REGISTRY/literegistry-podman-gateway:0.2.17
+PODMAN_IMAGE=YOUR_REGISTRY/literegistry-podman-server:0.2.17
+DOCKER_MIRROR_IMAGE=YOUR_REGISTRY/literegistry-docker-mirror:0.2.17
+PODMAN_WARMUP_IMAGE=YOUR_REGISTRY/literegistry-podman-warmup:0.2.17
+PODMAN_LIVE_FIRE_IMAGE=YOUR_REGISTRY/literegistry-podman-live-fire:0.2.17
 ```
 
 The live-fire image includes the complete TMAX deployment workload manifest as
@@ -637,7 +637,7 @@ The bundled file is
 `literegistry_podman_beaker/assets/tmax_deployment_workloads.jsonl`. An explicit
 second positional `manifest_path` still overrides it for custom workloads.
 
-Publish `literegistry==1.0.49` and `literegistry-podman-beaker==0.2.16` to the
+Publish `literegistry==1.0.49` and `literegistry-podman-beaker==0.2.17` to the
 selected Python index before building the runtime images.
 
 If LiteRegistry is served by an internal Python index, export
@@ -649,11 +649,11 @@ Use the resulting installed-package images directly:
 
 ```python
 config = PodmanStackConfig(
-    redis_image="YOUR_REGISTRY/literegistry-redis:0.2.16",
-    gateway_image="YOUR_REGISTRY/literegistry-podman-gateway:0.2.16",
-    podman_image="YOUR_REGISTRY/literegistry-podman-server:0.2.16",
-    docker_mirror_image="YOUR_REGISTRY/literegistry-docker-mirror:0.2.16",
-    warmup_image="YOUR_REGISTRY/literegistry-podman-warmup:0.2.16",
+    redis_image="YOUR_REGISTRY/literegistry-redis:0.2.17",
+    gateway_image="YOUR_REGISTRY/literegistry-podman-gateway:0.2.17",
+    podman_image="YOUR_REGISTRY/literegistry-podman-server:0.2.17",
+    docker_mirror_image="YOUR_REGISTRY/literegistry-docker-mirror:0.2.17",
+    warmup_image="YOUR_REGISTRY/literegistry-podman-warmup:0.2.17",
 )
 ```
 

@@ -69,7 +69,7 @@ def test_mirror_image_uses_canonical_service_path() -> None:
 
 def test_warmup_image_uses_public_podman_client_command() -> None:
     contents = (DOCKER_ROOT / "Dockerfile.warmup").read_text(encoding="utf-8")
-    assert "ARG PODMAN_BEAKER_VERSION=0.2.16" in contents
+    assert "ARG PODMAN_BEAKER_VERSION=0.2.17" in contents
     assert '"literegistry==${LITEREGISTRY_VERSION}"' in contents
     assert (
         '"literegistry-podman-beaker==${PODMAN_BEAKER_VERSION}"' in contents
