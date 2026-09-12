@@ -42,7 +42,7 @@ def test_local_search_image_uses_literegistry_service_and_jtc_index_assets() -> 
     contents = (DOCKER_ROOT / "Dockerfile.local-search").read_text(encoding="utf-8")
     assert "FROM eclipse-temurin:21-jdk-jammy AS java" in contents
     assert '"pyserini==2.3.0"' in contents
-    assert "ARG LITEREGISTRY_VERSION=1.0.53" in contents
+    assert "ARG LITEREGISTRY_VERSION=1.0.54" in contents
     assert "COPY search /app/search" in contents
     assert "COPY datadev /app/datadev" not in contents
     assert "literegistry.services.bm25_server" in contents
@@ -90,3 +90,26 @@ def test_readme_shell_examples_are_syntax_valid() -> None:
     bash_blocks = re.findall(r"```bash\n(.*?)```", readme, flags=re.DOTALL)
     assert bash_blocks
     subprocess.run(["bash", "-n"], input="\n".join(bash_blocks), text=True, check=True)
+
+
+def test_terminal_image_validation_rejects_missing_early_tool(tmp_path) -> None:
+    contents = (DOCKER_ROOT / "Dockerfile.terminal").read_text()
+    check = re.search(r"for tool in (.*?); do .*?; done", contents)
+    assert check is not None
+    for tool in check.group(1).split():
+        (tmp_path / tool).symlink_to("/bin/true")
+    result = subprocess.run(["/bin/sh", "-c", check.group(0)], env={"PATH": str(tmp_path)})
+    assert result.returncode == 0
+    (tmp_path / "rg").unlink()
+    result = subprocess.run(["/bin/sh", "-c", check.group(0)], env={"PATH": str(tmp_path)})
+    assert result.returncode != 0
+
+
+def test_all_runtime_image_pins_match_literegistry_version() -> None:
+    root = PACKAGE_ROOT.parent
+    version = re.search(r'version="([^"]+)"', (root / "setup.py").read_text()).group(1)
+    dockerfiles = list(DOCKER_ROOT.glob("Dockerfile.*"))
+    dockerfiles += list((root / "literegistry_podman_beaker/docker").glob("Dockerfile.*"))
+    assert len(dockerfiles) == 11
+    for dockerfile in dockerfiles:
+        assert f"ARG LITEREGISTRY_VERSION={version}\n" in dockerfile.read_text(), dockerfile
