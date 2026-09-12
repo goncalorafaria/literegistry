@@ -8,6 +8,7 @@ container for the lifetime of the session.
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from dataclasses import dataclass
 import logging
 import math
@@ -105,6 +106,40 @@ class PodmanBackendError(RuntimeError):
 
 class SessionNotFound(KeyError):
     pass
+
+
+@dataclass(frozen=True)
+class ResourceViolation:
+    reason: str
+    limit: int
+    observed: int
+    unit: str
+
+
+@dataclass(frozen=True)
+class SessionTermination:
+    container_id: str
+    violation: ResourceViolation
+
+    def response_body(self) -> dict[str, Any]:
+        return {
+            "code": "sandbox_lost",
+            "reason": self.violation.reason,
+            "container_id": self.container_id,
+            "recoverable": False,
+            "limit": self.violation.limit,
+            "observed": self.violation.observed,
+            "unit": self.violation.unit,
+            "enforcement": "userspace_watchdog",
+        }
+
+
+class SessionLost(SessionNotFound):
+    """A session whose resource termination was confirmed by this replica."""
+
+    def __init__(self, termination: SessionTermination):
+        super().__init__(termination.container_id)
+        self.termination = termination
 
 
 class OutputLimitExceeded(RuntimeError):
@@ -232,11 +267,20 @@ class CompletedPodmanCommand:
 class PodmanSessionBackend:
     """Owns Podman containers labelled for exactly one affinity instance."""
 
+    _TERMINATION_TTL_SECONDS = 3600.0
+    _MAX_TERMINATION_RECORDS = 10_000
+
     def __init__(self, config: Optional[PodmanAffinityConfig] = None) -> None:
         self.config = config or PodmanAffinityConfig()
         self._locks: dict[str, asyncio.Lock] = {}
         self._owned_container_ids: set[str] = set()
         self._terminating_container_ids: set[str] = set()
+        self._termination_records: OrderedDict[
+            str, tuple[float, SessionTermination]
+        ] = OrderedDict()
+        self._pending_terminations: dict[
+            str, tuple[SessionTermination, asyncio.Future[Optional[SessionTermination]]]
+        ] = {}
         self._session_last_used: dict[str, float] = {}
         self._container_init_pids: dict[str, int] = {}
         self._pending_sessions = 0
@@ -452,14 +496,36 @@ class PodmanSessionBackend:
         logger.info("Created container=%s client_id=%r", container_id, client_id)
         return container_id
 
+    def _prune_termination_records(self) -> None:
+        """Called with the state lock held; records are ordered by expiry."""
+        now = self._now()
+        while self._termination_records:
+            first = next(iter(self._termination_records))
+            expires_at, _ = self._termination_records[first]
+            if (
+                expires_at > now
+                and len(self._termination_records) <= self._MAX_TERMINATION_RECORDS
+            ):
+                break
+            self._termination_records.popitem(last=False)
+
     async def _require_owned(self, container_id: str) -> None:
-        async with self._locks_guard:
-            owned = (
-                container_id in self._owned_container_ids
-                and container_id not in self._terminating_container_ids
-            )
-        if not owned:
-            raise SessionNotFound(container_id)
+        while True:
+            async with self._locks_guard:
+                self._prune_termination_records()
+                pending = self._pending_terminations.get(container_id)
+                if pending is None:
+                    record = self._termination_records.get(container_id)
+                    if record is not None:
+                        raise SessionLost(record[1])
+                    if container_id not in self._owned_container_ids:
+                        raise SessionNotFound(container_id)
+                    return
+            # Removal does not take the command lock. Wait outside the state
+            # lock, and do not let a cancelled request cancel the watchdog.
+            termination = await asyncio.shield(pending[1])
+            if termination is not None:
+                raise SessionLost(termination)
 
     async def _touch_owned_session(self, container_id: str) -> None:
         async with self._locks_guard:
@@ -476,6 +542,7 @@ class PodmanSessionBackend:
         timeout: float = 10.0,
         workdir: str = "/workspace",
     ) -> CompletedPodmanCommand:
+        await self._require_owned(container_id)
         lock = await self._lock_for(container_id)
         async with lock:
             await self._require_owned(container_id)
@@ -484,7 +551,7 @@ class PodmanSessionBackend:
                 # The deadline runs inside the container, so it can terminate
                 # the command's complete process tree before the outer
                 # podman-exec failsafe expires.
-                return await self._run(
+                result = await self._run(
                     [
                         *self._podman,
                         "exec",
@@ -502,6 +569,12 @@ class PodmanSessionBackend:
                     stdin=stdin.encode(),
                     timeout=timeout + 5.0,
                 )
+                await self._require_owned(container_id)
+                return result
+            except (PodmanBackendError, asyncio.TimeoutError):
+                # Prefer a confirmed loss over an incidental exec failure.
+                await self._require_owned(container_id)
+                raise
             finally:
                 # A long command can exceed the idle timeout. Touching on
                 # completion makes a janitor that waited on this container's
@@ -509,8 +582,7 @@ class PodmanSessionBackend:
                 try:
                     await self._touch_owned_session(container_id)
                 except SessionNotFound:
-                    # A resource watchdog is allowed to force-remove an active
-                    # command; do not mask that command's Podman result here.
+                    # Preserve the loss error from the post-exec check.
                     pass
 
     async def _remove_session_locked(self, container_id: str) -> None:
@@ -544,6 +616,7 @@ class PodmanSessionBackend:
         *,
         idle_before: Optional[float] = None,
     ) -> bool:
+        await self._require_owned(container_id)
         lock = await self._lock_for(container_id)
         async with lock:
             await self._require_owned(container_id)
@@ -817,28 +890,25 @@ class PodmanSessionBackend:
                 usages[root_pid] = ancestry[root_pid]
         return usages
 
-    def _resource_violation(self, usage: tuple[int, int]) -> Optional[str]:
+    def _resource_violation(self, usage: tuple[int, int]) -> Optional[ResourceViolation]:
         rss_bytes, task_count = usage
         if self.config.session_memory is not None:
             limit = parse_memory_limit(self.config.session_memory)
             if rss_bytes > limit:
-                return (
-                    f"resident memory {rss_bytes} bytes exceeds budget "
-                    f"{limit} ({self.config.session_memory})"
-                )
+                return ResourceViolation("memory_limit", limit, rss_bytes, "rss_bytes")
         if self.config.session_pids_limit is not None:
             if task_count > self.config.session_pids_limit:
-                return (
-                    f"task count {task_count} exceeds budget "
-                    f"{self.config.session_pids_limit}"
+                return ResourceViolation(
+                    "pids_limit", self.config.session_pids_limit, task_count, "tasks"
                 )
         return None
 
     async def _force_remove_over_budget(
-        self, container_id: str, init_pid: int, reason: str
+        self, container_id: str, init_pid: int, reason: ResourceViolation
     ) -> bool:
-        """Immediately remove a confirmed offender, including an active command."""
-
+        """Remove an offender, retaining its reason only after confirmed removal."""
+        termination = SessionTermination(container_id, reason)
+        completed = asyncio.get_running_loop().create_future()
         async with self._locks_guard:
             if (
                 container_id not in self._owned_container_ids
@@ -847,17 +917,30 @@ class PodmanSessionBackend:
             ):
                 return False
             self._terminating_container_ids.add(container_id)
+            # Retain the evidence before invoking rm. Concurrent requests wait
+            # for confirmation rather than getting a generic missing-session error.
+            self._pending_terminations[container_id] = (termination, completed)
         logger.warning("Session %s %s; force-removing", container_id, reason)
-        result = await self._run(
-            [*self._podman, "rm", "--force", "--time", "0", container_id]
-        )
-        async with self._locks_guard:
-            self._terminating_container_ids.discard(container_id)
-            if result.returncode == 0:
-                self._owned_container_ids.discard(container_id)
-                self._session_last_used.pop(container_id, None)
-                self._container_init_pids.pop(container_id, None)
-                self._locks.pop(container_id, None)
+        result = None
+        try:
+            result = await self._run(
+                [*self._podman, "rm", "--force", "--time", "0", container_id]
+            )
+        finally:
+            async with self._locks_guard:
+                self._terminating_container_ids.discard(container_id)
+                self._pending_terminations.pop(container_id, None)
+                removed = result is not None and result.returncode == 0
+                if removed:
+                    self._owned_container_ids.discard(container_id)
+                    self._session_last_used.pop(container_id, None)
+                    self._container_init_pids.pop(container_id, None)
+                    self._locks.pop(container_id, None)
+                    self._termination_records[container_id] = (
+                        self._now() + self._TERMINATION_TTL_SECONDS, termination
+                    )
+                    self._prune_termination_records()
+                completed.set_result(termination if removed else None)
         if result.returncode != 0:
             logger.warning(
                 "Failed to remove over-budget container %s: %s",
@@ -1074,6 +1157,10 @@ def create_app(
             return await service.podman(request)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+        except SessionLost as exc:
+            raise HTTPException(
+                status_code=410, detail=exc.termination.response_body()
+            ) from exc
         except SessionNotFound as exc:
             raise HTTPException(
                 status_code=404,
@@ -1096,6 +1183,10 @@ def create_app(
             return await service.close(request)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+        except SessionLost as exc:
+            raise HTTPException(
+                status_code=410, detail=exc.termination.response_body()
+            ) from exc
         except SessionNotFound as exc:
             raise HTTPException(
                 status_code=404,

@@ -17,6 +17,7 @@ from literegistry.services.podman import (
     PodmanBackendError,
     PodmanSessionBackend,
     SessionNotFound,
+    SessionLost,
     SessionRequest,
     PodmanRequest,
     build_podman_registry_mirror_config,
@@ -681,8 +682,9 @@ def test_resource_watchdog_can_terminate_while_command_lock_is_held():
         assert await backend.enforce_resource_budgets() == [CONTAINER_ID]
         assert not command.done()
         backend.release_command.set()
-        result = await command
-        assert result.returncode == 137
+        with pytest.raises(SessionLost) as error:
+            await command
+        assert error.value.termination.violation.reason == "memory_limit"
         assert CONTAINER_ID not in backend._owned_container_ids
 
     asyncio.run(scenario())

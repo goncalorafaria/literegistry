@@ -570,3 +570,29 @@ def test_strict_affinity_rechecks_registration_after_request_failure():
 
     with tempfile.TemporaryDirectory() as root:
         asyncio.run(check(root))
+
+
+def test_gateway_preserves_watchdog_loss_response_without_retry(tmp_path):
+    from literegistry.http import HTTPResponseError
+
+    async def scenario():
+        app, registry, transport, bindings = make_environment(tmp_path)
+        await bindings.bind("affinity-kv", "a"*64, "server-a", "mock://replica-a")
+        body = {"detail": {
+            "code": "sandbox_lost", "reason": "memory_limit", "recoverable": False,
+            "container_id": "a"*64, "limit": 1024, "observed": 2048,
+            "unit": "rss_bytes", "enforcement": "userspace_watchdog",
+        }}
+        calls = []
+        async def post(service, server_uri, endpoint, payload, retry):
+            calls.append((server_uri, endpoint))
+            raise HTTPResponseError(410, body, server_uri)
+        transport.post = post
+        status, response = await call_json(app, "/affinity/podman", {
+            "service": "affinity-kv", "affinity_id": "a"*64, "command": "allocate",
+        })
+        assert status == 410
+        assert response == body
+        assert calls == [("mock://replica-a", "podman")]
+        assert True not in registry.model_forces
+    asyncio.run(scenario())
