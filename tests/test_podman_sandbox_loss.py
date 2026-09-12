@@ -160,3 +160,43 @@ def test_cancelled_waiter_does_not_cancel_removal():
         with pytest.raises(SessionLost):
             await backend.execute(CID, "echo hello")
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("exists_code,state_code,state,status", [
+    (0, 0, b"true\n", 200), (1, 0, b"", 404), (125, 0, b"", 503),
+    (0, 0, b"false\n", 410), (0, 125, b"", 503), (0, 0, b"invalid", 503),
+])
+def test_session_probe_is_read_only_and_distinguishes_uncertainty(exists_code, state_code, state, status):
+    backend = WatchdogBackend()
+    calls = []
+    async def run(args, **kwargs):
+        calls.append(args)
+        if "exists" in args:
+            return CompletedPodmanCommand(tuple(args), exists_code, b"", b"")
+        assert "inspect" in args
+        return CompletedPodmanCommand(tuple(args), state_code, state, b"")
+    backend._run = run
+    with TestClient(create_app(PodmanAffinityService(backend), None)) as client:
+        response = client.get(f"/sessions/{CID}")
+        assert response.status_code == status
+        if status == 410:
+            assert response.json()["detail"]["reason"] == "container_stopped"
+            assert response.json()["detail"]["recoverable"] is False
+        if status == 200:
+            assert response.json() == {"container_id": CID, "status": "active"}
+        count = len(calls)
+        assert client.get("/sessions/not-a-container-id").status_code == 400
+        assert len(calls) == count
+    assert all("rm" not in args and "exec" not in args and "run" not in args for args in calls)
+
+
+def test_session_probe_preserves_watchdog_reason_and_requires_auth():
+    backend = WatchdogBackend()
+    asyncio.run(backend.enforce_resource_budgets())
+    token = "a"*32
+    with TestClient(create_app(PodmanAffinityService(backend), token)) as client:
+        assert client.get(f"/sessions/{CID}").status_code == 401
+        response = client.get(f"/sessions/{CID}", headers={"Authorization": f"Bearer {token}"})
+        assert response.status_code == 410
+        assert response.json()["detail"]["reason"] == "memory_limit"
+    assert len(backend.calls) == 1
