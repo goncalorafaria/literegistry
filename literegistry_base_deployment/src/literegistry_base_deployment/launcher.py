@@ -579,7 +579,11 @@ class BaseDeploymentLauncher:
                 image=self.config.terminal_image,
                 replicas=self.config.terminal_replicas,
                 wait=wait,
-                child='exec literegistry terminal --host=0.0.0.0 --port="$PORT" --registry="$REGISTRY"',
+                child=(
+                    'for tool in rg grep awk sed jq xsv pandoc sort uniq head tail wc cat nl echo tr cut; '
+                    'do command -v "$tool" >/dev/null || { echo "Missing required terminal command: $tool" >&2; exit 1; }; done; '
+                    'exec literegistry terminal --host=0.0.0.0 --port="$PORT" --registry="$REGISTRY"'
+                ),
             )
         if self.config.web_search_replicas:
             self._add_spread_service(
