@@ -60,6 +60,7 @@ nav:
   - CLI: cli.md
   - Registry: registry.md
   - Gateway: gateway.md
+  - Chat soft affinity: chat-soft-affinity.md
   - Package layout: package-layout.md
   - vLLM & SGLang: vllm-sglang.md
   - Code & Terminal: code-and-terminal.md
