@@ -155,12 +155,16 @@ class GatewayConfig:
     affinity_ttl_seconds: float = 900.0
     docker_mirror_affinity_ttl_seconds: float = 604800.0
     docker_mirror_soft_affinity: bool = True
+    chat_soft_affinity: bool = True
+    chat_affinity_load_slack: int = 2
     advertise_host: Optional[str] = None
     registration_enabled: bool = True
     registration_instance_id: Optional[str] = None
     registration_heartbeat_interval: float = 10.0
 
     def __post_init__(self) -> None:
+        if self.chat_affinity_load_slack < 0:
+            raise ValueError("chat_affinity_load_slack must be non-negative")
         if self.stats_window_seconds <= 0:
             raise ValueError("stats_window_seconds must be greater than zero")
         if self.docker_mirror_affinity_ttl_seconds <= 0:
@@ -245,6 +249,8 @@ class GatewayConfig:
             docker_mirror_soft_affinity=_env_bool(
                 "DOCKER_MIRROR_SOFT_AFFINITY", True
             ),
+            chat_soft_affinity=_env_bool("CHAT_SOFT_AFFINITY", True),
+            chat_affinity_load_slack=int(os.getenv("CHAT_AFFINITY_LOAD_SLACK", "2")),
             advertise_host=os.getenv("GATEWAY_ADVERTISE_HOST"),
             registration_enabled=_env_bool(
                 "GATEWAY_REGISTRATION_ENABLED", True
@@ -688,7 +694,17 @@ class Gateway:
         self.registry = registry
         self.config = config or GatewayConfig()
         self.proxy_routes = list(routes) if routes is not None else default_proxy_routes()
-        self.routing = routing or LoadBalancedRouting(registry)
+        if routing is not None:
+            self.routing = routing
+        elif self.config.chat_soft_affinity:
+            from literegistry.gateway.chat_affinity import ChatAffinityRouting
+
+            self.routing = ChatAffinityRouting(
+                registry, ttl_seconds=self.config.affinity_ttl_seconds,
+                load_slack=self.config.chat_affinity_load_slack,
+            )
+        else:
+            self.routing = LoadBalancedRouting(registry)
         self.session_manager = session_manager or get_session_manager()
         self.metrics = metrics or GatewayMetrics(self.config.stats_window_seconds)
         self.registration = registration
