@@ -85,3 +85,23 @@ def test_fire_entrypoint_uses_literegistry_factory(tmp_path) -> None:
         port=1214,
         workers=1,
     )
+
+
+def test_original_corpus_url_title_and_fetch_are_preserved(tmp_path):
+    from literegistry.services.bm25_server import parse_document
+    text = '---\ntitle: "Pokémon World Championships - Wikipedia"\ndate: 2015-11-20\n---\nFull original page text.'
+    record = {'docid':'54072','url':'https://en.wikipedia.org/wiki/Pok%C3%A9mon_World_Championships','text':text}
+    document = parse_document(record, 1)
+    assert document.title == 'Pokémon World Championships - Wikipedia'
+    assert document.url == record['url']
+    assert document.text == text
+    assert parse_document({**record,'title':'Explicit title'},1).title == 'Explicit title'
+    corpus=tmp_path/'corpus.jsonl'
+    corpus.write_text(json.dumps(record)+'\n')
+    class Searcher:
+        def search(self, query, topn):
+            return [('54072', 1.0)]
+    client=TestClient(create_app(corpus,searcher=Searcher()))
+    hit=client.post('/search',json={'query':'Pokémon','topn':1}).json()['results'][0]
+    assert hit['url'] == record['url'] and hit['title'] == document.title
+    assert client.post('/get_content',json={'url':hit['url']}).json()['content'] == text

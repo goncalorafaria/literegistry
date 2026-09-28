@@ -47,7 +47,18 @@ def parse_document(record: Mapping[str, object], line_number: int) -> Document:
     )
     if not text:
         raise ValueError(f"missing contents/text at corpus line {line_number}")
-    title = str(record.get("title") or text.splitlines()[0][:160] or docid)
+    lines = text.splitlines()
+    metadata_title = ""
+    if lines and lines[0].strip() == "---":
+        for line in lines[1:]:
+            if line.strip() == "---":
+                break
+            if line.startswith("title:"):
+                metadata_title = line.split(":", 1)[1].strip()
+                if len(metadata_title) >= 2 and metadata_title[0] == metadata_title[-1] and metadata_title[0] in "\"'":
+                    metadata_title = metadata_title[1:-1]
+                break
+    title = str(record.get("title") or metadata_title or lines[0][:160] or docid)
     return Document(docid, url, title, text)
 
 

@@ -1008,6 +1008,33 @@ with st.sidebar:
     )
 
 
+@st.cache_data(ttl=5)
+def read_live_gateways(registry):
+    from literegistry.console.live import poll_head_gateways
+    return poll_head_gateways(registry)
+
+
+if poll_registry and registry.startswith(("head+", "head://")):
+    st.subheader("Live gateway telemetry from head registry")
+    try:
+        snapshots = read_live_gateways(registry)
+        rows = [row for snapshot in snapshots for row in snapshot["rows"]]
+        st.caption("Direct /gateway-stats polling. Counters measure finished requests, including failures; they are not ingress or queue counts.")
+        if rows:
+            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        elif snapshots:
+            st.info("Gateways discovered; no requests have finished yet.")
+        else:
+            st.info("No live gateway monitoring endpoints published in this head registry.")
+        for snapshot in snapshots:
+            if snapshot["error"]:
+                st.warning(snapshot["publisher"] + ": " + snapshot["error"])
+        with st.expander("Discovered gateway endpoints"):
+            st.json([{k: v for k, v in item.items() if k != "rows"} for item in snapshots])
+    except Exception as exc:
+        st.warning("Gateway telemetry unavailable: " + str(exc))
+
+
 if "event_queue" not in st.session_state:
     st.session_state.event_queue = Queue()
 if "events" not in st.session_state:
@@ -1052,7 +1079,7 @@ with st.sidebar:
 
 if events.empty:
     st.title("literegistry console")
-    st.warning("Listening for gateway metric lines. No events have arrived yet.")
+    st.warning("No legacy gateway summary lines. Live gateway counters are shown above; vLLM telemetry is available below.")
     tab_registry_empty, tab_vllm_empty, tab_vllm_errors_empty = st.tabs(
         ["Registry", "vLLM", "vLLM errors"]
     )

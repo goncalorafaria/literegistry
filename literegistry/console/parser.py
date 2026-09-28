@@ -95,7 +95,7 @@ def find_recent_files(root, name_patterns=None, max_age_seconds=DEFAULT_LOG_MAX_
         return []
 
     max_age_minutes = max(1, int(max_age_seconds / 60))
-    cmd = ["find", str(root), "-type", "f", "-mmin", "-{}".format(max_age_minutes)]
+    cmd = ["find", "-L", str(root), "-type", "f", "-mmin", "-{}".format(max_age_minutes)]
     if name_patterns:
         if len(name_patterns) == 1:
             cmd.extend(["-name", name_patterns[0]])
@@ -279,46 +279,17 @@ def parse_registry_summary(output, ts=None):
 
 
 def poll_registry_summary(registry_url, timeout_seconds=4.0):
-    if not registry_url:
-        return []
-
-    try:
-        result = subprocess.run(
-            ["literegistry", "summary", "--registry", registry_url],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return []
-
-    return parse_registry_summary(result.stdout)
+    return poll_registry_summary_with_status(registry_url, timeout_seconds)[0]
 
 
 def poll_registry_summary_with_status(registry_url, timeout_seconds=4.0):
     if not registry_url:
         return [], "No registry URL provided."
-
+    from literegistry.console.live import registry_summary
     try:
-        result = subprocess.run(
-            ["literegistry", "summary", "--registry", registry_url],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-        )
-    except subprocess.TimeoutExpired:
-        return [], "Registry summary timed out."
-    except OSError as exc:
-        return [], "Could not run literegistry: {}".format(exc)
-
-    rows = parse_registry_summary(result.stdout)
-    if rows:
-        return rows, ""
-
-    detail = result.stderr.strip() or result.stdout.strip() or "No parseable registry rows."
-    return [], detail
+        return registry_summary(registry_url, timeout_seconds), ""
+    except Exception as exc:
+        return [], "Registry discovery failed: {}".format(exc)
 
 
 def unique_values(rows, key):

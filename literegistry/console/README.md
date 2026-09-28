@@ -71,3 +71,20 @@ Runtime shape:
 The initial files are tailed from the end after optional seed parsing, so the app does
 not replay the same existing log lines twice or scan historical gateway logs. Newly
 discovered log files are read from the beginning so startup lines are not missed.
+
+## Shared head registry and live gateways
+
+Pass a head discovery URI to follow Redis replacements automatically:
+
+```bash
+literegistry console --registry head+sqlite:///path/to/head.sqlite3 --ngrok=False
+```
+
+The console polls registry services in-process and reads `/gateway-stats` directly
+from endpoints published under `gateway` and `gateway-monitor` in the head registry.
+Each trainer should publish a TTL-renewed `gateway-monitor` record with its own
+publisher ID. This monitoring name does not replace the shared bootstrap gateway.
+The panel shows completed request counters by gateway/route and recent completion
+latencies. Counts include failures; they are not ingress, success, or queue counts.
+A discovered gateway with no completed requests appears in the endpoint details.
+vLLM engine throughput and queue metrics continue to come from the selected logs.

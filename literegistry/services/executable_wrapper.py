@@ -1,4 +1,5 @@
 import subprocess
+import logging
 import requests
 import time
 import socket
@@ -173,41 +174,57 @@ class ExecutableWrapper(ABC):
     def check_health(self):
         """Check if server is responding"""
         try:
-            response = requests.get(f"http://localhost:{self.port}/v1/models")
+            response = requests.get(f"http://localhost:{self.port}/v1/models", timeout=10)
             return response.status_code == 200
         except requests.exceptions.RequestException:
             return False
 
     def heartbeat_loop(self):
-        """Run heartbeat in a loop"""
-        while self.should_run:
-            if self.check_health():
-                if not self._registered:
-                    asyncio.run(
-                        self.registry.register_server(
-                            url=self.url,
-                            port=self.port,
-                            metadata=self._registration_metadata,
-                        )
-                    )
-                    self._registered = True
-                    print("Server healthy and registered")
-                else:
-                    asyncio.run(self.registry.heartbeat(self.url, self.port))
-                # print("Heartbeat sent. Status: healthy")
-            else:
-                print("Server unhealthy!")
-            time.sleep(self.heartbeat_interval)
+        """Keep registry clients and their recovery on one persistent event loop."""
+        async def monitor():
+            self._heartbeat_loop = asyncio.get_running_loop()
+            self._heartbeat_task = asyncio.current_task()
+            try:
+                while self.should_run:
+                    try:
+                        if await asyncio.to_thread(self.check_health):
+                            if not self._registered:
+                                await self.registry.register_server(
+                                    url=self.url, port=self.port,
+                                    metadata=self._registration_metadata,
+                                )
+                                self._registered = True
+                            else:
+                                await self.registry.heartbeat(self.url, self.port)
+                    except Exception:
+                        logging.exception("Model registry heartbeat failed; retrying")
+                    await asyncio.sleep(self.heartbeat_interval)
+            except asyncio.CancelledError:
+                pass
+            finally:
+                try:
+                    if self._registered:
+                        await asyncio.wait_for(self.registry.deregister(), timeout=5)
+                except Exception:
+                    logging.exception("Model deregistration failed; registration will expire")
+                finally:
+                    await self.registry.store.close()
+        asyncio.run(monitor())
 
     def cleanup(self):
-        """Clean up resources"""
+        """Stop registration on its owning loop before stopping the model."""
         self.should_run = False
-        if self._registered:
-            asyncio.run(self.registry.deregister())
+        loop = getattr(self, "_heartbeat_loop", None)
+        task = getattr(self, "_heartbeat_task", None)
+        if loop is not None and not loop.is_closed() and task is not None:
+            loop.call_soon_threadsafe(task.cancel)
+        thread = getattr(self, "heartbeat_thread", None)
+        if thread is not None:
+            thread.join(timeout=15)
         if self.process:
             self.process.terminate()
             self.process.wait()
-        print("Server stopped and deregistered")
+        print("Server stopped")
 
     def run(self):
         """Run server and monitoring"""
@@ -217,9 +234,8 @@ class ExecutableWrapper(ABC):
             time.sleep(30)  # Wait for model to load
 
             # Start heartbeat in background thread
-            heartbeat_thread = threading.Thread(target=self.heartbeat_loop)
-            heartbeat_thread.daemon = True
-            heartbeat_thread.start()
+            self.heartbeat_thread = threading.Thread(target=self.heartbeat_loop, daemon=True)
+            self.heartbeat_thread.start()
 
             # Wait for shutdown signal
             self.process.wait()

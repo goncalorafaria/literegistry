@@ -8,6 +8,7 @@ running a Redis service. Operations run in worker threads so synchronous
 from __future__ import annotations
 
 import asyncio
+from contextlib import closing
 import json
 import math
 from pathlib import Path
@@ -134,7 +135,22 @@ class SQLiteKVStore(KeyValueStore):
         return connection
 
     def _initialize_sync(self) -> None:
-        with self._connect() as connection:
+        # Discovery creates short-lived stores frequently. An initialized DB
+        # must not take schema/migration write locks just to read endpoints.
+        if self.path.exists():
+            with closing(self._read_connect()) as connection:
+                names = {row[0] for row in connection.execute("SELECT name FROM sqlite_master")}
+                required = {_TABLE, _AFFINITY_TABLE, f"{_TABLE}_expires_at",
+                            f"{_AFFINITY_TABLE}_lookup", f"{_AFFINITY_TABLE}_server",
+                            f"{_AFFINITY_TABLE}_expires_at"}
+                if required <= names:
+                    legacy = connection.execute(
+                        f"SELECT 1 FROM {_TABLE} WHERE key >= ? AND key < ? LIMIT 1",
+                        _prefix_bounds(_AFFINITY_PREFIX),
+                    ).fetchone()
+                    if legacy is None:
+                        return
+        with closing(self._connect()) as connection, connection:
             # DELETE journaling avoids WAL's shared-memory requirement and is
             # the more portable choice when the database lives on shared disk.
             connection.execute("PRAGMA journal_mode = DELETE")
@@ -305,7 +321,7 @@ class SQLiteKVStore(KeyValueStore):
     async def get(self, key: str) -> Optional[bytes]:
         def operation() -> Optional[bytes]:
             now = time.time()
-            with self._read_connect() as connection:
+            with closing(self._read_connect()) as connection, connection:
                 tables = (
                     (_AFFINITY_TABLE, _TABLE)
                     if key.startswith(_AFFINITY_PREFIX)
@@ -339,7 +355,7 @@ class SQLiteKVStore(KeyValueStore):
         affinity_columns = self._affinity_columns(key, payload, expires_at)
 
         def operation() -> None:
-            with self._connect() as connection:
+            with closing(self._connect()) as connection, connection:
                 if affinity_columns is not None:
                     (
                         service,
@@ -396,7 +412,7 @@ class SQLiteKVStore(KeyValueStore):
 
     async def delete(self, key: str) -> bool:
         def operation() -> bool:
-            with self._connect() as connection:
+            with closing(self._connect()) as connection, connection:
                 cursor = connection.execute(
                     f"DELETE FROM {_TABLE} WHERE key = ?",
                     (key,),
@@ -417,7 +433,7 @@ class SQLiteKVStore(KeyValueStore):
 
     async def keys(self, prefix: Optional[str] = None) -> list[str]:
         def operation() -> list[str]:
-            with self._read_connect() as connection:
+            with closing(self._read_connect()) as connection, connection:
                 keys: set[str] = set()
                 for table in (_TABLE, _AFFINITY_TABLE):
                     query, parameters = self._live_key_query(
@@ -440,7 +456,7 @@ class SQLiteKVStore(KeyValueStore):
         """Return matching live rows with one indexed SQLite query."""
 
         def operation() -> list[tuple[str, bytes]]:
-            with self._read_connect() as connection:
+            with closing(self._read_connect()) as connection, connection:
                 items: dict[str, bytes] = {}
                 for table in (_TABLE, _AFFINITY_TABLE):
                     query, parameters = self._live_key_query(
@@ -485,7 +501,7 @@ class SQLiteKVStore(KeyValueStore):
                 + " AND ".join(clauses)
                 + " ORDER BY key"
             )
-            with self._read_connect() as connection:
+            with closing(self._read_connect()) as connection, connection:
                 rows = connection.execute(query, parameters).fetchall()
                 return [(str(key), bytes(value)) for key, value in rows]
 
@@ -510,7 +526,7 @@ class SQLiteKVStore(KeyValueStore):
             if service is not None:
                 clauses.append("service = ?")
                 parameters.append(service)
-            with self._connect() as connection:
+            with closing(self._connect()) as connection, connection:
                 cursor = connection.execute(
                     f"DELETE FROM {_AFFINITY_TABLE} WHERE "
                     + " AND ".join(clauses),
