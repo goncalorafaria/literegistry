@@ -1,6 +1,7 @@
 """Asynchronous clients for LiteRegistry tool services."""
 
 from ._transport import ToolClient
+from .botbook import DEFAULT_BOTBOOK_GATEWAY_URL, BotbookClient
 from .code import DEFAULT_CODE_SERVER_URL, RemoteCodeExecutionClient
 from .fetch import DEFAULT_FETCH_SERVER_URL, FetchClient
 from .judge import DEFAULT_JUDGE_SERVER_URL, JudgeClient
@@ -24,6 +25,8 @@ from .terminal import DEFAULT_TERMINAL_SERVER_URL, TerminalExecutionClient
 from .webterminal import WebTerminalExecutionClient
 
 __all__ = [
+    "DEFAULT_BOTBOOK_GATEWAY_URL",
+    "BotbookClient",
     "DEFAULT_CLASSIFY_SERVER_URL",
     "DEFAULT_CODE_SERVER_URL",
     "DEFAULT_FETCH_SERVER_URL",

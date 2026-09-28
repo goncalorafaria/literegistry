@@ -23,6 +23,7 @@ def test_canonical_modules_are_importable() -> None:
         "literegistry.services.bm25_server",
         "literegistry.services.podman",
         "literegistry.services.podman_server",
+        "literegistry.services.botbook_server",
         "literegistry.services.docker_mirror_server",
         "literegistry.services.docker_mirror_warmup",
         "literegistry.services.affinity_mock_server",

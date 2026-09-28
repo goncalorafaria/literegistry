@@ -28,6 +28,7 @@ import literegistry.services.terminal_server as terminal_server
 import literegistry.services.search_server as search_server
 import literegistry.services.bm25_server as bm25_server
 import literegistry.services.podman_server as podman_server
+import literegistry.services.botbook_server as botbook_server
 import literegistry.services.docker_mirror_server as docker_mirror_server
 import literegistry.console.launcher as console_launcher
 
@@ -185,6 +186,7 @@ def main():
         "gateway": gateway.main,
         "old-gateway": old_gateway.main,
         "podman": podman_server.main,
+        "botbook": botbook_server.main,
         "docker-mirror": docker_mirror_server.main,
         "openai-proxy": openai_proxy.main,
         "vllm": vllm.main,
