@@ -64,6 +64,7 @@ nav:
   - Package layout: package-layout.md
   - vLLM & SGLang: vllm-sglang.md
   - Code & Terminal: code-and-terminal.md
+  - Botbook: botbook.md
   - Podman: podman.md
   - Docker mirror: docker-mirror.md
   - Load balancing: load-balancing.md

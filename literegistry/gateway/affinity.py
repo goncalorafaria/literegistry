@@ -644,6 +644,10 @@ class StrictAffinityGateway:
         """Execute a command on the replica selected by the handshake."""
         return await self.forward(request, "podman")
 
+    async def botbook(self, request: Request) -> Response:
+        """Execute a messaging operation on the session owner."""
+        return await self.forward(request, "botbook")
+
     async def close(self, request: Request) -> Response:
         """Close the upstream session and release its affinity binding."""
         return await self.forward(request, "close")
@@ -654,6 +658,7 @@ class StrictAffinityGateway:
             Route("/affinity/kv/put", self.put, methods=["POST"]),
             Route("/affinity/kv/get", self.get, methods=["POST"]),
             Route("/affinity/podman", self.podman, methods=["POST"]),
+            Route("/affinity/botbook", self.botbook, methods=["POST"]),
             Route("/affinity/close", self.close, methods=["POST"]),
         ]
 
