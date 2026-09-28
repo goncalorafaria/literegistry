@@ -865,7 +865,7 @@ class TerminalPipelineServer:
         self._max_response_chars = (
             self.config.max_response_chars
             if self.config.max_response_chars is not None
-            else self.config.max_output_bytes
+            else (self.config.max_output_bytes or None)
         )
         self.registry = ServerRegistry(store=get_kvstore(self.config.registry))
         self.url = f"http://{socket.getfqdn()}"
@@ -890,13 +890,33 @@ class TerminalPipelineServer:
         }
 
     async def _terminate(self, process: asyncio.subprocess.Process) -> None:
-        if process.returncode is not None:
-            return
+        if process.returncode is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+        async def discard(stream: asyncio.StreamReader | None) -> None:
+            if stream is not None:
+                while await stream.read(64 * 1024):
+                    pass
+
+        # Readers must already be cancelled/joined. Drain remaining pipe data
+        # before waiting: asyncio process.wait() can otherwise remain blocked.
+        await asyncio.gather(
+            discard(process.stdout), discard(process.stderr), process.wait()
+        )
+
+    async def _feed_stdin(self, process: asyncio.subprocess.Process, data: bytes) -> None:
+        assert process.stdin is not None
         try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            return
-        await process.wait()
+            process.stdin.write(data)
+            await process.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            # head and similar commands can exit before consuming all input.
+            pass
+        finally:
+            process.stdin.close()
 
     async def _read_limited(
         self, stream: asyncio.StreamReader, limit: int, stream_name: str
@@ -906,7 +926,7 @@ class TerminalPipelineServer:
         total = 0
         while chunk := await stream.read(64 * 1024):
             total += len(chunk)
-            if total > limit:
+            if limit and total > limit:
                 raise PipelineLimitError(
                     f"pipeline {stream_name} exceeded the configured limit"
                 )
@@ -918,7 +938,7 @@ class TerminalPipelineServer:
     ) -> tuple[str, bool, int]:
         if truncation is None:
             return stdout, False, 0
-        if truncation > self._max_response_chars:
+        if self._max_response_chars is not None and truncation > self._max_response_chars:
             raise PipelineValidationError(
                 f"truncation cannot exceed the server maximum of "
                 f"{self._max_response_chars} characters"
@@ -968,18 +988,7 @@ class TerminalPipelineServer:
                 assert process.stdin is not None
                 assert process.stdout is not None
                 assert process.stderr is not None
-                try:
-                    process.stdin.write(data)
-                    await asyncio.wait_for(process.stdin.drain(), timeout=remaining)
-                except (BrokenPipeError, ConnectionResetError):
-                    # Commands such as ``head`` may intentionally exit before
-                    # consuming all input.
-                    pass
-                except asyncio.TimeoutError:
-                    await self._terminate(process)
-                    raise
-                finally:
-                    process.stdin.close()
+                stdin_task = asyncio.create_task(self._feed_stdin(process, data))
                 stdout_task = asyncio.create_task(
                     self._read_limited(
                         process.stdout, self.config.max_output_bytes, "output"
@@ -991,17 +1000,19 @@ class TerminalPipelineServer:
                     )
                 )
                 try:
-                    stdout, stderr, _ = await asyncio.wait_for(
-                        asyncio.gather(stdout_task, stderr_task, process.wait()),
-                        timeout=remaining,
+                    _, stdout, stderr, _ = await asyncio.wait_for(
+                        asyncio.gather(stdin_task, stdout_task, stderr_task, process.wait()),
+                        timeout=max(0, deadline - asyncio.get_running_loop().time()),
                     )
-                except (asyncio.TimeoutError, PipelineLimitError):
-                    await self._terminate(process)
+                except BaseException:
+                    for task in (stdin_task, stdout_task, stderr_task):
+                        task.cancel()
                     await asyncio.gather(
-                        stdout_task, stderr_task, return_exceptions=True
+                        stdin_task, stdout_task, stderr_task, return_exceptions=True
                     )
+                    await self._terminate(process)
                     raise
-                if len(stdout) > self.config.max_output_bytes:
+                if self.config.max_output_bytes and len(stdout) > self.config.max_output_bytes:
                     raise PipelineLimitError("pipeline output exceeded the configured limit")
                 if len(stderr) > self.config.max_stderr_bytes:
                     raise PipelineLimitError("pipeline stderr exceeded the configured limit")
@@ -1129,7 +1140,7 @@ def main(
     max_response_chars: int | None = None,
     command_path: str | None = None,
 ) -> None:
-    """Run the restricted terminal pipeline server with uvicorn."""
+    """Run the terminal server; max_output_bytes=0 disables the output byte cap."""
     import uvicorn
 
     config = TerminalServerConfig(

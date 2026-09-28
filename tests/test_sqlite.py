@@ -58,13 +58,21 @@ def test_sqlite_store_crud_prefix_and_persistence(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
-def test_sqlite_store_expires_ttl_records(tmp_path: Path) -> None:
+def test_sqlite_store_expires_ttl_records(tmp_path: Path, monkeypatch) -> None:
+    from types import SimpleNamespace
+    import time
+    import literegistry.sqlite as sqlite_module
+
+    clock = [time.time()]
+    monkeypatch.setattr(sqlite_module, "time", SimpleNamespace(
+        time=lambda: clock[0], monotonic=time.monotonic,
+    ))
     async def scenario() -> None:
         store = SQLiteKVStore(tmp_path / "registry.sqlite3")
         await store.set("short", "value", ttl_seconds=0.05)
         await store.set("durable", "value")
         assert await store.get("short") == b"value"
-        await asyncio.sleep(0.08)
+        clock[0] += 0.08
         assert await store.get("short") is None
         assert not await store.exists("short")
         assert await store.keys() == ["durable"]
@@ -293,3 +301,17 @@ def test_sqlite_migrates_legacy_affinity_rows_transparently(tmp_path: Path) -> N
 def test_sqlite_uri_rejects_unsupported_forms(uri: str) -> None:
     with pytest.raises(ValueError):
         sqlite_registry_path(uri)
+
+
+def test_open_existing_store_does_not_require_write_lock(tmp_path):
+    path = tmp_path / 'head.sqlite3'
+    first = SQLiteKVStore(path)
+    writer = sqlite3.connect(path)
+    try:
+        writer.execute('BEGIN IMMEDIATE')
+        second = SQLiteKVStore(path, timeout=0.05)
+        asyncio.run(second.close())
+    finally:
+        writer.rollback()
+        writer.close()
+        asyncio.run(first.close())

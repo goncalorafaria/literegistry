@@ -456,3 +456,53 @@ def test_response_truncation_cannot_exceed_server_limit():
 
     with pytest.raises(PipelineValidationError, match="server maximum"):
         server._truncate_stdout("abcdef", 4)
+
+
+@pytest.mark.parametrize('command', ['cat', 'head -n 200'])
+def test_large_output_does_not_deadlock_and_counts_unicode_characters(command):
+    server = _server()
+    server.config.max_output_bytes = 0
+    text = ('é' * 6000 + '\n') * 200
+    async def run():
+        return await asyncio.wait_for(server.execute(TerminalRequest(
+            contents=text, command=command, truncation=10000, max_runtime=3)), 5)
+    result = asyncio.run(run())
+    missing = len(text) - 10000
+    assert result.success
+    assert result.truncated_characters == missing
+    assert result.stdout == text[:10000] + f'\n[ truncated ({missing} characters missing) ]'
+
+
+def test_large_input_early_exit_and_downstream_pipeline():
+    server = _server()
+    server.config.max_output_bytes = 0
+    async def run():
+        return await asyncio.wait_for(server.execute(TerminalRequest(
+            contents='abc\n' * 500000, command='cat | head -n 1', max_runtime=3)), 5)
+    assert asyncio.run(run()).stdout == 'abc\n'
+
+
+@pytest.mark.parametrize('cancel', [False, True])
+def test_subprocess_timeout_and_cancellation_reap_child(cancel):
+    import sys
+    real_spawn = asyncio.create_subprocess_exec
+    children = []
+    async def spawn(*args, **kwargs):
+        child = await real_spawn(sys.executable, '-c',
+            "import sys,time; sys.stdout.write('x'*200000); sys.stdout.flush(); time.sleep(60)",
+            **kwargs)
+        children.append(child)
+        return child
+    async def run():
+        server = _server()
+        with patch('asyncio.create_subprocess_exec', side_effect=spawn):
+            task = asyncio.create_task(server.execute(TerminalRequest(
+                contents='x'*1000000, command='cat', max_runtime=0.2 if not cancel else 5)))
+            if cancel:
+                while not children:
+                    await asyncio.sleep(0.01)
+                task.cancel()
+            with pytest.raises(asyncio.CancelledError if cancel else asyncio.TimeoutError):
+                await asyncio.wait_for(task, 3)
+        assert children[0].returncode is not None
+    asyncio.run(run())

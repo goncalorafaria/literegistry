@@ -2,8 +2,7 @@ from literegistry import ServerRegistry, get_kvstore
 import asyncio
 from fastapi import FastAPI, HTTPException
 from typing import List, Optional, Dict, Any
-import time
-from threading import Thread
+import logging
 import socket
 
 
@@ -48,7 +47,7 @@ class ServiceAPI(FastAPI):
             store=store,#RedisKVStore("redis://klone-login01.hyak.local:6379"),#FileSystemKVStore(self.registry_path),
             max_history=max_history,
         )
-        self.heartbeat_thread = None
+        self.heartbeat_task = None
         self.url = f"http://{hostname}"
 
         # Register startup and shutdown events
@@ -68,24 +67,29 @@ class ServiceAPI(FastAPI):
                 metadata=self.metadata,
             )
 
-            # Start heartbeat thread
-            self._start_heartbeat_thread()
+            # Keep registration on the application event loop
+            self._start_heartbeat_task()
 
     def _register_shutdown_events(self):
         """Register shutdown event handlers."""
 
         @self.on_event("shutdown")
         async def shutdown_event():
-            if self.registry:
-                await self.registry.deregister()
+            if self.heartbeat_task is not None:
+                self.heartbeat_task.cancel()
+                await asyncio.gather(self.heartbeat_task, return_exceptions=True)
+            try:
+                await asyncio.wait_for(self.registry.deregister(), timeout=5)
+            finally:
+                await self.registry.store.close()
 
-    def _start_heartbeat_thread(self):
-        """Start a daemon thread for heartbeat operations."""
-
-        def heartbeat_loop():
+    def _start_heartbeat_task(self):
+        async def heartbeat_loop():
             while True:
-                asyncio.run(self.registry.heartbeat(self.url, self.port))
-                time.sleep(self.heartbeat_interval)
+                try:
+                    await self.registry.heartbeat(self.url, self.port)
+                except Exception:
+                    logging.exception("Service heartbeat failed; retrying")
+                await asyncio.sleep(self.heartbeat_interval)
 
-        self.heartbeat_thread = Thread(target=heartbeat_loop, daemon=True)
-        self.heartbeat_thread.start()
+        self.heartbeat_task = asyncio.create_task(heartbeat_loop())
