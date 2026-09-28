@@ -46,3 +46,5 @@ All CLI commands go through `literegistry <subcommand>` (Fire). Registry URLs
 are either `redis://host:port` or a filesystem path.
 
 This site is built with MkDocs and published via GitHub Pages from `master`.
+
+- [Botbook messaging sessions](botbook.md): strict-affinity broadcast and direct messaging backed by Redis.

@@ -213,6 +213,7 @@ def test_gateway_exposes_management_and_declarative_proxy_routes():
         "/affinity/kv/put",
         "/affinity/kv/get",
         "/affinity/podman",
+        "/affinity/botbook",
         "/affinity/close",
         "/v2",
         "/v2/",
