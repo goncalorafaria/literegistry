@@ -17,6 +17,8 @@ from .podman import (
     DEFAULT_PODMAN_GATEWAY_URL,
     DEFAULT_PODMAN_SESSION_IMAGE,
     PodmanExecutionClient,
+    PodmanCommand,
+    PodmanStreamError,
 )
 from .reward_model import DEFAULT_CLASSIFY_SERVER_URL, RewardModelClient
 from .search import DEFAULT_SEARCH_SERVER_URL, SearchClient
@@ -40,6 +42,8 @@ __all__ = [
     "JudgeClient",
     "PlainJsonToolOutputDisplay",
     "PodmanExecutionClient",
+    "PodmanCommand",
+    "PodmanStreamError",
     "RemoteCodeExecutionClient",
     "RewardModelClient",
     "SearchClient",

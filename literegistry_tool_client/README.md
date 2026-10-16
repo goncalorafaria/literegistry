@@ -51,6 +51,40 @@ here implements the common `ToolClient.execute()` interface.
 PrimeBeaker's `primebeaker.client` and `primebeaker.clients` imports remain
 compatibility facades for these same classes.
 
+## Podman live output
+
+The client owns the container session, command handles, and output cursors:
+
+```python
+from literegistry_tool_client import PodmanExecutionClient
+
+async with PodmanExecutionClient(gateway_url) as podman:
+    job = await podman.start_command(command="make build", timeout=60, merge_output=True)
+    async for chunk in job.stream():
+        print(chunk["data"], end="", flush=True)
+    result = await job.wait()
+    print("exit:", result["exit_code"])
+```
+
+For periodic reads, `batch = await job.read()` returns `stdout`, `stderr`, and
+status such as `running`, `done`, and `exit_code`. For a direct iterator, use
+`async for chunk in podman.stream(command="make build", merge_output=True)`.
+No IDs, request tokens, or cursors are needed for these methods.
+
+`merge_output=False` tags chunks as stdout or stderr. Advancing the reader frees
+consumed output; the client acknowledges the final batch on completion.
+`wait()` drains unread output and returns final status without accumulating a
+copy of the command's logs. Its result is cached for repeated calls. Use one
+consumer per command. Final status includes `success`, `exit_code`, `timed_out`,
+and `error`; a nonzero exit code is returned for the caller to handle.
+
+`PodmanStreamError` exposes `status_code` and `code` for HTTP errors, including
+expired output. A failed read preserves the cursor, and the client never
+silently replaces the container or re-runs a command. HTTP requests make one
+attempt. Closing and starting another session cannot redirect an old command
+handle into the new container. An injected HTTP session remains caller-owned.
+The existing `execute()` call still returns one complete result.
+
 ## Botbook
 
 Create a session as one participant, then attach other participants using the same

@@ -525,10 +525,13 @@ class StrictAffinityGateway:
             status_code=503,
         ) from last_unavailable
 
-    async def forward(self, request: Request, endpoint: str) -> Response:
+    async def forward(
+        self, request: Request, endpoint: str, *, payload: Optional[dict[str, Any]] = None,
+    ) -> Response:
         request_id = _request_id(request)
         started = time.monotonic()
-        payload = await self._payload(request)
+        if payload is None:
+            payload = await self._payload(request)
         service, forwarded = self._service(payload)
         affinity_id = forwarded.get("affinity_id")
         if not isinstance(affinity_id, str) or not affinity_id:
@@ -632,7 +635,9 @@ class StrictAffinityGateway:
             liveness_check,
             (time.monotonic() - started) * 1000.0,
         )
-        return JSONResponse(result)
+        return JSONResponse(result, headers={"Cache-Control": "no-store"}
+                            if endpoint.startswith("podman/") else None,
+                            status_code=202 if endpoint == "podman/start" else 200)
 
     async def put(self, request: Request) -> Response:
         return await self.forward(request, "kv/put")
@@ -648,6 +653,25 @@ class StrictAffinityGateway:
         """Execute a messaging operation on the session owner."""
         return await self.forward(request, "botbook")
 
+    async def podman_start(self, request: Request) -> Response:
+        return await self.forward(request, "podman/start")
+
+    async def podman_output(self, request: Request) -> Response:
+        # Error responses such as 410 may otherwise be cached by an HTTP
+        # intermediary, even after the client resumes with a valid cursor.
+        try:
+            return await self.forward(request, "podman/output", payload=dict(request.query_params))
+        except HTTPResponseError as exc:
+            body = exc.body if isinstance(exc.body, (dict, list)) else {
+                "error": str(exc.body), "status": "failed",
+            }
+            return JSONResponse(body, status_code=exc.status, headers={"Cache-Control": "no-store"})
+        except GatewayRequestError as exc:
+            return JSONResponse(
+                exc.response_body or {"error": str(exc), "status": "failed"},
+                status_code=exc.status_code, headers={"Cache-Control": "no-store"},
+            )
+
     async def close(self, request: Request) -> Response:
         """Close the upstream session and release its affinity binding."""
         return await self.forward(request, "close")
@@ -658,6 +682,8 @@ class StrictAffinityGateway:
             Route("/affinity/kv/put", self.put, methods=["POST"]),
             Route("/affinity/kv/get", self.get, methods=["POST"]),
             Route("/affinity/podman", self.podman, methods=["POST"]),
+            Route("/affinity/podman/start", self.podman_start, methods=["POST"]),
+            Route("/affinity/podman/output", self.podman_output, methods=["GET"]),
             Route("/affinity/botbook", self.botbook, methods=["POST"]),
             Route("/affinity/close", self.close, methods=["POST"]),
         ]

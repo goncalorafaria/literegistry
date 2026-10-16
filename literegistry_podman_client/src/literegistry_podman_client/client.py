@@ -8,7 +8,8 @@ from dataclasses import dataclass
 import json
 from collections.abc import AsyncIterator, Mapping
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
+from uuid import uuid4
 
 import aiohttp
 
@@ -367,6 +368,42 @@ class PodmanClient:
         )
         return CommandResult.from_payload(response)
 
+    async def start_command(
+        self, affinity_id: str, command: str, *, stdin: str = "",
+        timeout: float = 10.0, workdir: str | None = None,
+        merge_output: bool = False, request_id: str | None = None,
+    ) -> "PodmanCommand":
+        """Start once and return a handle for incremental output polling.
+
+        Supply a stable request_id to safely retry an uncertain start within
+        the worker's retention window. Commands on a busy session return 409.
+        """
+        if not isinstance(affinity_id, str) or not affinity_id.strip():
+            raise ValueError("affinity_id must be a non-empty string")
+        if not isinstance(command, str) or not command.strip():
+            raise ValueError("command must be a non-empty string")
+        response = await self._post("affinity/podman/start", {
+            "service": self.service, "affinity_id": affinity_id,
+            "command": command, "stdin": stdin, "timeout": timeout,
+            "workdir": self.workdir if workdir is None else workdir,
+            "merge_output": merge_output,
+            "request_id": uuid4().hex if request_id is None else request_id,
+        })
+        command_id = response.get("command_id")
+        if not isinstance(command_id, str) or not command_id:
+            raise PodmanGatewayError("invalid command start response", response=response)
+        return PodmanCommand(client=self, affinity_id=affinity_id, command_id=command_id)
+
+    async def command_output(
+        self, affinity_id: str, command_id: str, *, cursor: int = 0,
+        wait_ms: int = 1000, max_chunks: int = 64,
+    ) -> JsonObject:
+        """Read output; cursor acknowledges and frees all previous chunks."""
+        query = urlencode({"service": self.service, "affinity_id": affinity_id,
+                           "command_id": command_id, "cursor": cursor,
+                           "wait_ms": wait_ms, "max_chunks": max_chunks})
+        return await self._request("GET", f"affinity/podman/output?{query}")
+
     async def close(self, affinity_id: str) -> JsonObject:
         """Delete one container and its affinity binding."""
         if not isinstance(affinity_id, str) or not affinity_id.strip():
@@ -389,6 +426,86 @@ class PodmanClient:
             yield podman_session
         finally:
             await podman_session.close()
+
+
+class PodmanCommand:
+    """A running command and its single-consumer acknowledgement cursor."""
+
+    def __init__(self, *, client: PodmanClient, affinity_id: str, command_id: str) -> None:
+        self.client = client
+        self.affinity_id = affinity_id
+        self.command_id = command_id
+        self.cursor = 0
+        self._poll_lock = asyncio.Lock()
+        self._final: JsonObject | None = None
+        self._acknowledged = False
+
+    async def poll(self, *, wait_ms: int = 1000, max_chunks: int = 64) -> JsonObject:
+        """Return the next batch, advancing only after a successful response."""
+        async with self._poll_lock:
+            response = await self.client.command_output(
+                self.affinity_id, self.command_id, cursor=self.cursor,
+                wait_ms=wait_ms, max_chunks=max_chunks,
+            )
+            next_cursor = response.get("next_cursor")
+            if type(next_cursor) is not int or next_cursor < self.cursor:
+                raise PodmanGatewayError("invalid command output cursor", response=response)
+            if (not isinstance(response.get("chunks"), list)
+                    or type(response.get("done")) is not bool
+                    or type(response.get("has_more")) is not bool):
+                raise PodmanGatewayError("invalid command output batch", response=response)
+            for chunk in response["chunks"]:
+                if (not isinstance(chunk, dict) or chunk.get("stream") not in {"stdout", "stderr"}
+                        or not isinstance(chunk.get("data"), str)):
+                    raise PodmanGatewayError("invalid command output chunk", response=response)
+            self.cursor = next_cursor
+            if response["done"] and not response["has_more"]:
+                self._final = {key: response.get(key) for key in
+                               ("exit_code", "success", "timed_out", "error")}
+            return response
+
+    async def read(self, *, wait_ms: int = 1000) -> JsonObject:
+        """Read a batch of stdout/stderr and status, without protocol IDs."""
+        batch = await self.poll(wait_ms=wait_ms)
+        return {
+            "stdout": "".join(c["data"] for c in batch["chunks"] if c["stream"] == "stdout"),
+            "stderr": "".join(c["data"] for c in batch["chunks"] if c["stream"] == "stderr"),
+            **{key: batch.get(key) for key in
+               ("running", "done", "has_more", "exit_code", "success", "timed_out", "error")},
+        }
+
+    async def stream(self, *, wait_ms: int = 1000) -> AsyncIterator[dict[str, str]]:
+        """Yield {stream, data} chunks and manage cursors and acknowledgement."""
+        if self._final is None:
+            async for batch in self.output(wait_ms=wait_ms):
+                for chunk in batch["chunks"]:
+                    yield {"stream": chunk["stream"], "data": chunk["data"]}
+        else:
+            await self.wait(wait_ms=wait_ms)
+
+    async def wait(self, *, wait_ms: int = 1000) -> JsonObject:
+        """Drain unread output and return final status, without accumulating logs."""
+        while self._final is None:
+            await self.poll(wait_ms=wait_ms)
+        if not self._acknowledged:
+            try:
+                await self.poll(wait_ms=0)
+            except PodmanGatewayError as exc:
+                if exc.status_code != 410 or _error_detail(exc.response).get("code") not in {
+                    "command_expired", "output_expired",
+                }:
+                    raise
+            self._acknowledged = True
+        return dict(self._final)
+
+    async def output(self, *, wait_ms: int = 1000) -> AsyncIterator[JsonObject]:
+        """Yield batches through the final status and acknowledge the last batch."""
+        while True:
+            batch = await self.poll(wait_ms=wait_ms)
+            yield batch
+            if batch["done"] and not batch["has_more"]:
+                await self.wait(wait_ms=0)
+                return
 
 
 class PodmanSession:
@@ -415,6 +532,31 @@ class PodmanSession:
     @property
     def closed(self) -> bool:
         return self._closed
+
+    async def start_command(
+        self, command: str, *, stdin: str = "", timeout: float = 10.0,
+        workdir: str | None = None, merge_output: bool = False,
+        request_id: str | None = None,
+    ) -> PodmanCommand:
+        if self._loss is not None:
+            raise self._loss
+        if self.closed:
+            raise PodmanGatewayError("cannot execute on a closed Podman session")
+        try:
+            return await self.client.start_command(
+                self.affinity_id, command, stdin=stdin, timeout=timeout,
+                workdir=workdir, merge_output=merge_output, request_id=request_id,
+            )
+        except PodmanContainerLostError as exc:
+            self._loss = exc
+            self._closed = True
+            raise
+
+    async def stream(self, command: str, **options: Any) -> AsyncIterator[dict[str, str]]:
+        """Start a command and yield stdout/stderr chunks with IDs managed here."""
+        job = await self.start_command(command, **options)
+        async for chunk in job.stream():
+            yield chunk
 
     async def execute(
         self,

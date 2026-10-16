@@ -3,6 +3,7 @@
 from .client import (
     CommandResult,
     PodmanCommandError,
+    PodmanCommand,
     PodmanContainerLostError,
     PodmanClient,
     PodmanGatewayError,
@@ -12,6 +13,7 @@ from .client import (
 __all__ = [
     "CommandResult",
     "PodmanCommandError",
+    "PodmanCommand",
     "PodmanContainerLostError",
     "PodmanClient",
     "PodmanGatewayError",

@@ -37,6 +37,40 @@ from literegistry_podman_client import PodmanClient
 
 Its runtime dependencies are `aiohttp` and Python Fire.
 
+## Live command output
+
+With a gateway and worker that support command polling, use the optional
+`start_command()` flow to receive output while a command runs:
+
+```python
+async with PodmanClient(gateway_url) as client:
+    async with client.session(image="python:3.12-slim") as session:
+        job = await session.start_command(
+            "python -u -c 'import time; print(1); time.sleep(2); print(2)'",
+            timeout=10,
+            merge_output=True,
+        )
+        async for chunk in job.stream():
+            print(chunk["data"], end="", flush=True)
+        result = await job.wait()
+        assert result["success"], result
+```
+
+`merge_output=False` keeps stdout/stderr tagged separately. `job.read()` returns
+the next stdout/stderr text and status, and `job.wait()` drains unread output
+and caches final status without retaining a copy of the logs. For a direct
+iterator use `session.stream("make build", merge_output=True)`. These APIs manage
+IDs, cursors, and final acknowledgement internally. Use one consumer per command.
+The raw `job.poll()` and `job.output()` batch APIs remain available for advanced
+use. Advancing the cursor frees consumed output. Slow readers can receive
+HTTP 410 `output_expired`; command results also expire after the worker's
+retention period. Neither error means the container was lost. For reconnects,
+save `job.command_id` and `job.cursor` and use `client.command_output()`.
+Retry an uncertain start with the same explicit `request_id` while retained
+to receive the original handle instead of executing twice.
+
+See [the worker API and limits](../docs/podman.md#optional-live-command-output).
+
 ## Give a deployment to someone
 
 The operator gives the user one value:

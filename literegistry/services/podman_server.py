@@ -184,6 +184,9 @@ def main(
         os.environ.get("PODMAN_AFFINITY_HEARTBEAT_INTERVAL", "10")
     ),
     allow_non_loopback: bool = False,
+    max_stream_commands: int = int(os.environ.get("PODMAN_MAX_STREAM_COMMANDS", "64")),
+    stream_buffer_bytes: int = int(os.environ.get("PODMAN_STREAM_BUFFER_BYTES", "1048576")),
+    stream_retention_seconds: float = float(os.environ.get("PODMAN_STREAM_RETENTION_SECONDS", "300")),
 ) -> None:
     """Run the one-worker Podman HTTP server and register it in Redis.
 
@@ -216,6 +219,9 @@ def main(
         heartbeat_interval: Seconds between Redis heartbeats.
         allow_non_loopback: Explicitly permit a managed cluster bind. This is
             required for Beaker host networking and must not be used casually.
+        max_stream_commands: Maximum running and retained streaming commands.
+        stream_buffer_bytes: Maximum unacknowledged output bytes per command.
+        stream_retention_seconds: Lifetime of command output/results after exit.
     """
     if host not in {"127.0.0.1", "localhost", "::1"} and not allow_non_loopback:
         raise ValueError(
@@ -237,6 +243,9 @@ def main(
         image_prune_until=image_prune_until,
         instance_id=instance_id,
         registry_mirror=registry_mirror,
+        max_stream_commands=max_stream_commands,
+        stream_buffer_bytes=stream_buffer_bytes,
+        stream_retention_seconds=stream_retention_seconds,
     )
     registration = RedisRegistration(
         registry_url=registry,
