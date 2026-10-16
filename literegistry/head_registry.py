@@ -102,6 +102,10 @@ class HeadRegistryKVStore(KeyValueStore):
     Operations wait indefinitely by default while Redis is unavailable. They
     remain cancellable, and :meth:`close` wakes any callers waiting for a
     replacement endpoint.
+
+    A healthy Redis client is reused until an operation fails. The head registry
+    is read only for initial discovery and recovery. ``refresh_interval`` is
+    retained for constructor compatibility; it does not expire a working client.
     """
 
     def __init__(
@@ -172,12 +176,13 @@ class HeadRegistryKVStore(KeyValueStore):
             if self._closed:
                 raise HeadRegistryClosedError("head registry store is closed")
             async with self._connection_lock:
+                if self._closed:
+                    raise HeadRegistryClosedError("head registry store is closed")
                 now = time.monotonic()
-                if (
-                    self._client is not None
-                    and not force_check
-                    and now - self._last_head_check < self.refresh_interval
-                ):
+                # Failed clients are invalidated before recovery. Another caller
+                # may already have connected a replacement while we were waiting;
+                # reuse it even when this caller requested a forced check.
+                if self._client is not None:
                     return self._client
 
                 record = await self._read_endpoint()
