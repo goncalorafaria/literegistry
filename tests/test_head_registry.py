@@ -195,7 +195,6 @@ def test_operation_waits_for_replacement_redis(monkeypatch, tmp_path) -> None:
         store = HeadRegistryKVStore(
             tmp_path,
             poll_interval=0.01,
-            refresh_interval=0.01,
         )
         try:
             assert await store.set("before", "old") is True
