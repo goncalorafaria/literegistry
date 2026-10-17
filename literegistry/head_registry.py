@@ -104,8 +104,7 @@ class HeadRegistryKVStore(KeyValueStore):
     replacement endpoint.
 
     A healthy Redis client is reused until an operation fails. The head registry
-    is read only for initial discovery and recovery. ``refresh_interval`` is
-    retained for constructor compatibility; it does not expire a working client.
+    is read only for initial discovery and recovery.
     """
 
     def __init__(
@@ -114,11 +113,10 @@ class HeadRegistryKVStore(KeyValueStore):
         *,
         endpoint_name: str = "redis",
         poll_interval: float = 1.0,
-        refresh_interval: float = 5.0,
         db: int = 0,
     ) -> None:
-        if poll_interval <= 0 or refresh_interval <= 0:
-            raise ValueError("poll_interval and refresh_interval must be positive")
+        if poll_interval <= 0:
+            raise ValueError("poll_interval must be positive")
         self.root = head_registry_backend(root)
         self._display_root = (
             redact_redis_url(self.root)
@@ -127,12 +125,10 @@ class HeadRegistryKVStore(KeyValueStore):
         )
         self.endpoint_name = endpoint_name
         self.poll_interval = float(poll_interval)
-        self.refresh_interval = float(refresh_interval)
         self.db = db
         self.endpoint_registry = get_endpoint_registry(self.root)
         self._client: RedisKVStore | None = None
         self._endpoint_identity: tuple[str, str] | None = None
-        self._last_head_check = 0.0
         self._last_unavailable_log = 0.0
         self._last_unavailable_url: str | None = None
         self._connection_lock = asyncio.Lock()
@@ -171,22 +167,20 @@ class HeadRegistryKVStore(KeyValueStore):
             with suppress(Exception):
                 await client.close()
 
-    async def _connect(self, *, force_check: bool = False) -> RedisKVStore:
+    async def _connect(self) -> RedisKVStore:
         while True:
             if self._closed:
                 raise HeadRegistryClosedError("head registry store is closed")
             async with self._connection_lock:
                 if self._closed:
                     raise HeadRegistryClosedError("head registry store is closed")
-                now = time.monotonic()
                 # Failed clients are invalidated before recovery. Another caller
                 # may already have connected a replacement while we were waiting;
-                # reuse it even when this caller requested a forced check.
+                # reuse it rather than performing discovery again.
                 if self._client is not None:
                     return self._client
 
                 record = await self._read_endpoint()
-                self._last_head_check = now
                 if record is not None:
                     endpoint_url = _beaker_reachable_url(record.uri)
                     identity = (endpoint_url, record.publisher_id)
@@ -238,10 +232,6 @@ class HeadRegistryKVStore(KeyValueStore):
                         )
                         return candidate
 
-                # Keep a working old client across a short publication gap.
-                if self._client is not None and not force_check:
-                    return self._client
-            force_check = True
             await self._sleep()
 
     async def _invalidate(self, client: RedisKVStore) -> None:
@@ -249,7 +239,6 @@ class HeadRegistryKVStore(KeyValueStore):
             if self._client is client:
                 failed_url = client.url
                 await self._disconnect_locked()
-                self._last_head_check = 0.0
                 logger.warning(
                     "Lost Redis %s; waiting for a healthy endpoint in head registry %s",
                     redact_redis_url(failed_url),
@@ -260,16 +249,14 @@ class HeadRegistryKVStore(KeyValueStore):
         self,
         operation: Callable[[RedisKVStore], Awaitable[_T]],
     ) -> _T:
-        force_check = False
         while True:
-            client = await self._connect(force_check=force_check)
+            client = await self._connect()
             try:
                 return await operation(client)
             except HeadRegistryClosedError:
                 raise
             except Exception:
                 await self._invalidate(client)
-                force_check = True
                 await self._sleep()
 
     async def ping(self) -> bool:
