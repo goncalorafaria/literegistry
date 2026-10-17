@@ -457,3 +457,10 @@ building the four package images requires a Docker daemon and network access.
 
 The bundled gateway enables experimental mirror soft affinity by default. If this base deployment is used with external `docker-mirror` services, disable it with
 `--docker-mirror-soft-affinity=False` to restore normal load balancing.
+
+## Gateways shared with Podman
+
+Base gateways default to `--gateway-timeout=840` and
+`--affinity-ttl-seconds=7200`, matching the Podman replay stack. Both settings
+are configurable. This TTL controls session routing mappings, separately from
+command deadlines, container memory limits, and container idle expiry.
