@@ -128,3 +128,70 @@ def test_index_errors_follow_store_policy(raise_on_error):
             assert await store.active_server_keys(0) == []
 
     asyncio.run(scenario())
+
+
+def test_indexed_endpoint_lifecycle(redis_socket, monkeypatch):
+    from literegistry.coop.endpoints import EndpointRegistry
+
+    async def scenario():
+        client = redis.Redis(unix_socket_path=redis_socket)
+        store = RedisKVStore(raise_on_error=True)
+        store._redis = client
+        registry = EndpointRegistry(store, location="test")
+        now = [1000.0]
+        monkeypatch.setattr("literegistry.coop.endpoints.time.time", lambda: now[0])
+        try:
+            async with client.pipeline() as pipe:
+                for number in range(10000):
+                    pipe.set(f"affinity:example:{number}", b"binding")
+                await pipe.execute()
+            await registry.publish("gateway", "http://first", publisher_id="first")
+            monkeypatch.setattr(client, "scan_iter", lambda **kw: pytest.fail("endpoint scanned"))
+            now[0] += 1
+            await registry.publish("gateway", "http://second", publisher_id="second")
+            assert (await registry.get("gateway")).uri == "http://second"
+            # A malformed publisher cannot obscure another live publisher.
+            await store.set_endpoint(registry.prefix("gateway"),
+                                     registry.key("gateway", "bad"), "invalid", ttl_seconds=30)
+            assert (await registry.get("gateway")).uri == "http://second"
+            assert await registry.delete("gateway", publisher_id="first")
+            assert (await registry.get("gateway")).publisher_id == "second"
+            # Native TTL expiration, independent of publisher/reader wall clocks.
+            await client.pexpire(registry.key("gateway", "second"), 1)
+            await asyncio.sleep(0.02)
+            assert await registry.get("gateway") is None
+            assert await client.zscore(store._endpoint_index(registry.prefix("gateway")),
+                                       registry.key("gateway", "second")) is None
+            assert await registry.delete("gateway")  # malformed record
+            assert await registry.get("gateway") is None
+            assert not await registry.delete("gateway")
+            assert await registry.get("gateway") is None  # empty marker avoids SCAN
+        finally:
+            await registry.close()
+
+    asyncio.run(scenario())
+
+
+def test_legacy_endpoint_scan_until_republication(redis_socket, monkeypatch):
+    from literegistry.coop.endpoints import EndpointRegistry
+
+    async def scenario():
+        client = redis.Redis(unix_socket_path=redis_socket)
+        store = RedisKVStore(raise_on_error=True)
+        store._redis = client
+        registry = EndpointRegistry(store, location="test")
+        try:
+            record = await registry.publish("gateway", "http://legacy", publisher_id="old")
+            await client.delete(store._endpoint_index(registry.prefix("gateway")))
+            scan = AsyncMock(wraps=store.keys)
+            monkeypatch.setattr(store, "keys", scan)
+            assert await registry.get("gateway") == record
+            scan.assert_awaited_once()
+            await registry.publish("gateway", "http://updated", publisher_id="old")
+            scan.reset_mock()
+            assert (await registry.get("gateway")).uri == "http://updated"
+            scan.assert_not_awaited()
+        finally:
+            await registry.close()
+
+    asyncio.run(scenario())

@@ -60,6 +60,21 @@ class _FakeRedis(HeartbeatIndexMixin):
             if key.startswith(prefix):
                 yield key.encode()
 
+    async def eval(self, script, numkeys, index):
+        # Endpoint-index lookup; real Lua/TTL behavior is covered with Redis.
+        self._check()
+        assert numkeys == 1 and index.startswith("literegistry:endpoints:v1:")
+        if index not in self.sorted_sets:
+            return None
+        live = []
+        for key in list(self.sorted_sets[index]):
+            if key:
+                if await self.exists(key):
+                    live.append(key.encode())
+                else:
+                    await self.zrem(index, key)
+        return live
+
     async def aclose(self):
         self.closed = True
 
@@ -195,7 +210,6 @@ def test_operation_waits_for_replacement_redis(monkeypatch, tmp_path) -> None:
         store = HeadRegistryKVStore(
             tmp_path,
             poll_interval=0.01,
-            refresh_interval=0.01,
         )
         try:
             assert await store.set("before", "old") is True
