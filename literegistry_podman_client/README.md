@@ -267,3 +267,32 @@ python -m twine upload dist/*
 
 Publishing requires a PyPI account and token. Verify that the distribution
 name `literegistry-podman-client` is available before the first upload.
+
+### Shared gateway discovery
+
+Share one `GatewayDiscovery` across clients in the same event loop (or use one
+`PodmanClient` for all trajectories). Discovery runs once, concurrent callers
+share the result, and successful gateways have no refresh TTL:
+
+```python
+from literegistry_podman_client import GatewayDiscovery, PodmanClient
+
+# Requires `literegistry` in addition to this standalone client package.
+discovery = GatewayDiscovery.from_registry(
+    "redis://registry:6379", endpoint_name="gateway"
+)
+async with PodmanClient(gateway_discovery=discovery) as client:
+    print(client.mirror_url)
+    # Create independent container sessions through this shared client.
+```
+
+For another discovery backend, pass an async function returning an absolute
+HTTP(S) URL to `GatewayDiscovery(discover)`. Explicit `PodmanClient(gateway_url)`
+continues to work without discovery or the `literegistry` dependency.
+
+Only an HTTP transport failure or request timeout invalidates the selection.
+HTTP error responses, including worker capacity errors, do not. The failed
+request is **not retried**: a command may already have executed. The next request
+resolves the gateway again; a late failure from an older selection cannot clear
+a newer one. Canceling one discovery waiter does not cancel the shared lookup.
+Open the client before accessing `mirror_url` when no explicit URL was supplied.

@@ -1,5 +1,7 @@
 """Asynchronous Podman sessions through a LiteRegistry gateway."""
 
+from .discovery import GatewayDiscovery
+
 from .client import (
     CommandResult,
     PodmanCommandError,
@@ -10,6 +12,7 @@ from .client import (
 )
 
 __all__ = [
+    "GatewayDiscovery",
     "CommandResult",
     "PodmanCommandError",
     "PodmanContainerLostError",

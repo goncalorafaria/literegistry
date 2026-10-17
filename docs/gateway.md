@@ -226,3 +226,22 @@ and probe timeouts remain inconclusive. The original transport error is returned
 Strict affinity never changes owners. These checks do not diagnose filesystem
 corruption or choose a training reward/episode policy. The client exception is the
 boundary for callers handling confirmed loss.
+
+### Gateway discovery at high concurrency
+
+Gateway selection belongs to the client. The standalone Podman client provides
+`GatewayDiscovery` to share one lookup across clients and reuse the selection
+until a transport failure. Gateway HTTP responses (including backend 503s) do
+not trigger rediscovery, and failed commands are not automatically reissued.
+See the [Podman client example](../literegistry_podman_client/README.md#shared-gateway-discovery).
+
+Redis endpoint publication now writes a per-name publisher index atomically with
+the existing TTL record. Lookup visits only publishers of that endpoint and
+prunes expired records using Redis TTLs, without scanning unrelated affinity or
+worker keys. File and SQLite endpoint registries keep their existing behavior.
+
+Upgrade **all publishers of an endpoint** before relying on its indexed lookup.
+Their next publication populates the index; readers retain the old scan for a
+legacy endpoint with no index. Once an endpoint is indexed, legacy publishers
+that do not update its index are not discoverable. An empty index retains a
+small marker so repeated lookups of expired endpoints do not scan Redis.

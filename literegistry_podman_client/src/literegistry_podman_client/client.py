@@ -12,6 +12,8 @@ from urllib.parse import urlsplit
 
 import aiohttp
 
+from .discovery import GatewayDiscovery
+
 
 JsonObject = dict[str, Any]
 
@@ -144,20 +146,24 @@ class PodmanClient:
 
     def __init__(
         self,
-        gateway_url: str,
+        gateway_url: str | None = None,
         *,
+        gateway_discovery: GatewayDiscovery | None = None,
         service: str = "podman",
         workdir: str = "/workspace",
         request_timeout: float = 310.0,
         headers: Mapping[str, str] | None = None,
         http_session: aiohttp.ClientSession | None = None,
     ) -> None:
-        if not isinstance(gateway_url, str):
+        if gateway_url is None and gateway_discovery is not None:
+            gateway_url = ""
+        elif not isinstance(gateway_url, str):
             raise TypeError("gateway_url must be a string")
         gateway_url = gateway_url.rstrip("/")
         parsed = urlsplit(gateway_url)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise ValueError("gateway_url must be an absolute HTTP(S) URL")
+        if gateway_url or gateway_discovery is None:
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise ValueError("gateway_url must be an absolute HTTP(S) URL")
         if not isinstance(service, str) or not service.strip():
             raise ValueError("service must be a non-empty string")
         if not isinstance(workdir, str) or not workdir.strip():
@@ -166,6 +172,7 @@ class PodmanClient:
             raise ValueError("request_timeout must be greater than zero")
 
         self.gateway_url = gateway_url
+        self._gateway_discovery = gateway_discovery
         self.service = service.strip()
         self.workdir = workdir
         self.request_timeout = request_timeout
@@ -182,10 +189,14 @@ class PodmanClient:
     @property
     def mirror_url(self) -> str:
         """Docker Registry mirror base URL exposed by the same gateway."""
+        if not self.gateway_url:
+            raise PodmanGatewayError("open the client before using its discovered mirror URL")
         return self.gateway_url
 
     async def open(self) -> "PodmanClient":
         """Open the shared HTTP connection pool and return this client."""
+        if self._gateway_discovery is not None:
+            self.gateway_url, _ = await self._gateway_discovery.resolve()
         async with self._open_lock:
             if self.is_open:
                 return self
@@ -230,7 +241,12 @@ class PodmanClient:
     ) -> JsonObject:
         await self.open()
         assert self._http_session is not None
-        url = f"{self.gateway_url}/{endpoint.lstrip('/')}"
+        gateway_url = self.gateway_url
+        generation = None
+        if self._gateway_discovery is not None:
+            gateway_url, generation = await self._gateway_discovery.resolve()
+            self.gateway_url = gateway_url
+        url = f"{gateway_url}/{endpoint.lstrip('/')}"
         headers = {"accept": "application/json", **self.headers}
         if payload is not None:
             headers["content-type"] = "application/json"
@@ -267,8 +283,11 @@ class PodmanClient:
         except PodmanGatewayError:
             raise
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            if self._gateway_discovery is not None and generation is not None:
+                self._gateway_discovery.invalidate(gateway_url, generation)
+            # The command may already have executed. Never retry it implicitly.
             raise PodmanGatewayError(
-                f"could not reach gateway at {self.gateway_url}: {exc}"
+                f"could not reach gateway at {gateway_url}: {exc}"
             ) from exc
         if not isinstance(result, dict):
             raise PodmanGatewayError(
