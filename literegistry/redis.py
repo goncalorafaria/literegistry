@@ -144,6 +144,88 @@ class RedisKVStore(KeyValueStore):
                 raise
             return False
 
+    @staticmethod
+    def _endpoint_index(prefix: str) -> str:
+        return f"literegistry:endpoints:v1:{prefix}"
+
+    async def set_endpoint(
+        self, prefix: str, key: str, value: str, *, ttl_seconds: float,
+    ) -> bool:
+        """Atomically publish a TTL record and its per-name publisher index."""
+        ttl_seconds = float(ttl_seconds)
+        if not math.isfinite(ttl_seconds) or ttl_seconds <= 0:
+            raise ValueError("ttl_seconds must be a finite value greater than zero")
+        client = await self._get_redis()
+        try:
+            async with client.pipeline(transaction=True) as pipe:
+                pipe.set(
+                    key, value.encode("utf-8"),
+                    px=max(1, math.ceil(ttl_seconds * 1000)),
+                )
+                # Keep a marker so an indexed but empty endpoint never scans.
+                pipe.zadd(self._endpoint_index(prefix), {"": 0, key: 0})
+                await pipe.execute()
+            return True
+        except Exception:
+            if self.raise_on_error:
+                raise
+            return False
+
+    async def endpoint_keys(self, prefix: str) -> List[str]:
+        """Find live publishers without scanning unrelated keys.
+
+        Legacy-only registries retain the old scan until a publisher refreshes.
+        Once indexed, all publishers of that endpoint must use indexed writes.
+        """
+        client = await self._get_redis()
+        try:
+            index = self._endpoint_index(prefix)
+            # Use Redis TTLs as the source of truth, avoiding clock skew between
+            # publishers and readers. Prune absent records atomically with the
+            # read, so a concurrent refresh cannot lose its index membership.
+            keys = await client.eval(
+                """
+                if redis.call('EXISTS', KEYS[1]) == 0 then return nil end
+                local live = {}
+                for _, key in ipairs(redis.call('ZRANGE', KEYS[1], 0, -1)) do
+                    if key ~= '' then
+                        if redis.call('EXISTS', key) == 1 then
+                            table.insert(live, key)
+                        else
+                            redis.call('ZREM', KEYS[1], key)
+                        end
+                    end
+                end
+                return live
+                """,
+                1,
+                index,
+            )
+            if keys is None:
+                return await self.keys(prefix=prefix)
+            return [
+                key.decode("utf-8") if isinstance(key, bytes) else key
+                for key in keys
+            ]
+        except Exception:
+            if self.raise_on_error:
+                raise
+            return []
+
+    async def delete_endpoint(self, prefix: str, key: str) -> bool:
+        """Delete only this publisher's record and index member."""
+        client = await self._get_redis()
+        try:
+            async with client.pipeline(transaction=True) as pipe:
+                pipe.delete(key)
+                pipe.zrem(self._endpoint_index(prefix), key)
+                result = await pipe.execute()
+            return result[0] > 0
+        except Exception:
+            if self.raise_on_error:
+                raise
+            return False
+
     async def set_server(self, key: str, value: str, last_heartbeat: float) -> bool:
         """Atomically persist a server record and its heartbeat index entry."""
         redis_client = await self._get_redis()

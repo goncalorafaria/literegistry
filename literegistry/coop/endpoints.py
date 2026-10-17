@@ -181,16 +181,27 @@ class EndpointRegistry:
             published_at=time.time(),
             metadata=dict(metadata or {}),
         )
-        await self.store.set(
-            self.key(name, publisher_id),
-            record.to_json(),
-            ttl_seconds=ttl_seconds,
-        )
+        indexed_set = getattr(self.store, "set_endpoint", None)
+        if indexed_set is not None:
+            await indexed_set(
+                self.prefix(name), self.key(name, publisher_id),
+                record.to_json(), ttl_seconds=ttl_seconds,
+            )
+        else:
+            await self.store.set(
+                self.key(name, publisher_id), record.to_json(),
+                ttl_seconds=ttl_seconds,
+            )
         return record
 
     async def get(self, name: str) -> EndpointRecord | None:
         records: list[EndpointRecord] = []
-        for key in await self.store.keys(prefix=self.prefix(name)):
+        indexed_keys = getattr(self.store, "endpoint_keys", None)
+        keys = (
+            await indexed_keys(self.prefix(name)) if indexed_keys is not None
+            else await self.store.keys(prefix=self.prefix(name))
+        )
+        for key in keys:
             payload = await self.store.get(key)
             if payload is None:
                 continue
@@ -203,10 +214,21 @@ class EndpointRegistry:
         return max(records, key=lambda record: record.published_at, default=None)
 
     async def delete(self, name: str, *, publisher_id: str | None = None) -> bool:
+        indexed_delete = getattr(self.store, "delete_endpoint", None)
+
+        async def remove(key: str) -> bool:
+            if indexed_delete is not None:
+                return await indexed_delete(self.prefix(name), key)
+            return await self.store.delete(key)
+
         if publisher_id is not None:
-            return await self.store.delete(self.key(name, publisher_id))
-        keys = await self.store.keys(prefix=self.prefix(name))
-        results = await asyncio.gather(*(self.store.delete(key) for key in keys))
+            return await remove(self.key(name, publisher_id))
+        indexed_keys = getattr(self.store, "endpoint_keys", None)
+        keys = (
+            await indexed_keys(self.prefix(name)) if indexed_keys is not None
+            else await self.store.keys(prefix=self.prefix(name))
+        )
+        results = await asyncio.gather(*(remove(key) for key in keys))
         return any(results)
 
     async def close(self) -> None:

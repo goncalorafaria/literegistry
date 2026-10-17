@@ -36,12 +36,13 @@ class _Pipeline:
         pass
 
     def __getattr__(self, name):
-        def enqueue(*args):
-            self.commands.append((name, args))
+        def enqueue(*args, **kwargs):
+            self.commands.append((name, args, kwargs))
             return self
         return enqueue
 
     async def execute(self):
         if hasattr(self.client, "_check"):
             self.client._check()
-        return [await getattr(self.client, name)(*args) for name, args in self.commands]
+        return [await getattr(self.client, name)(*args, **kwargs)
+                for name, args, kwargs in self.commands]
