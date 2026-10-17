@@ -21,8 +21,10 @@ import time
 from typing import Any, Optional
 from urllib.parse import urlsplit
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from pydantic import BaseModel, Field
+
+from literegistry.services.podman_streaming import CommandStreamError, PodmanCommandStreams
 
 
 logger = logging.getLogger(__name__)
@@ -183,6 +185,19 @@ class CloseRequest(SessionRequest):
     pass
 
 
+class StartCommandRequest(PodmanRequest):
+    timeout: float = Field(default=10.0, ge=0.1, le=300.0)
+    request_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")
+    merge_output: bool = False
+
+
+class CommandOutputRequest(SessionRequest):
+    command_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    cursor: int = Field(default=0, ge=0)
+    wait_ms: int = Field(default=1000, ge=0, le=10_000)
+    max_chunks: int = Field(default=64, ge=1, le=256)
+
+
 class HandshakeResponse(BaseModel):
     container_id: str
     affinity_id: str
@@ -222,8 +237,15 @@ class PodmanAffinityConfig:
     max_stderr_bytes: int = 256 * 1024
     operation_timeout: float = 300.0
     registry_mirror: Optional[str] = None
+    max_stream_commands: int = 64
+    stream_buffer_bytes: int = 1024 * 1024
+    stream_retention_seconds: float = 300.0
 
     def __post_init__(self) -> None:
+        if self.max_stream_commands < 1 or self.stream_buffer_bytes < 4:
+            raise ValueError("stream command capacity must be positive and buffer at least 4 bytes")
+        if not math.isfinite(self.stream_retention_seconds) or self.stream_retention_seconds <= 0:
+            raise ValueError("stream_retention_seconds must be positive and finite")
         for name in ("session_memory", "image_prune_until"):
             value = getattr(self, name)
             if value is not None and not value.strip():
@@ -285,6 +307,7 @@ class PodmanSessionBackend:
         self._container_init_pids: dict[str, int] = {}
         self._pending_sessions = 0
         self._locks_guard = asyncio.Lock()
+        self.streams = PodmanCommandStreams(self)
         self._registry_config_file: Optional[Any] = None
         self._podman_env: Optional[dict[str, str]] = None
         if self.config.registry_mirror:
@@ -533,6 +556,15 @@ class PodmanSessionBackend:
                 raise SessionNotFound(container_id)
             self._session_last_used[container_id] = self._now()
 
+    def _exec_args(
+        self, container_id: str, command: str, timeout: float, workdir: str,
+        *, merge_output: bool = False,
+    ) -> list[str]:
+        wrapper = ("exec 2>&1\n" if merge_output else "") + _EXEC_WRAPPER
+        return [*self._podman, "exec", "--interactive", "--workdir", workdir,
+                container_id, "/bin/bash", "-c", wrapper,
+                "literegistry-exec", f"{timeout:g}", command]
+
     async def execute(
         self,
         container_id: str,
@@ -552,20 +584,7 @@ class PodmanSessionBackend:
                 # the command's complete process tree before the outer
                 # podman-exec failsafe expires.
                 result = await self._run(
-                    [
-                        *self._podman,
-                        "exec",
-                        "--interactive",
-                        "--workdir",
-                        workdir,
-                        container_id,
-                        "/bin/bash",
-                        "-c",
-                        _EXEC_WRAPPER,
-                        "literegistry-exec",
-                        f"{timeout:g}",
-                        command,
-                    ],
+                    self._exec_args(container_id, command, timeout, workdir),
                     stdin=stdin.encode(),
                     timeout=timeout + 5.0,
                 )
@@ -609,6 +628,7 @@ class PodmanSessionBackend:
             self._session_last_used.pop(container_id, None)
             self._container_init_pids.pop(container_id, None)
             self._locks.pop(container_id, None)
+        self.streams.discard_session(container_id)
 
     async def remove_session(
         self,
@@ -675,6 +695,7 @@ class PodmanSessionBackend:
             )
 
     async def cleanup(self) -> None:
+        await self.streams.shutdown()
         container_ids = await self.owned_container_ids()
         async with self._locks_guard:
             self._owned_container_ids.update(container_ids)
@@ -1116,6 +1137,42 @@ def create_app(
     )
     app.state.podman_affinity_service = service
 
+    async def stream_operation(operation, request):
+        try:
+            container_id = request.selected_container_id()
+            options = request.model_dump(exclude={"container_id", "affinity_id"})
+            return await operation(container_id, **options)
+        except CommandStreamError as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.detail,
+                                headers={"Cache-Control": "no-store"}) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SessionLost as exc:
+            raise HTTPException(status_code=410, detail=exc.termination.response_body()) from exc
+        except SessionNotFound as exc:
+            raise HTTPException(status_code=404, detail={
+                "error": "container_not_found", "container_id": exc.args[0],
+            }) from exc
+        except (PodmanBackendError, asyncio.TimeoutError) as exc:
+            raise HTTPException(status_code=503, detail="command stream unavailable") from exc
+
+    @app.post("/podman/start", status_code=202)
+    async def start_command(request: StartCommandRequest, response: Response):
+        response.headers["Cache-Control"] = "no-store"
+        return await stream_operation(service.backend.streams.start, request)
+
+    @app.get("/podman/output")
+    async def command_output(response: Response, request: CommandOutputRequest = Depends()):
+        # GET is the public polling API. The gateway uses the JSON POST below
+        # so it can reuse its exact-owner transport without changing routing.
+        response.headers["Cache-Control"] = "no-store"
+        return await stream_operation(service.backend.streams.output, request)
+
+    @app.post("/podman/output")
+    async def command_output_post(request: CommandOutputRequest, response: Response):
+        response.headers["Cache-Control"] = "no-store"
+        return await stream_operation(service.backend.streams.output, request)
+
     @app.get("/health")
     async def health() -> dict[str, Any]:
         try:
@@ -1142,6 +1199,11 @@ def create_app(
             "janitor_interval": service.backend.config.janitor_interval,
             "resource_watchdog_interval": service.backend.config.resource_watchdog_interval,
             "image_prune_until": service.backend.config.image_prune_until,
+            "streaming": {
+                "max_commands": service.backend.config.max_stream_commands,
+                "buffer_bytes": service.backend.config.stream_buffer_bytes,
+                "retention_seconds": service.backend.config.stream_retention_seconds,
+            },
         }
 
     @app.get("/sessions/{container_id}")

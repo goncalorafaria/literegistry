@@ -5,6 +5,7 @@ from .discovery import GatewayDiscovery
 from .client import (
     CommandResult,
     PodmanCommandError,
+    PodmanCommand,
     PodmanContainerLostError,
     PodmanClient,
     PodmanGatewayError,
@@ -15,6 +16,7 @@ __all__ = [
     "GatewayDiscovery",
     "CommandResult",
     "PodmanCommandError",
+    "PodmanCommand",
     "PodmanContainerLostError",
     "PodmanClient",
     "PodmanGatewayError",

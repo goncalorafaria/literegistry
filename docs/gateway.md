@@ -86,6 +86,8 @@ deployed gateway. Registration can be disabled with `--register=False`.
 | `POST` | `/terminal` | Workers registered as `model_path=terminal` |
 | `POST` | `/affinity/handshake` | Select a stateful replica and create a binding |
 | `POST` | `/affinity/podman` | Run a command on the bound Podman container |
+| `POST` | `/affinity/podman/start` | Start a command and return a handle for live output |
+| `GET` | `/affinity/podman/output` | Poll output by affinity ID, command ID, and acknowledgement cursor |
 | `POST` | `/affinity/close` | Delete the container and release its binding |
 | `GET/HEAD` | `/v2` | Docker Registry V2 mirror root |
 | `GET/HEAD` | `/v2/` | Docker Registry V2 mirror root |

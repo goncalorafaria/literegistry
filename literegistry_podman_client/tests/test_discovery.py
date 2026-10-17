@@ -214,3 +214,78 @@ def test_request_timeout_invalidates_without_reissuing():
                 assert commands == 1
 
     asyncio.run(scenario())
+
+
+def test_streaming_rediscovery_keeps_command_and_cursor_without_restarting():
+    async def scenario():
+        lookups = 0
+        starts = 0
+        first_output_sent = False
+        failed_cursors = []
+        resumed_cursors = []
+        affinity_id = "a" * 64
+        command_id = "c" * 32
+
+        def batch(cursor, data, done):
+            return {
+                "chunks": [{"stream": "stdout", "data": data}] if data else [],
+                "next_cursor": cursor + 1 if data else cursor,
+                "done": done, "running": not done, "has_more": False,
+                "exit_code": 0 if done else None, "success": True if done else None,
+                "timed_out": False, "error": None,
+            }
+
+        async def first(request):
+            nonlocal starts, first_output_sent
+            if request.path == "/affinity/handshake":
+                return web.json_response({
+                    "affinity_id": affinity_id, "container_id": affinity_id,
+                    "instance_id": "worker-a", "image": "test",
+                })
+            if request.path == "/affinity/podman/start":
+                starts += 1
+                return web.json_response({"command_id": command_id}, status=202)
+            assert request.path == "/affinity/podman/output"
+            if not first_output_sent:
+                assert request.query["cursor"] == "0"
+                first_output_sent = True
+                return web.json_response(batch(0, "first", False))
+            failed_cursors.append(int(request.query["cursor"]))
+            request.transport.close()
+            return web.json_response({})
+
+        async def second(request):
+            if request.path == "/affinity/close":
+                return web.json_response({"removed": True})
+            assert request.path == "/affinity/podman/output"
+            assert request.query["affinity_id"] == affinity_id
+            assert request.query["command_id"] == command_id
+            cursor = int(request.query["cursor"])
+            resumed_cursors.append(cursor)
+            return web.json_response(batch(cursor, "second" if cursor == 1 else "", True))
+
+        async with gateway(first) as old_url, gateway(second) as new_url:
+            async def lookup():
+                nonlocal lookups
+                lookups += 1
+                return old_url if lookups == 1 else new_url
+
+            discovery = GatewayDiscovery(lookup)
+            async with PodmanClient(gateway_discovery=discovery) as client:
+                session = await client.handshake()
+                job = await session.start_command("build")
+                assert (await job.read(wait_ms=0))["stdout"] == "first"
+                with pytest.raises(PodmanGatewayError):
+                    await job.read(wait_ms=0)
+                assert lookups == starts == 1
+                assert failed_cursors and set(failed_cursors) == {1}
+                assert job.cursor == 1 and not session.closed
+
+                chunks = [chunk async for chunk in job.stream(wait_ms=0)]
+                assert chunks == [{"stream": "stdout", "data": "second"}]
+                assert resumed_cursors == [1, 2]
+                assert (await job.wait())["exit_code"] == 0
+                assert lookups == 2 and starts == 1
+                await session.close()
+
+    asyncio.run(scenario())

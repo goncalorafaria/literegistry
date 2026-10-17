@@ -98,6 +98,91 @@ child processes. The outer `podman exec` deadline remains as a five-second
 failsafe. Session images must provide `/bin/bash` and `sleep`, which are also
 required by the long-lived session entrypoint.
 
+## Optional live command output
+
+`POST /affinity/podman/start` starts a command and returns HTTP 202 immediately:
+
+```json
+{
+  "service": "podman",
+  "affinity_id": "<container-id>",
+  "request_id": "build-1",
+  "command": "make build",
+  "timeout": 60,
+  "merge_output": false
+}
+```
+
+The response contains `command_id` and an initial `cursor` of `0`. Poll with
+`GET /affinity/podman/output?service=podman&affinity_id=<container-id>&command_id=<command-id>&cursor=0&wait_ms=1000`.
+Both requests go to the container's existing owner. The ordinary
+`POST /affinity/podman` continues to wait for a complete result.
+
+Each poll returns `chunks` containing `{cursor, stream, data}`, a `next_cursor`,
+`running`, `done`, `has_more`, `exit_code`, `success`, `timed_out`, and `error`.
+The exit code and success are null until completion. Stop when `done` is true
+and `has_more` is false; check `error` as well as the exit code. An empty batch
+with `running=true` means no new output arrived during the wait.
+`wait_ms` ranges from 0 to 10000. `max_chunks` defaults to 64 (maximum 256).
+
+Pass the returned `next_cursor` in the next poll. That acknowledges and frees
+all earlier chunks, so consumed output does not accumulate. Retrying the same
+cursor can return the same output until it is acknowledged or evicted; this
+is a single-consumer flow. Send one final poll with the last `next_cursor` and
+`wait_ms=0` to release the final batch. Responses disable HTTP caching.
+
+With `merge_output=false` (the default), chunks identify stdout or stderr;
+their ordering across streams reflects when the worker reads them. With
+`merge_output=true`, stderr is redirected into stdout inside the container,
+and all chunks use `stream="stdout"`. Output is UTF-8 text, with invalid bytes
+replaced. Programs may still buffer their output; use their unbuffered mode
+when needed (for example, `python -u`).
+
+The buffer keeps at most 1 MiB or 1024 chunks per command, evicting the oldest
+chunks when full. A stale cursor returns HTTP 410 with `code="output_expired"` and
+`oldest_cursor`; explicitly resume there to accept the output gap. Results
+expire 300 seconds after command completion, returning 410
+`code="command_expired"`. Closing a session also removes its completed results.
+These errors do not mean the container was lost. State is local to the worker
+and does not survive a worker restart.
+
+One worker accepts up to 64 running or retained commands. Configure these
+limits with `literegistry podman --max-stream-commands=64
+--stream-buffer-bytes=1048576 --stream-retention-seconds=300` or the
+`PODMAN_MAX_STREAM_COMMANDS`, `PODMAN_STREAM_BUFFER_BYTES`, and
+`PODMAN_STREAM_RETENTION_SECONDS` environment variables. The worker's `/health`
+reports the configured limits. When full, starts return 503
+`command_stream_capacity`. A start on a busy container returns 409 `session_busy`;
+other sessions remain independent. Normal commands and close wait for the
+running command's session lock. Existing command deadlines still apply.
+
+Reuse the same `request_id` to retry an uncertain start: while the command is
+retained, matching requests return the same handle; different inputs return
+409 `request_id_conflict`. After retention expires the key can be reused and
+would start a new command. No command is restarted automatically.
+
+The Python client exposes this flow explicitly:
+
+```python
+job = await session.start_command(
+    "make build", timeout=60, merge_output=True
+)
+async for chunk in job.stream():
+    print(chunk["data"], end="", flush=True)
+result = await job.wait()  # exit_code, timed_out, success, and error
+```
+
+For periodic reads use `await job.read()`; it returns stdout/stderr text and
+status without IDs or cursors. `job.wait()` drains unread output and returns
+cached final status without accumulating logs. The canonical
+`literegistry_tool_client.PodmanExecutionClient` exposes the same command handle
+through `start_command(command=...)`, with the session managed by its context
+manager. For raw batch polling use `await job.poll()` on the standalone client;
+for reconnecting use
+`client.command_output(affinity_id, command_id, cursor=saved_cursor)`.
+The worker also exposes `POST /podman/start`, `GET /podman/output`, and the
+JSON-body `POST /podman/output` used by the gateway's pinned transport.
+
 ## Output truncation
 
 A command whose stdout exceeds 1MB (stderr: 256KB) is no longer aborted.
