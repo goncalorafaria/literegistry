@@ -234,16 +234,21 @@ class HeadRegistryKVStore(KeyValueStore):
 
             await self._sleep()
 
-    async def _invalidate(self, client: RedisKVStore) -> None:
+    async def _invalidate(self, client: RedisKVStore, error: Exception) -> None:
         async with self._connection_lock:
             if self._client is client:
                 failed_url = client.url
-                await self._disconnect_locked()
+                safe_url = redact_redis_url(failed_url)
+                error_message = str(error).replace(failed_url, safe_url)
                 logger.warning(
-                    "Lost Redis %s; waiting for a healthy endpoint in head registry %s",
-                    redact_redis_url(failed_url),
+                    "Lost Redis %s; error_type=%s error=%s; invalidating connection "
+                    "and waiting for a healthy endpoint in head registry %s",
+                    safe_url,
+                    type(error).__name__,
+                    error_message,
                     self._display_root,
                 )
+                await self._disconnect_locked()
 
     async def _execute(
         self,
@@ -255,8 +260,8 @@ class HeadRegistryKVStore(KeyValueStore):
                 return await operation(client)
             except HeadRegistryClosedError:
                 raise
-            except Exception:
-                await self._invalidate(client)
+            except Exception as exc:
+                await self._invalidate(client, exc)
                 await self._sleep()
 
     async def ping(self) -> bool:
