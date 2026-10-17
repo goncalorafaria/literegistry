@@ -386,6 +386,14 @@ class PodmanClient:
         )
         return CommandResult.from_payload(response)
 
+    async def renew(self, affinity_id: str) -> JsonObject:
+        """Renew the existing gateway mapping; never create or reassign a session."""
+        if not isinstance(affinity_id, str) or not affinity_id.strip():
+            raise ValueError("affinity_id must be a non-empty string")
+        return await self._post("affinity/renew", {
+            "service": self.service, "affinity_id": affinity_id.strip(),
+        })
+
     async def close(self, affinity_id: str) -> JsonObject:
         """Delete one container and its affinity binding."""
         if not isinstance(affinity_id, str) or not affinity_id.strip():

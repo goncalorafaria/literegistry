@@ -42,8 +42,8 @@ class StackCommand:
         redis_data_dir: str | None = None,
         podman_image: str = "goncalof/literegistry-podman-immediate-rm-20260819",
         podman_session_image: str = "docker.io/library/ubuntu:24.04",
-        podman_max_sessions: int | None = None,
-        podman_session_memory: str | None = "4g",
+        podman_max_sessions: int | None = 8,
+        podman_session_memory: str | None = "16g",
         podman_session_pids_limit: int | None = 2048,
         podman_session_idle_timeout: float | None = 7200.0,
         podman_janitor_interval: float = 300.0,
@@ -63,10 +63,10 @@ class StackCommand:
         docker_hub_username_secret: str | None = None,
         docker_hub_token_secret: str | None = None,
         podman_registry_mirror: str | None = None,
-        affinity_ttl_seconds: float = 900.0,
+        affinity_ttl_seconds: float = 7200.0,
         docker_mirror_affinity_ttl_seconds: float = 604800.0,
         registry_cache_ttl_seconds: int = 5,
-        gateway_timeout: float = 300.0,
+        gateway_timeout: float = 840.0,
         weka_source: str = "oe-adapt-default",
     ) -> None:
         config = PodmanStackConfig(

@@ -175,7 +175,7 @@ class SessionRequest(BaseModel):
 class PodmanRequest(SessionRequest):
     command: str = Field(..., min_length=1, max_length=16 * 1024)
     stdin: str = Field(default="", max_length=1024 * 1024)
-    timeout: float = Field(default=10.0, ge=0.1, le=60.0)
+    timeout: float = Field(default=10.0, ge=0.1, le=300.0)
     workdir: str = Field(default="/workspace", min_length=1, max_length=4096)
 
 

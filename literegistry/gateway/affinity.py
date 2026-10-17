@@ -648,6 +648,20 @@ class StrictAffinityGateway:
         """Execute a messaging operation on the session owner."""
         return await self.forward(request, "botbook")
 
+    async def renew(self, request: Request) -> Response:
+        """Extend an existing session mapping without executing a container command."""
+        payload = await self._payload(request)
+        service, forwarded = self._service(payload)
+        affinity_id = forwarded.get("affinity_id")
+        if not isinstance(affinity_id, str) or not affinity_id.strip():
+            raise GatewayRequestError("affinity_id must be a non-empty string")
+        binding = await self.bindings.touch(service, affinity_id)
+        if binding is None:
+            raise GatewayRequestError(
+                "strict affinity binding was not found or has expired", status_code=404,
+            )
+        return JSONResponse({"status": "renewed", "expires_at": binding.expires_at})
+
     async def close(self, request: Request) -> Response:
         """Close the upstream session and release its affinity binding."""
         return await self.forward(request, "close")
@@ -659,6 +673,7 @@ class StrictAffinityGateway:
             Route("/affinity/kv/get", self.get, methods=["POST"]),
             Route("/affinity/podman", self.podman, methods=["POST"]),
             Route("/affinity/botbook", self.botbook, methods=["POST"]),
+            Route("/affinity/renew", self.renew, methods=["POST"]),
             Route("/affinity/close", self.close, methods=["POST"]),
         ]
 
