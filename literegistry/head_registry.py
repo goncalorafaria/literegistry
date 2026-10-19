@@ -234,63 +234,87 @@ class HeadRegistryKVStore(KeyValueStore):
 
             await self._sleep()
 
-    async def _invalidate(self, client: RedisKVStore) -> None:
+    async def _invalidate(
+        self, client: RedisKVStore, error: Exception, *,
+        operation_name: str, elapsed_seconds: float,
+    ) -> None:
         async with self._connection_lock:
             if self._client is client:
                 failed_url = client.url
-                await self._disconnect_locked()
+                safe_url = redact_redis_url(failed_url)
+                error_message = str(error).replace(failed_url, safe_url) or "<no message>"
                 logger.warning(
-                    "Lost Redis %s; waiting for a healthy endpoint in head registry %s",
-                    redact_redis_url(failed_url),
+                    "Lost Redis %s; operation=%s elapsed_seconds=%.3f "
+                    "error_type=%s error=%s; invalidating connection "
+                    "and waiting for a healthy endpoint in head registry %s",
+                    safe_url,
+                    operation_name,
+                    elapsed_seconds,
+                    type(error).__name__,
+                    error_message,
                     self._display_root,
                 )
+                await self._disconnect_locked()
 
     async def _execute(
         self,
         operation: Callable[[RedisKVStore], Awaitable[_T]],
+        *,
+        operation_name: str,
     ) -> _T:
         while True:
             client = await self._connect()
+            started = time.monotonic()
             try:
                 return await operation(client)
             except HeadRegistryClosedError:
                 raise
-            except Exception:
-                await self._invalidate(client)
+            except Exception as exc:
+                await self._invalidate(
+                    client, exc, operation_name=operation_name,
+                    elapsed_seconds=time.monotonic() - started,
+                )
                 await self._sleep()
 
     async def ping(self) -> bool:
-        return await self._execute(lambda client: client.ping())
+        return await self._execute(lambda client: client.ping(), operation_name="ping")
 
     async def get(self, key: str):
-        return await self._execute(lambda client: client.get(key))
+        return await self._execute(lambda client: client.get(key), operation_name="get")
 
     async def set(self, key: str, value, ttl_seconds=None) -> bool:
         return await self._execute(
-            lambda client: client.set(key, value, ttl_seconds=ttl_seconds)
+            lambda client: client.set(key, value, ttl_seconds=ttl_seconds),
+            operation_name="set",
         )
 
     async def delete(self, key: str) -> bool:
-        return await self._execute(lambda client: client.delete(key))
+        return await self._execute(lambda client: client.delete(key), operation_name="delete")
 
     async def set_server(self, key: str, value: str, last_heartbeat: float) -> bool:
         return await self._execute(
-            lambda client: client.set_server(key, value, last_heartbeat)
+            lambda client: client.set_server(key, value, last_heartbeat),
+            operation_name="set_server",
         )
 
     async def delete_server(self, key: str) -> bool:
-        return await self._execute(lambda client: client.delete_server(key))
+        return await self._execute(
+            lambda client: client.delete_server(key), operation_name="delete_server",
+        )
 
     async def active_server_keys(self, min_heartbeat: float) -> list[str]:
         return await self._execute(
-            lambda client: client.active_server_keys(min_heartbeat)
+            lambda client: client.active_server_keys(min_heartbeat),
+            operation_name="active_server_keys",
         )
 
     async def exists(self, key: str) -> bool:
-        return await self._execute(lambda client: client.exists(key))
+        return await self._execute(lambda client: client.exists(key), operation_name="exists")
 
     async def keys(self, prefix: str | None = None) -> list[str]:
-        return await self._execute(lambda client: client.keys(prefix=prefix))
+        return await self._execute(
+            lambda client: client.keys(prefix=prefix), operation_name="keys",
+        )
 
     async def close(self) -> None:
         if self._closed:
