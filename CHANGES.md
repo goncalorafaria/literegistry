@@ -12,12 +12,32 @@
 
 Rebuild the Podman worker image and select it with `--podman-image` before deploying these entrypoint changes. Existing image references, including the legacy launcher default, are not updated by a source change. Existing workers must be replaced to acquire the new behavior.
 
-### Related PRs
+### Gateway, registry, and client fixes
 
-- [#11, merged](https://github.com/goncalorafaria/literegistry/pull/11): reuse healthy Redis connections without polling the head registry.
-- [#14, merged](https://github.com/goncalorafaria/literegistry/pull/14): retain healthy gateway discovery results, index Redis endpoints, and incorporate obsolete head-refresh removal from #12.
-- [#15, separate open PR](https://github.com/goncalorafaria/literegistry/pull/15): log the Redis operation exception before invalidating its connection.
-- Streaming APIs remain in [#13](https://github.com/goncalorafaria/literegistry/pull/13).
+| Area | Change | Submission status |
+| --- | --- | --- |
+| Worker discovery | Index the active Redis worker roster instead of repeatedly scanning every key; bound fallback SCAN batches. | [#4, merged](https://github.com/goncalorafaria/literegistry/pull/4) |
+| Session loss | Preserve typed sandbox-loss reasons, including resource-limit failures; terminate a lost client session rather than silently creating a different container. | [#5, merged](https://github.com/goncalorafaria/literegistry/pull/5) |
+| Strict affinity | Probe an unavailable owner and its session with bounded liveness checks, including owners absent from the cached roster. Preserve affinity and avoid replaying an executed command on another worker. | [#6, merged](https://github.com/goncalorafaria/literegistry/pull/6) |
+| Chat routing | Optional session affinity for standard chat-completions routing. | [#8, merged](https://github.com/goncalorafaria/literegistry/pull/8) |
+| Redis discovery | Reuse the healthy Redis connection; consult head discovery again when it fails, rather than polling head storage during normal operations. | [#11, merged](https://github.com/goncalorafaria/literegistry/pull/11) |
+| Refresh settings | Remove the obsolete head-registry refresh interval. | [#12, merged](https://github.com/goncalorafaria/literegistry/pull/12), incorporated into #14 |
+| Gateway discovery | Share cached gateway selection across Podman clients; keep a healthy gateway and invalidate it on failure. Index endpoint discovery in Redis instead of full-key scans. | [#14, merged](https://github.com/goncalorafaria/literegistry/pull/14); released as LiteRegistry 1.0.59 / Podman client 0.1.5 |
+| Redis diagnostics | Log the operation exception before invalidating a connection so endpoint warnings retain the underlying cause. | [#15, open](https://github.com/goncalorafaria/literegistry/pull/15) |
+| Session renewal | Expose `/affinity/renew` and client renewal without executing a task command; extend deployment affinity TTL to two hours. | This PR, [#16](https://github.com/goncalorafaria/literegistry/pull/16) |
+| Gateway deadline | Set the Podman deployment gateway timeout to 840 seconds. | This PR, #16 |
+| Streaming | Live Podman command output and client resume APIs. | [#13, separate open PR](https://github.com/goncalorafaria/literegistry/pull/13) |
+
+A merged PR does not update running gateways or clients automatically. Rebuild the relevant gateway/worker images and update installed clients to deploy those revisions.
+
+### Additional local gateway changes requiring separate submission review
+
+The shared development checkout contains further changes beyond this PR. They are listed here to avoid treating them as already merged or covered by #16:
+
+- New-session handshake handling recognizes worker `HTTPResponseError` responses with status 503 as well as gateway transport errors, allowing candidate selection to continue. The existing branch handles only `GatewayRequestError` in that path.
+- Least-outstanding routing, shared Redis reservation accounting, routing statistics, disconnect cancellation, and routing cleanup are local changes whose PR coverage has not been confirmed.
+- An opt-in filesystem-head setting bypasses `fsync` for an explicitly selected ephemeral head directory; this durability change is not included here.
+- Streaming-specific gateway endpoints and response cache headers remain outside this PR.
 
 ### Replay boundaries and outstanding issues
 
