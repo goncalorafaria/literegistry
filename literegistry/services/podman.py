@@ -209,7 +209,7 @@ class PodmanAffinityConfig:
     podman_binary: str = "podman"
     storage_driver: str = "vfs"
     session_image: str = "docker.io/library/ubuntu:24.04"
-    session_network: str = "none"
+    session_network: str = "pasta"
     max_sessions: Optional[int] = None
     session_memory: Optional[str] = None
     session_pids_limit: Optional[int] = None

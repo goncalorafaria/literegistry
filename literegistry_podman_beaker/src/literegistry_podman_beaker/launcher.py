@@ -84,6 +84,7 @@ class PodmanStackConfig:
     podman_image: str = "goncalof/literegistry-podman-immediate-rm-20260819"
     podman_instance_prefix: str = "podman"
     podman_session_image: str = "docker.io/library/ubuntu:24.04"
+    podman_session_network: str = "pasta"
     podman_max_sessions: int | None = 8
     podman_session_memory: str | None = "16g"
     podman_session_pids_limit: int | None = 2048
@@ -174,6 +175,8 @@ class PodmanStackConfig:
             )
         if self.gateway_workers < 1:
             raise ValueError("gateway_workers must be positive")
+        if not self.podman_session_network.strip():
+            raise ValueError("podman_session_network must be non-empty")
         if self.podman_session_memory is not None and not self.podman_session_memory.strip():
             raise ValueError("podman_session_memory must be non-empty when supplied")
         if self.podman_max_sessions is not None and self.podman_max_sessions < 1:
@@ -597,23 +600,32 @@ class PodmanStackLauncher:
                 + '--advertise_host="$ADVERTISE_HOST" --advertise_port="$PORT" '
                 + '--registry="$REGISTRY" '
                 + f"--image={shlex.quote(self.config.podman_session_image)} "
-                + '--network=none --instance_id="$INSTANCE_ID" --storage_driver=vfs '
+                + f"--network={shlex.quote(self.config.podman_session_network)} "
+                + '--instance_id="$INSTANCE_ID" --storage_driver=vfs '
                 + podman_hardening_cli
                 + '--registry_mirror="$PODMAN_REGISTRY_MIRROR" --allow_non_loopback=True'
             )
-            tasks.append(
-                self._task(
-                    task_name,
-                    self.config.podman_image,
-                    wait + _dynamic_port_command(name, "podman", child),
-                    cluster=cluster,
-                    replicas=replicas,
-                    env_vars=[
-                        {"name": "BEAKER_ALLOW_SUBCONTAINERS", "value": "1"},
-                        {"name": "BEAKER_SKIP_DOCKER_SOCKET", "value": "1"},
-                    ],
-                )
+            podman_task = self._task(
+                task_name,
+                self.config.podman_image,
+                wait + _dynamic_port_command(name, "podman", child),
+                cluster=cluster,
+                replicas=replicas,
+                env_vars=[
+                    {"name": "BEAKER_ALLOW_SUBCONTAINERS", "value": "1"},
+                    {"name": "BEAKER_SKIP_DOCKER_SOCKET", "value": "1"},
+                    {
+                        "name": "PODMAN_AFFINITY_NETWORK",
+                        "value": self.config.podman_session_network,
+                    },
+                ],
             )
+            # Beaker's command overrides the Docker ENTRYPOINT. Invoke it
+            # explicitly so TUN setup and the rootless user switch still run.
+            podman_task["command"].insert(
+                0, "/usr/local/bin/literegistry-podman-entrypoint"
+            )
+            tasks.append(podman_task)
 
         run_warmup = self.config.warmup_enabled and (
             self.config.docker_mirror_replicas > 0

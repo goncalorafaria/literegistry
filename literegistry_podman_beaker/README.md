@@ -570,8 +570,19 @@ container and its affinity binding.
 
 ## Operational behavior
 
-- Podman runs rootless in the Podman service image.
-- Every task uses Beaker host networking and collision-checked dynamic ports.
+- Podman runs rootless in the Podman service image. Task sessions default to
+  `pasta` networking with outbound DNS and download access. Use
+  `--podman-session-network=none` to disable task networking.
+- The worker entrypoint creates a namespace-local TUN device as root, then
+  drops to `podman` before running any service or supervisor. Beaker launches
+  invoke this entrypoint explicitly because task commands override the image
+  entrypoint. No host TUN mount is needed; the platform must allow `mknod`
+  and use of the device. Rebuild the worker image to pick up this entrypoint.
+  Select the rebuilt Beaker image with `--podman-image`; historical image
+  references, including the launcher's legacy image default, do not acquire
+  the new entrypoint automatically.
+- Outer service tasks use Beaker host networking and collision-checked dynamic
+  ports. Inner task sessions use the configured Podman network (`pasta` by default).
 - The stack always creates exactly one gateway; it has eight workers by default.
 - Omitting `registry` creates exactly one ephemeral Redis task. Supplying a
   Redis URL reuses that server instead.
@@ -657,8 +668,9 @@ config = PodmanStackConfig(
 )
 ```
 
-The final Redis image runs as `USER redis`; Podman runs as `USER podman`; the
-mirror runs as `USER mirror`; and the gateway runs as `USER gateway`.
+The final Redis image runs as `USER redis`; the Podman image starts as root
+only to prepare TUN and immediately switches to `podman`; the mirror runs as
+`USER mirror`; and the gateway runs as `USER gateway`.
 
 
 ## Experimental mirror soft affinity
@@ -672,6 +684,7 @@ Beaker Podman replicas enable resource and cleanup controls by default:
 
 | Fire CLI option | `PodmanStackConfig` field | Default |
 |---|---|---:|
+| `--podman-session-network` | `podman_session_network` | `pasta` |
 | `--podman-max-sessions` | `podman_max_sessions` | `8` |
 | `--podman-session-memory` | `podman_session_memory` | `16g` |
 | `--podman-session-pids-limit` | `podman_session_pids_limit` | `2048` |
