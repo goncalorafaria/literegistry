@@ -570,8 +570,19 @@ container and its affinity binding.
 
 ## Operational behavior
 
-- Podman runs rootless in the Podman service image.
-- Every task uses Beaker host networking and collision-checked dynamic ports.
+- Podman runs rootless in the Podman service image. Task sessions default to
+  `pasta` networking with outbound DNS and download access. Use
+  `--podman-session-network=none` to disable task networking.
+- The worker entrypoint creates a namespace-local TUN device as root, then
+  drops to `podman` before running any service or supervisor. Beaker launches
+  invoke this entrypoint explicitly because task commands override the image
+  entrypoint. No host TUN mount is needed; the platform must allow `mknod`
+  and use of the device. Rebuild the worker image to pick up this entrypoint.
+  Select the rebuilt Beaker image with `--podman-image`; historical image
+  references, including the launcher's legacy image default, do not acquire
+  the new entrypoint automatically.
+- Outer service tasks use Beaker host networking and collision-checked dynamic
+  ports. Inner task sessions use the configured Podman network (`pasta` by default).
 - The stack always creates exactly one gateway; it has eight workers by default.
 - Omitting `registry` creates exactly one ephemeral Redis task. Supplying a
   Redis URL reuses that server instead.
@@ -657,8 +668,9 @@ config = PodmanStackConfig(
 )
 ```
 
-The final Redis image runs as `USER redis`; Podman runs as `USER podman`; the
-mirror runs as `USER mirror`; and the gateway runs as `USER gateway`.
+The final Redis image runs as `USER redis`; the Podman image starts as root
+only to prepare TUN and immediately switches to `podman`; the mirror runs as
+`USER mirror`; and the gateway runs as `USER gateway`.
 
 
 ## Experimental mirror soft affinity
@@ -672,8 +684,9 @@ Beaker Podman replicas enable resource and cleanup controls by default:
 
 | Fire CLI option | `PodmanStackConfig` field | Default |
 |---|---|---:|
-| `--podman-max-sessions` | `podman_max_sessions` | `None` |
-| `--podman-session-memory` | `podman_session_memory` | `4g` |
+| `--podman-session-network` | `podman_session_network` | `pasta` |
+| `--podman-max-sessions` | `podman_max_sessions` | `8` |
+| `--podman-session-memory` | `podman_session_memory` | `16g` |
 | `--podman-session-pids-limit` | `podman_session_pids_limit` | `2048` |
 | `--podman-session-idle-timeout` | `podman_session_idle_timeout` | `7200` seconds |
 | `--podman-janitor-interval` | `podman_janitor_interval` | `300` seconds |
@@ -712,3 +725,31 @@ remain preferable when available.
 Choose the idle timeout above the longest legitimate gap between commands in
 one trajectory. Image pruning removes only unused images, but an aggressive
 age can increase subsequent cold-pull traffic.
+
+## RL replay deployment defaults
+
+Each worker accepts eight sessions, with 16 GiB per container and a 5-second
+resource watchdog. Commands may request up to 300 seconds (the per-request
+default remains 10 seconds). Session idle expiry and gateway mapping TTL are
+7200 seconds; gateway request timeout is 840 seconds, allowing startup/image
+pulls as well as commands. These limits are independent.
+
+During long model generations, call `await client.renew(affinity_id)` every
+60 seconds. This only refreshes an existing mapping; an expired mapping returns
+404 and is never reassigned. It does not execute a command or reset container
+idle expiry. The training harness owns the renewal task and cleanup handling.
+
+For the 128-worker layout used by RL, supply:
+
+```bash
+--podman-replicas=128 --docker-mirror-replicas=4 --gateway-workers=16 \
+--service-clusters=ai2/jupiter,ai2/neptune,ai2/saturn,ai2/ceres \
+--omit-resources=True --head-registry=<private-head-registry>
+```
+
+Use your existing Docker Hub secret bindings for the mirrors. Keep the routing
+service `podman`; isolate research deployments with separate head registries.
+These changes affect newly launched deployments. Existing deployments are not
+restarted. Build updated core gateway/Podman images and install the updated
+client before using renewal or 300-second commands; an old image still has the
+60-second validation limit.

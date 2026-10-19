@@ -159,7 +159,8 @@ class BaseDeploymentConfig:
     jina_api_key_secret: str | None = "JINA_API_KEY"
     hf_token_secret: str | None = "HF_TOKEN"
     hf_home: str | None = None
-    gateway_timeout: float = 300.0
+    gateway_timeout: float = 840.0
+    affinity_ttl_seconds: float = 7200.0
     registry_cache_ttl_seconds: int = 5
     shared_dir: str = "/weka/gfaria"
     weka_source: str = "oe-adapt-default"
@@ -245,6 +246,8 @@ class BaseDeploymentConfig:
             raise ValueError("gateway_workers and python_pool_size must be positive")
         if self.min_runtime_hours < 0:
             raise ValueError("min_runtime_hours must be non-negative")
+        if self.affinity_ttl_seconds <= 0:
+            raise ValueError("affinity TTL must be positive")
         if self.gateway_timeout <= 0 or self.registry_cache_ttl_seconds < 1:
             raise ValueError("gateway timeout and registry cache TTL must be positive")
         if not self.cache_maxmemory.strip():
@@ -533,6 +536,7 @@ class BaseDeploymentLauncher:
             f"--workers={self.config.gateway_workers} "
             f"--registry_cache_ttl_seconds={self.config.registry_cache_ttl_seconds} "
             f"--timeout={self.config.gateway_timeout:g} "
+            f"--affinity_ttl_seconds={self.config.affinity_ttl_seconds:g} "
             f"--docker_mirror_soft_affinity={self.config.docker_mirror_soft_affinity}"
         )
         gateway_child = (
