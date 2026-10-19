@@ -149,7 +149,7 @@ def main(
     image: str = os.environ.get(
         "PODMAN_AFFINITY_IMAGE", "docker.io/library/ubuntu:24.04"
     ),
-    network: str = os.environ.get("PODMAN_AFFINITY_NETWORK", "none"),
+    network: str = os.environ.get("PODMAN_AFFINITY_NETWORK", "pasta"),
     instance_id: str = os.environ.get(
         "PODMAN_AFFINITY_INSTANCE_ID", "podman-affinity-1"
     ),
