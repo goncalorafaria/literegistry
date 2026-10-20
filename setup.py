@@ -13,7 +13,7 @@ bm25_requirements = [
 
 setuptools.setup(
     name="literegistry",
-    version="1.0.61",
+    version="1.0.62",
     author="Goncalo Faria",
     author_email="gfaria@cs.washington.edu",
     description="Package for implementing service discovery in a really lite way.",
