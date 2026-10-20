@@ -178,3 +178,13 @@ cached candidates triggers one registry refresh before returning failure.
 Existing sessions remain pinned to their owner regardless of reported capacity.
 
 Both worker and gateway packages must be upgraded to enable this behavior.
+
+### Session admission under capacity pressure
+
+The gateway retains the original handshake for up to 300 seconds, including container creation. It tries at most eight eligible cached candidates per round, then waits with exponential jittered backoff (initially 0.25–0.5 seconds, capped at 2.5–5 seconds). Normal roster-cache expiry supplies refreshed capacity; exhausted rounds do not force extra Redis scans.
+
+An upstream HTTP 503 containing `Podman session capacity exhausted` advances to another candidate. Rejected workers receive a five-second cooldown shared across handshakes in each gateway process. Workers become eligible again after the cooldown. Cooldowns are process-local, not distributed reservations; worker-side admission remains authoritative. The original trace is not discarded on transient candidate exhaustion.
+
+An upstream HTTP 500/503 containing `image not known` or `layer not known` permits exactly one alternate-worker attempt. The result of that attempt is final. This policy does not retry terminal commands or creation requests with unknown outcomes. Client disconnection is checked before each admission round. A creation timeout reports `execution_outcome=unknown` and is not retried; it can require later session cleanup.
+
+Constructor settings: `admission_timeout`, `admission_backoff_initial`, and `admission_backoff_max`. The external request timeout should exceed the admission timeout. Logs include `handshake_retry` with `reason=capacity_rejected` or `reason=image_storage`, and `admission_wait` with the round, delay, and elapsed time.
