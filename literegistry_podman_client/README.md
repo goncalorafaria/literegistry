@@ -296,3 +296,35 @@ request is **not retried**: a command may already have executed. The next reques
 resolves the gateway again; a late failure from an older selection cannot clear
 a newer one. Canceling one discovery waiter does not cancel the shared lookup.
 Open the client before accessing `mirror_url` when no explicit URL was supplied.
+
+## HTTP connection reuse and recovery
+
+Owned HTTP pools reuse connections with a two-second idle keepalive. A loop
+responsiveness timer detects pauses longer than two seconds; after a pause,
+new requests use a fresh pool because buffered responses may refer to
+connections whose server-side keepalive has already expired. Configure these
+thresholds with `keepalive_timeout` and `event_loop_stall_timeout`.
+
+Transport errors also retire the affected pool. Concurrent requests already
+using it drain before it closes; failure on an older pool does not retire a
+newer replacement. The failed command is never automatically resent, since its
+execution outcome may be unknown. Subsequent requests reconnect.
+
+Caller-supplied `http_session` objects remain caller-managed; configure and
+replace those pools in the owning application.
+
+## Gateway outage recovery
+
+`PodmanClient(recovery_timeout=120)` waits with jittered exponential backoff
+(up to 5 seconds between attempts) after discovery or connection-establishment
+failures. Set zero to disable. Healthy pools and shared generation-aware
+discovery are reused; failed pools are retired without interrupting other
+in-flight requests. Affinity IDs are preserved.
+
+Mutating requests are retried only when they were not sent. Disconnects and
+read timeouts after submission retain an unknown outcome and surface to callers;
+commands and creates are never blindly repeated. GET transport failures may
+retry. This does not implement durable command-result tracking or handshake
+idempotency. Caller timeouts must allow the recovery window.
+
+`recovery_stats` reports retries, recovered requests, and exhausted waits.
