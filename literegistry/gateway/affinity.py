@@ -178,6 +178,9 @@ class StrictAffinityGateway:
         probe_timeout: float = 1.0,
         probe_cooldown: float = 2.0,
         max_owner_probes: int = 256,
+        admission_timeout: float = 300.0,
+        admission_backoff_initial: float = 0.5,
+        admission_backoff_max: float = 5.0,
     ) -> None:
         self.registry = registry
         self.bindings = bindings
@@ -187,6 +190,14 @@ class StrictAffinityGateway:
             raise ValueError("probe timeout and cooldown must be positive and finite")
         if max_owner_probes < 1:
             raise ValueError("max_owner_probes must be positive")
+        if not (0 < admission_timeout < float("inf")
+                and 0 < admission_backoff_initial <= admission_backoff_max < float("inf")):
+            raise ValueError("admission timeout/backoff must be positive and finite")
+        self.admission_timeout = admission_timeout
+        self.admission_backoff_initial = admission_backoff_initial
+        self.admission_backoff_max = admission_backoff_max
+        # Share short rejection cooldowns across handshakes in this process.
+        self._capacity_cooldowns: OrderedDict[tuple[str, str], float] = OrderedDict()
         self.probe_timeout = probe_timeout
         self.probe_cooldown = probe_cooldown
         self.max_owner_probes = max_owner_probes
@@ -469,10 +480,23 @@ class StrictAffinityGateway:
             service,
         )
         last_unavailable: Optional[GatewayRequestError] = None
-        # Use cached discovery first. A complete registry refresh happens only
-        # if every cached candidate fails or the cached roster is empty.
-        for force in (False, True):
-            candidates = await self._candidate_servers(service, force=force)
+        image_storage_error: Optional[HTTPResponseError] = None
+        image_storage_worker: Optional[str] = None
+        image_retry_sent = False
+        capacity_rejected_uris: set[str] = set()
+        last_capacity_error: Optional[HTTPResponseError] = None
+        deadline = started + self.admission_timeout
+        backoff = self.admission_backoff_initial
+        round_number = 0
+        # Keep the same handshake alive. Normal roster-cache expiry provides
+        # fresh capacity; exhaustion never forces an extra Redis scan.
+        while time.monotonic() < deadline:
+            if await request.is_disconnected():
+                raise GatewayRequestError("admission client disconnected", status_code=499)
+            round_number += 1
+            force = False
+            capacity_rejected_uris.clear()
+            candidates = await self._candidate_servers(service, force=False)
             logger.info(
                 "gateway_affinity mode=strict event=roster "
                 "request_id=%s service=%r registry_force=%s candidates=%d",
@@ -481,15 +505,81 @@ class StrictAffinityGateway:
                 str(force).lower(),
                 len(candidates),
             )
+            attempts_this_round = 0
             for attempt, selected in enumerate(candidates, start=1):
+                if time.monotonic() >= deadline or attempts_this_round >= 8:
+                    break
+                key = (service, selected.server_uri)
+                if self._capacity_cooldowns.get(key, 0) > time.monotonic():
+                    continue
+                if (selected.server_uri == image_storage_worker
+                        or selected.server_uri in capacity_rejected_uris):
+                    continue
+                if image_storage_error is not None:
+                    image_retry_sent = True
+                attempts_this_round += 1
                 try:
-                    result = await self._post(
-                        service,
-                        selected.server_uri,
-                        "handshake",
-                        forwarded,
+                    # Bound the whole admission request, including creation.
+                    # A timeout has unknown outcome and MUST NOT be retried.
+                    async with asyncio.timeout(max(0, deadline - time.monotonic())):
+                        result = await self._post(
+                            service, selected.server_uri, "handshake", forwarded,
+                        )
+                except TimeoutError as exc:
+                    raise GatewayRequestError(
+                        "session creation exceeded admission deadline",
+                        status_code=504,
+                        response_body={"code": "affinity_admission_timeout",
+                                       "execution_outcome": "unknown",
+                                       "request_id": request_id},
+                    ) from exc
+                except HTTPResponseError as exc:
+                    body = str(exc.body).lower()
+                    # An explicit admission rejection created no session.
+                    # Try the next cached candidate without a Redis lookup.
+                    # Rejected workers have a shared cooldown; admission
+                    # retries a fresh cached selection after backing off.
+                    if (not image_retry_sent and exc.status == 503
+                            and "podman session capacity exhausted" in body):
+                        capacity_rejected_uris.add(selected.server_uri)
+                        last_capacity_error = exc
+                        self._capacity_cooldowns[key] = time.monotonic() + self.admission_backoff_max
+                        self._capacity_cooldowns.move_to_end(key)
+                        while len(self._capacity_cooldowns) > 4096:
+                            self._capacity_cooldowns.popitem(last=False)
+                        logger.warning(
+                            "gateway_affinity mode=strict event=handshake_retry "
+                            "request_id=%s service=%r server_id=%r server_uri=%r "
+                            "reason=capacity_rejected rejected_workers=%d",
+                            request_id, service, selected.server_id,
+                            selected.server_uri, len(capacity_rejected_uris),
+                        )
+                        continue
+                    # A definite image-storage failure allows one alternate
+                    # attempt. This policy never retries terminal commands.
+                    if (
+                        image_retry_sent
+                        or exc.status not in {500, 503}
+                        or not any(marker in body for marker in (
+                            "image not known", "layer not known"
+                        ))
+                    ):
+                        raise
+                    image_storage_error = exc
+                    image_storage_worker = selected.server_uri
+                    logger.warning(
+                        "gateway_affinity mode=strict event=handshake_retry "
+                        "request_id=%s service=%r server_id=%r server_uri=%r "
+                        "reason=image_storage retry=1 max_retries=1",
+                        request_id, service, selected.server_id, selected.server_uri,
                     )
+                    continue
                 except GatewayRequestError as exc:
+                    if image_retry_sent or (
+                        isinstance(exc, _TransportFailure)
+                        and exc.response_body.get("execution_outcome") != "not_sent"
+                    ):
+                        raise
                     if exc.status_code == 503:
                         last_unavailable = exc
                         logger.warning(
@@ -548,6 +638,35 @@ class StrictAffinityGateway:
                     (time.monotonic() - started) * 1000.0,
                 )
                 return JSONResponse(result)
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            delay = min(remaining, random.uniform(backoff / 2, backoff))
+            logger.info(
+                "gateway_affinity mode=strict event=admission_wait "
+                "request_id=%s service=%r round=%d delay_seconds=%.3f "
+                "elapsed_seconds=%.3f",
+                request_id, service, round_number, delay, time.monotonic() - started,
+            )
+            await asyncio.sleep(delay)
+            backoff = min(self.admission_backoff_max, backoff * 2)
+
+        if image_storage_error is not None:
+            # No alternate candidate: retain the actionable upstream error.
+            raise image_storage_error
+        if last_capacity_error is not None:
+            raise GatewayRequestError(
+                "no available servers for affinity service " + service,
+                status_code=503,
+                response_body={
+                    "error": "admission deadline exceeded waiting for capacity",
+                    "code": "affinity_capacity_exhausted",
+                    "admission_timeout_seconds": self.admission_timeout,
+                    "admission_rounds": round_number,
+                    "request_id": request_id,
+                },
+            ) from last_capacity_error
 
         logger.error(
             "gateway_affinity mode=strict event=handshake_failed "
