@@ -72,6 +72,7 @@ class ServerRegistry:
 
     async def register_server(
         self, url: str, port: int, metadata: Optional[Dict] = None,
+        *, data: Optional[Dict] = None,
     ) -> str:
         """Register a new server with the registry"""
         self._metadata = metadata or {}  # Store for potential re-registration
@@ -87,6 +88,8 @@ class ServerRegistry:
             "uri": f"{url}:{port}",
         }
 
+        if data is not None:
+            info["data"] = data
         key = f"server_{self.server_id}"
         await self._write_server(key, info)
         return self.server_id
@@ -99,16 +102,16 @@ class ServerRegistry:
             info_bytes = await self.store.get(key)
             if info_bytes:
                 info = json.loads(info_bytes.decode("utf-8"))
-                if data:
+                if data is not None:
                     info["data"] = data
                 info["last_heartbeat"] = time.time()
                 await self._write_server(key, info)
             else:
                 # Re-register if key disappeared
-                await self.register_server(url, port, self._metadata)
+                await self.register_server(url, port, self._metadata, data=data)
         except Exception:
             # Re-register on any error
-            await self.register_server(url, port, self._metadata)
+            await self.register_server(url, port, self._metadata, data=data)
 
     async def deregister(self):
         """Remove server from registry"""

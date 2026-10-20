@@ -186,3 +186,38 @@ python tools/compare_podman_execution_benchmarks.py  podman-throughput-r1.json p
 
 The comparator accepts both current `literegistry-podman-*` results and legacy
 `jtc-podman-*` benchmark JSON.
+
+
+### Capacity in registry heartbeats
+
+Registered Podman replicas publish a cheap admission-capacity snapshot in the
+server record's `data` object on startup and every heartbeat (10 seconds by
+default, configurable with `PODMAN_AFFINITY_HEARTBEAT_INTERVAL`):
+
+```json
+{
+  "active_sessions": 6,
+  "pending_creates": 1,
+  "max_sessions": 8,
+  "available_slots": 1,
+  "capacity_updated_at": 1792454400.0
+}
+```
+
+`pending_creates` counts reserved creation slots, including in-progress image
+pulls. Active sessions retain their slot until removal succeeds. Counters are
+read together under the backend state lock without invoking Podman. They reflect
+admission bookkeeping, not a fresh container inventory. A creation transitioning
+to active may briefly count in both counters, conservatively underreporting free
+capacity. Unlimited capacity uses `null` for both `max_sessions` and
+`available_slots`.
+
+Consumers can read `data` through `ServerRegistry.roster()` or
+`RegistryClient.models()`. The snapshot is also retained when a missing registry
+entry is recreated by a heartbeat. With a `head+` registry, these worker records
+are written to Redis; the head registry remains the discovery mechanism.
+
+This adds capacity reporting, not capacity-based gateway selection. Future
+routing should account for snapshot age and treat absent fields as unknown,
+not zero capacity. The worker remains the authority on admission because a
+heartbeat snapshot can become stale immediately under concurrent traffic.

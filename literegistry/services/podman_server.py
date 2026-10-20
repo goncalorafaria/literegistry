@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from collections.abc import Awaitable, Callable
 import logging
 import os
 import socket
@@ -41,6 +42,7 @@ class RedisRegistration:
         registry_mirror: Optional[str] = None,
         session_limits: Optional[dict] = None,
         heartbeat_interval: float = 10.0,
+        capacity_provider: Optional[Callable[[], Awaitable[dict[str, Any]]]] = None,
         store: Optional[KeyValueStore] = None,
         registry: Optional[ServerRegistry] = None,
     ) -> None:
@@ -54,6 +56,7 @@ class RedisRegistration:
         self.registry_mirror = registry_mirror
         self.session_limits = session_limits or {}
         self.heartbeat_interval = heartbeat_interval
+        self.capacity_provider = capacity_provider
         self._heartbeat_task: Optional[asyncio.Task] = None
 
     def metadata(self) -> dict[str, Any]:
@@ -74,11 +77,19 @@ class RedisRegistration:
             "authentication": {"type": "none"},
         }
 
+    async def heartbeat_data(self) -> Optional[dict[str, Any]]:
+        if self.capacity_provider is None:
+            return None
+        return await self.capacity_provider()
+
     async def start(self) -> None:
         ping = getattr(self.store, "ping", None)
         if ping is not None and not await ping():
             raise RuntimeError(f"Redis PING failed for {self.registry_url}")
-        await self.registry.register_server(self.url, self.port, self.metadata())
+        data = await self.heartbeat_data()
+        await self.registry.register_server(
+            self.url, self.port, self.metadata(), **({"data": data} if data is not None else {})
+        )
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         logger.info(
             "Registered server_id=%s uri=%s:%s registry=%s",
@@ -92,7 +103,10 @@ class RedisRegistration:
         while True:
             await asyncio.sleep(self.heartbeat_interval)
             try:
-                await self.registry.heartbeat(self.url, self.port)
+                data = await self.heartbeat_data()
+                await self.registry.heartbeat(
+                    self.url, self.port, **({"data": data} if data is not None else {})
+                )
             except Exception:
                 logger.exception("Redis registry heartbeat failed")
 
@@ -113,6 +127,7 @@ def build_registered_app(
 ):
     backend = PodmanSessionBackend(config)
     service = PodmanAffinityService(backend)
+    registration.capacity_provider = backend.capacity_snapshot
 
     @asynccontextmanager
     async def lifespan(app):
