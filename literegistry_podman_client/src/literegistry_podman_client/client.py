@@ -6,6 +6,10 @@ import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import json
+import math
+import random
+import logging
+import time
 from collections.abc import AsyncIterator, Mapping
 from typing import Any
 from urllib.parse import urlsplit
@@ -31,6 +35,7 @@ class PodmanGatewayError(RuntimeError):
         super().__init__(message)
         self.status_code = status_code
         self.response = response
+        self.request_not_sent = False
 
 
 def _error_detail(response: Any) -> JsonObject:
@@ -152,6 +157,9 @@ class PodmanClient:
         service: str = "podman",
         workdir: str = "/workspace",
         request_timeout: float = 310.0,
+        recovery_timeout: float = 120.0,
+        keepalive_timeout: float = 2.0,
+        event_loop_stall_timeout: float = 2.0,
         headers: Mapping[str, str] | None = None,
         http_session: aiohttp.ClientSession | None = None,
     ) -> None:
@@ -171,6 +179,24 @@ class PodmanClient:
         if request_timeout <= 0:
             raise ValueError("request_timeout must be greater than zero")
 
+        for name, value in (
+            ("keepalive_timeout", keepalive_timeout),
+            ("event_loop_stall_timeout", event_loop_stall_timeout),
+        ):
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and greater than zero")
+
+        if not math.isfinite(recovery_timeout) or recovery_timeout < 0:
+            raise ValueError("recovery_timeout must be finite and non-negative")
+        self.recovery_timeout = recovery_timeout
+        self.recovery_stats = {"retries": 0, "recovered": 0, "exhausted": 0}
+        self.keepalive_timeout = keepalive_timeout
+        self.event_loop_stall_timeout = event_loop_stall_timeout
+        self._loop_tick = time.monotonic()
+        self._loop_timer: asyncio.TimerHandle | None = None
+        self._pool_stale = False
+        self._active_requests: dict[aiohttp.ClientSession, int] = {}
+        self._retired_sessions: set[aiohttp.ClientSession] = set()
         self.gateway_url = gateway_url
         self._gateway_discovery = gateway_discovery
         self.service = service.strip()
@@ -190,32 +216,87 @@ class PodmanClient:
     def mirror_url(self) -> str:
         """Docker Registry mirror base URL exposed by the same gateway."""
         if not self.gateway_url:
-            raise PodmanGatewayError("open the client before using its discovered mirror URL")
+            raise PodmanGatewayError(
+                "open the client before using its discovered mirror URL"
+            )
         return self.gateway_url
 
+    def _observe_loop(self) -> None:
+        # A response may sit in the socket while the event loop is blocked.
+        # aiohttp then timestamps its release as "now", even though the peer
+        # has already expired keepalive. Track loop stalls independently.
+        now = time.monotonic()
+        if now - self._loop_tick > self.event_loop_stall_timeout:
+            self._pool_stale = True
+        self._loop_tick = now
+        self._loop_timer = asyncio.get_running_loop().call_later(
+            min(0.5, self.event_loop_stall_timeout / 4), self._observe_loop
+        )
+
     async def open(self) -> "PodmanClient":
-        """Open the shared HTTP connection pool and return this client."""
+        """Reuse healthy connections; replace owned pools after a loop stall."""
         if self._gateway_discovery is not None:
-            self.gateway_url, _ = await self._gateway_discovery.resolve()
+            try:
+                self.gateway_url, _ = await self._gateway_discovery.resolve()
+            except (OSError, asyncio.TimeoutError, LookupError) as exc:
+                error = PodmanGatewayError(
+                    f"gateway discovery failed before sending: {exc}"
+                )
+                error.request_not_sent = True
+                raise error from exc
         async with self._open_lock:
+            if self._owns_http_session:
+                if time.monotonic() - self._loop_tick > self.event_loop_stall_timeout:
+                    self._pool_stale = True
+                if self._pool_stale and self._http_session is not None:
+                    old = self._http_session
+                    self._http_session = None
+                    if self._active_requests.get(old, 0):
+                        self._retired_sessions.add(old)
+                    else:
+                        await old.close()
+                self._pool_stale = False
+                # Check for a stall before advancing the observation clock.
+                self._loop_tick = time.monotonic()
+                if self._loop_timer is None:
+                    self._observe_loop()
             if self.is_open:
                 return self
             if not self._owns_http_session and self._http_session is not None:
                 raise PodmanGatewayError("the supplied aiohttp session is closed")
             self._http_session = aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(
+                    keepalive_timeout=self.keepalive_timeout
+                ),
                 timeout=aiohttp.ClientTimeout(total=self.request_timeout),
                 trust_env=False,
             )
             self._owns_http_session = True
         return self
 
-    async def aclose(self) -> None:
-        """Close the owned HTTP pool without deleting active containers."""
+    async def _retire_pool(self, session: aiohttp.ClientSession) -> None:
         async with self._open_lock:
-            session = self._http_session
-            if session is not None and self._owns_http_session and not session.closed:
-                await session.close()
+            if not self._owns_http_session:
+                return  # A caller-supplied pool remains the caller's responsibility.
+            if self._http_session is session:
+                self._http_session = None
+            # Other requests on this pool may still be executing commands.
+            # Drain them instead of closing their sockets underneath them.
+            self._retired_sessions.add(session)
+
+    async def aclose(self) -> None:
+        """Close owned HTTP pools without deleting active containers."""
+        async with self._open_lock:
+            if self._loop_timer is not None:
+                self._loop_timer.cancel()
+                self._loop_timer = None
+            sessions = set(self._retired_sessions)
+            if self._owns_http_session and self._http_session is not None:
+                sessions.add(self._http_session)
             self._http_session = None
+            self._retired_sessions.clear()
+            for session in sessions:
+                await session.close()
 
     async def __aenter__(self) -> "PodmanClient":
         return await self.open()
@@ -239,19 +320,85 @@ class PodmanClient:
         endpoint: str,
         payload: Any = None,
     ) -> JsonObject:
+        """Wait for recovery only when replay cannot duplicate an operation.
+
+        Discovery and connection-establishment failures occur before sending.
+        Disconnects/timeouts after sending remain terminal for mutations.
+        """
+        deadline = None
+        attempt = 0
+        while True:
+            try:
+                if deadline is None:
+                    return await self._request_once(method, endpoint, payload)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self.recovery_stats["exhausted"] += 1
+                    raise last_error
+                # A timeout here can have an unknown execution outcome; do not
+                # turn it into another retry.
+                result = await asyncio.wait_for(
+                    self._request_once(method, endpoint, payload), timeout=remaining
+                )
+                self.recovery_stats["recovered"] += 1
+                return result
+            except PodmanGatewayError as error:
+                safe = getattr(error, "request_not_sent", False)
+                readonly = method == "GET" and error.status_code is None
+                if not (safe or readonly) or self.recovery_timeout == 0:
+                    raise
+                last_error = error
+                if deadline is None:
+                    deadline = time.monotonic() + self.recovery_timeout
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                attempt += 1
+                self.recovery_stats["retries"] += 1
+                delay = min(
+                    remaining,
+                    random.uniform(0.5, 1.0) * min(5.0, 0.5 * 2 ** min(attempt - 1, 4)),
+                )
+                logging.getLogger(__name__).warning(
+                    "gateway_recovery endpoint=%s attempt=%s delay=%.2f request_not_sent=%s",
+                    endpoint,
+                    attempt,
+                    delay,
+                    safe,
+                )
+                await asyncio.sleep(delay)
+
+    async def _request_once(
+        self,
+        method: str,
+        endpoint: str,
+        payload: Any = None,
+    ) -> JsonObject:
         await self.open()
         assert self._http_session is not None
         gateway_url = self.gateway_url
         generation = None
         if self._gateway_discovery is not None:
-            gateway_url, generation = await self._gateway_discovery.resolve()
+            try:
+                gateway_url, generation = await self._gateway_discovery.resolve()
+            except (OSError, asyncio.TimeoutError, LookupError) as exc:
+                error = PodmanGatewayError(
+                    f"gateway discovery failed before sending: {exc}"
+                )
+                error.request_not_sent = True
+                raise error from exc
             self.gateway_url = gateway_url
         url = f"{gateway_url}/{endpoint.lstrip('/')}"
         headers = {"accept": "application/json", **self.headers}
         if payload is not None:
             headers["content-type"] = "application/json"
+        # Discovery may have yielded while another caller retired its pool.
+        await self.open()
+        session = self._http_session
+        assert session is not None
+        self._active_requests[session] = self._active_requests.get(session, 0) + 1
         try:
-            async with self._http_session.request(
+            async with session.request(
                 method,
                 url,
                 headers=headers,
@@ -262,7 +409,8 @@ class PodmanClient:
                     detail = _error_detail(result)
                     confirmed_loss = (
                         response.status == 410
-                        and detail.get("code") in ("affinity_owner_lost", "sandbox_lost")
+                        and detail.get("code")
+                        in ("affinity_owner_lost", "sandbox_lost")
                         and detail.get("recoverable") is False
                     )
                     legacy_missing = (
@@ -283,12 +431,24 @@ class PodmanClient:
         except PodmanGatewayError:
             raise
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            await self._retire_pool(session)
             if self._gateway_discovery is not None and generation is not None:
                 self._gateway_discovery.invalidate(gateway_url, generation)
             # The command may already have executed. Never retry it implicitly.
-            raise PodmanGatewayError(
+            error = PodmanGatewayError(
                 f"could not reach gateway at {gateway_url}: {exc}"
-            ) from exc
+            )
+            error.request_not_sent = isinstance(exc, aiohttp.ClientConnectorError)
+            raise error from exc
+        finally:
+            remaining = self._active_requests[session] - 1
+            if remaining:
+                self._active_requests[session] = remaining
+            else:
+                self._active_requests.pop(session, None)
+                if session in self._retired_sessions:
+                    self._retired_sessions.discard(session)
+                    await session.close()
         if not isinstance(result, dict):
             raise PodmanGatewayError(
                 f"gateway returned a non-object response for {endpoint}",
@@ -390,9 +550,13 @@ class PodmanClient:
         """Renew the existing gateway mapping; never create or reassign a session."""
         if not isinstance(affinity_id, str) or not affinity_id.strip():
             raise ValueError("affinity_id must be a non-empty string")
-        return await self._post("affinity/renew", {
-            "service": self.service, "affinity_id": affinity_id.strip(),
-        })
+        return await self._post(
+            "affinity/renew",
+            {
+                "service": self.service,
+                "affinity_id": affinity_id.strip(),
+            },
+        )
 
     async def close(self, affinity_id: str) -> JsonObject:
         """Delete one container and its affinity binding."""
