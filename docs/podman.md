@@ -190,34 +190,37 @@ The comparator accepts both current `literegistry-podman-*` results and legacy
 
 ### Capacity in registry heartbeats
 
-Registered Podman replicas publish a cheap admission-capacity snapshot in the
-server record's `data` object on startup and every heartbeat (10 seconds by
-default, configurable with `PODMAN_AFFINITY_HEARTBEAT_INTERVAL`):
+Podman publishes `data.podman_capacity` on startup and each normal heartbeat
+(default 10 seconds):
 
 ```json
 {
-  "active_sessions": 6,
-  "pending_creates": 1,
-  "max_sessions": 8,
-  "available_slots": 1,
-  "capacity_updated_at": 1792454400.0
+  "podman_capacity": {
+    "active_sessions": 6,
+    "pending_sessions": 1,
+    "max_sessions": 8,
+    "available_sessions": 1,
+    "observed_at": 1792454400.0,
+    "valid_for_seconds": 30.0
+  }
 }
 ```
 
-`pending_creates` counts reserved creation slots, including in-progress image
-pulls. Active sessions retain their slot until removal succeeds. Counters are
-read together under the backend state lock without invoking Podman. They reflect
-admission bookkeeping, not a fresh container inventory. A creation transitioning
-to active may briefly count in both counters, conservatively underreporting free
-capacity. Unlimited capacity uses `null` for both `max_sessions` and
-`available_slots`.
+Counts come from admission bookkeeping under the backend lock, without a Podman
+subprocess. Pending sessions include reserved creation slots and image pulls.
+A transition to active can briefly count in both counters. Unlimited capacity
+uses `null` for maximum and available sessions. Heartbeat re-registration
+preserves the snapshot if the registry record disappears.
 
-Consumers can read `data` through `ServerRegistry.roster()` or
-`RegistryClient.models()`. The snapshot is also retained when a missing registry
-entry is recreated by a heartbeat. With a `head+` registry, these worker records
-are written to Redis; the head registry remains the discovery mechanism.
+The gateway checks these snapshots in its existing roster cache, skips workers
+reported full, and samples eligible workers. This adds no Redis lookup per
+candidate. Existing cache expiry and exhausted-candidate refresh behavior apply.
+Missing, expired, malformed, or unlimited snapshots leave a worker eligible;
+worker-side admission remains authoritative. Existing sessions stay pinned.
 
-This adds capacity reporting, not capacity-based gateway selection. Future
-routing should account for snapshot age and treat absent fields as unknown,
-not zero capacity. The worker remains the authority on admission because a
-heartbeat snapshot can become stale immediately under concurrent traffic.
+Both workers and gateway need upgrading. With a 10-second heartbeat and a
+5-second gateway cache, a newly freed slot can remain excluded for roughly
+15 seconds under normal operation. Fresh capacity is advisory, not a reservation.
+When every cached worker is full, the existing fallback may refresh the registry
+before returning an unavailable response. Under overload this can still cause
+additional registry traffic; it is not caused by each capacity check.

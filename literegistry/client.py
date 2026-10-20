@@ -161,8 +161,13 @@ class RegistryClient(ServerRegistry):
 
         return result
 
-    async def sample_servers(self, value: str, n: int, force: bool = False):
+    async def sample_servers(
+        self, value: str, n: int, force: bool = False,
+        *, exclude_uris: Optional[set[str]] = None,
+    ):
         servers = await self.get_all(value, force=force)
+        if exclude_uris:
+            servers = [uri for uri in servers if uri.rstrip("/") not in exclude_uris]
         
         # Handle case when no servers are available
         if not servers:

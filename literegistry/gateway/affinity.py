@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import random
 import socket
 import time
 import uuid
@@ -217,6 +218,28 @@ class StrictAffinityGateway:
         records = models.get(service, [])
         return [record for record in records if isinstance(record, Mapping)]
 
+    @staticmethod
+    def _reported_full(record: Mapping[str, Any]) -> bool:
+        """Capacity is a fresh admission hint, never ownership information."""
+        data = record.get("data")
+        snapshot = data.get("podman_capacity") if isinstance(data, Mapping) else None
+        if not isinstance(snapshot, Mapping):
+            return False
+        active = snapshot.get("active_sessions")
+        pending = snapshot.get("pending_sessions")
+        maximum = snapshot.get("max_sessions")
+        observed = snapshot.get("observed_at")
+        validity = snapshot.get("valid_for_seconds", 30.0)
+        if not all(type(v) is int and v >= 0 for v in (active, pending, maximum)):
+            return False  # Includes unlimited capacity (None) and malformed data.
+        if (type(observed) not in (int, float) or type(validity) not in (int, float)
+                or not 0 < validity <= 300):
+            return False
+        age = time.time() - observed
+        if not 0 <= age <= validity:
+            return False
+        return active + pending >= maximum
+
     async def _candidate_servers(
         self,
         service: str,
@@ -227,20 +250,32 @@ class StrictAffinityGateway:
         # path after failed cached candidates bypasses it.
         records = await self._records(service, force=force)
         by_uri: dict[str, SelectedServer] = {}
+        full_uris: set[str] = set()
         for record in records:
             uri = record.get("uri")
             server_id = record.get("server_id")
             if isinstance(uri, str) and uri and isinstance(server_id, str) and server_id:
                 normalized = uri.rstrip("/")
+                if self._reported_full(record):
+                    full_uris.add(normalized)
+                    logger.info(
+                        "gateway_affinity mode=strict event=capacity_skip "
+                        "service=%r server_id=%r server_uri=%r",
+                        service, server_id, normalized,
+                    )
+                    continue
                 by_uri[normalized] = SelectedServer(server_id, normalized)
         if not by_uri:
             return []
 
         # _records() populated the models cache, so this does not cause a
         # second roster scan even when _records() was explicitly refreshed.
-        preferred = await self.registry.sample_servers(
-            service, n=1, force=False
-        )
+        if full_uris:
+            preferred = await self.registry.sample_servers(
+                service, n=1, force=False, exclude_uris=full_uris
+            )
+        else:
+            preferred = await self.registry.sample_servers(service, n=1, force=False)
         ordered: list[SelectedServer] = []
         seen: set[str] = set()
         for uri, _ in preferred:
@@ -249,7 +284,9 @@ class StrictAffinityGateway:
             if selected is not None and normalized not in seen:
                 ordered.append(selected)
                 seen.add(normalized)
-        for uri, selected in by_uri.items():
+        remaining = list(by_uri.items())
+        random.shuffle(remaining)
+        for uri, selected in remaining:
             if uri not in seen:
                 ordered.append(selected)
         return ordered

@@ -665,26 +665,6 @@ class PodmanSessionBackend:
             )
         return container_ids
 
-    async def capacity_snapshot(self) -> dict[str, Any]:
-        """Cheap, lock-consistent admission counters for registry heartbeats.
-
-        Owned sessions include containers being closed until removal succeeds.
-        No Podman subprocess or network request is needed to collect this data.
-        """
-        async with self._locks_guard:
-            active = len(self._owned_container_ids)
-            pending = self._pending_sessions
-            maximum = self.config.max_sessions
-            return {
-                "active_sessions": active,
-                "pending_creates": pending,
-                "max_sessions": maximum,
-                "available_slots": (
-                    None if maximum is None else max(0, maximum - active - pending)
-                ),
-                "capacity_updated_at": time.time(),
-            }
-
     async def capacity_status(self) -> tuple[int, Optional[int]]:
         """Return reserved/active session count and the configured capacity."""
 
@@ -693,6 +673,22 @@ class PodmanSessionBackend:
                 len(self._owned_container_ids) + self._pending_sessions,
                 self.config.max_sessions,
             )
+
+    async def capacity_snapshot(self) -> dict[str, Any]:
+        """Publish one consistent in-memory snapshot; never spawn Podman here."""
+        async with self._locks_guard:
+            active = len(self._owned_container_ids)
+            pending = self._pending_sessions
+            maximum = self.config.max_sessions
+            return {
+                "active_sessions": active,
+                "pending_sessions": pending,
+                "max_sessions": maximum,
+                "available_sessions": (
+                    None if maximum is None else max(0, maximum - active - pending)
+                ),
+                "observed_at": time.time(),
+            }
 
     async def cleanup(self) -> None:
         container_ids = await self.owned_container_ids()

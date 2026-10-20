@@ -156,3 +156,25 @@ Run multiple `code` / `terminal` workers on different nodes with the same
 model replicas (with tighter retry budgets for these endpoints).
 
 Next: [Load balancing](load-balancing.md) · [Gateway](gateway.md)
+
+### Podman capacity-aware handshake routing
+
+Podman publishes `data.podman_capacity` with each registry heartbeat: active
+sessions, pending creates, maximum sessions, available slots, observation time,
+and validity duration. Counts are captured under the backend lock; reporting
+never runs a Podman subprocess. Active counts are the backend's admission
+accounting, including reservations retained until cleanup completes.
+
+Before a new strict-affinity handshake, the gateway excludes workers whose
+fresh snapshot has `active_sessions + pending_sessions >= max_sessions`, then
+samples the remaining workers through the load balancer. Fallback candidates
+are shuffled to avoid concentrating rejected handshakes on the first registry
+entry. `event=capacity_skip` records each skipped worker.
+
+Missing, malformed, unlimited, or expired snapshots do not exclude a worker.
+Workers retain the authoritative atomic capacity check; if a worker fills after
+its heartbeat, explicit 503 rejection advances to another candidate. Exhausting
+cached candidates triggers one registry refresh before returning failure.
+Existing sessions remain pinned to their owner regardless of reported capacity.
+
+Both worker and gateway packages must be upgraded to enable this behavior.
