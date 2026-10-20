@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 import logging
 import os
 import socket
-from typing import Any, Optional
+from typing import Any, Optional, Callable, Awaitable
 
 import fire
 import uvicorn
@@ -41,6 +41,7 @@ class RedisRegistration:
         registry_mirror: Optional[str] = None,
         session_limits: Optional[dict] = None,
         heartbeat_interval: float = 10.0,
+        capacity_provider: Optional[Callable[[], Awaitable[dict[str, Any]]]] = None,
         store: Optional[KeyValueStore] = None,
         registry: Optional[ServerRegistry] = None,
     ) -> None:
@@ -54,6 +55,7 @@ class RedisRegistration:
         self.registry_mirror = registry_mirror
         self.session_limits = session_limits or {}
         self.heartbeat_interval = heartbeat_interval
+        self.capacity_provider = capacity_provider
         self._heartbeat_task: Optional[asyncio.Task] = None
 
     def metadata(self) -> dict[str, Any]:
@@ -79,6 +81,7 @@ class RedisRegistration:
         if ping is not None and not await ping():
             raise RuntimeError(f"Redis PING failed for {self.registry_url}")
         await self.registry.register_server(self.url, self.port, self.metadata())
+        await self._publish_heartbeat()
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         logger.info(
             "Registered server_id=%s uri=%s:%s registry=%s",
@@ -88,11 +91,21 @@ class RedisRegistration:
             self.registry_url,
         )
 
+    async def _publish_heartbeat(self) -> None:
+        if self.capacity_provider is None:
+            await self.registry.heartbeat(self.url, self.port)
+            return
+        snapshot = await self.capacity_provider()
+        snapshot["valid_for_seconds"] = max(3 * self.heartbeat_interval, 5.0)
+        await self.registry.heartbeat(
+            self.url, self.port, data={"podman_capacity": snapshot}
+        )
+
     async def _heartbeat_loop(self) -> None:
         while True:
             await asyncio.sleep(self.heartbeat_interval)
             try:
-                await self.registry.heartbeat(self.url, self.port)
+                await self._publish_heartbeat()
             except Exception:
                 logger.exception("Redis registry heartbeat failed")
 
@@ -112,6 +125,7 @@ def build_registered_app(
     registration: RedisRegistration,
 ):
     backend = PodmanSessionBackend(config)
+    registration.capacity_provider = backend.capacity_snapshot
     service = PodmanAffinityService(backend)
 
     @asynccontextmanager
