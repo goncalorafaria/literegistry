@@ -161,3 +161,21 @@ other boards and DMs unread. Without a board argument, only `"general"` and your
 DMs are returned; custom boards always require an explicit argument. Reading
 `board="general"` and then the default inbox does not return the same posts again. Read state remains independent for every participant. All boards are
 deleted together when the session closes or expires.
+
+
+### Buffered async client
+
+`PodmanAsyncClient` exposes `open()`, `start()`, and `close()`. A command's `read()` returns available output immediately by default; `batches()` long-polls incrementally; `wait()` waits for completion and collects bounded **unread** output. Previously returned output is never repeated. Positive polling waits are limited to 10,000 ms to match the worker API.
+
+```python
+from literegistry_tool_client import PodmanAsyncClient
+
+async with PodmanAsyncClient(gateway, image="python:3.12-slim") as client:
+    job = await client.start(command="python -u task.py", timeout=300)
+    batch = await job.read()  # may be empty while still running
+    print(batch["stdout"], end="")
+    result = await job.wait(max_output_chars=1048576)
+    print(result["stdout"], end="")  # remaining output only
+```
+
+Use `async for batch in job.batches(): ...` to display output as it arrives. Reads on the same handle are serialized. `close()` drains accepted commands and attempts container removal even if reading fails. Multiple active commands on the same container receive `session_busy`; different containers can run concurrently. See [live results](../docs/podman-streaming-live-results.md).

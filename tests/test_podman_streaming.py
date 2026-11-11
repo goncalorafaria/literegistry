@@ -80,6 +80,10 @@ def test_output_arrives_before_exit_and_ack_releases_bytes(backend, tmp_path):
         try:
             job = await start(backend, f"printf first; while ! test -f {gate}; do sleep .02; done; printf second; exit 7")
             first = await poll(backend, job["command_id"])
+            for _ in range(20):
+                if first["chunks"] or first["done"]:
+                    break
+                first = await poll(backend, job["command_id"])
             assert first["running"] and not first["done"]
             assert "".join(c["data"] for c in first["chunks"]) == "first"
             # Retrying a lost response is possible before advancing the cursor.
@@ -259,6 +263,12 @@ def test_worker_api_and_gateway_poll_are_pinned_and_uncached(backend, tmp_path):
                     response = await client.get("/affinity/podman/output", params=params)
                     assert response.status_code == 200, response.text
                     assert response.headers["cache-control"] == "no-store"
+                    for _ in range(20):
+                        if response.json()["chunks"] or response.json()["done"]:
+                            break
+                        response = await client.get("/affinity/podman/output", params=params)
+                        assert response.status_code == 200, response.text
+                        assert response.headers["cache-control"] == "no-store"
                     assert response.json()["chunks"][0]["data"] == "hello"
                     direct = await upstream.get("/podman/output", params={
                         k: v for k, v in params.items() if k != "service"
